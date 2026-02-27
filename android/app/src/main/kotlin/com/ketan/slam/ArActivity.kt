@@ -2,16 +2,17 @@
 
 import android.Manifest
 import android.content.pm.PackageManager
-import android.graphics.Bitmap
-import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.graphics.ImageFormat
-import android.graphics.Rect
-import android.graphics.YuvImage
-import android.media.Image
+import android.hardware.camera2.CameraCaptureSession
+import android.hardware.camera2.CameraDevice
+import android.hardware.camera2.CaptureRequest
+import android.media.ImageReader
 import android.opengl.GLES20
 import android.opengl.GLSurfaceView
 import android.os.Bundle
+import android.os.Handler
+import android.os.HandlerThread
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.WindowManager
@@ -27,9 +28,9 @@ import com.google.ar.core.Config
 import com.google.ar.core.Frame
 import com.google.ar.core.Plane
 import com.google.ar.core.Session
+import com.google.ar.core.SharedCamera
 import com.google.ar.core.TrackingState
 import com.google.ar.core.exceptions.CameraNotAvailableException
-import com.google.ar.core.exceptions.NotYetAvailableException
 import com.google.ar.core.exceptions.UnavailableApkTooOldException
 import com.google.ar.core.exceptions.UnavailableArcoreNotInstalledException
 import com.google.ar.core.exceptions.UnavailableDeviceNotCompatibleException
@@ -37,11 +38,11 @@ import com.google.ar.core.exceptions.UnavailableSdkTooOldException
 import com.google.ar.core.exceptions.UnavailableUserDeclinedInstallationException
 import io.flutter.embedding.engine.FlutterEngineCache
 import io.flutter.plugin.common.MethodChannel
-import java.io.ByteArrayOutputStream
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
+import kotlin.math.sqrt
 
 class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
 
@@ -50,17 +51,29 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         private const val TAG = "SLAM"
         private const val CAMERA_PERMISSION_REQUEST_CODE = 1001
         private const val GRID_RESOLUTION_METERS = 0.25f
+        private const val MERGE_DISTANCE_METERS = 1.2f
+
+        // YOLO capture size — portrait, matching training data orientation
+        private const val YOLO_WIDTH  = 640  // landscape — matches sensor native output
+        private const val YOLO_HEIGHT = 480
     }
 
     // ── Views ─────────────────────────────────────────────────────────────────
     private lateinit var surfaceView: GLSurfaceView
     private lateinit var hudTextView: TextView
+    private lateinit var overlayView: DetectionOverlayView
 
     // ── ARCore ────────────────────────────────────────────────────────────────
     private var session: Session? = null
+    private var sharedCamera: SharedCamera? = null
     private var installRequested = false
     private var displayRotationHelper: DisplayRotationHelper? = null
     private lateinit var backgroundRenderer: BackgroundRenderer
+
+    // ── Shared camera ImageReader for YOLO ────────────────────────────────────
+    private var yoloImageReader: ImageReader? = null
+    private var cameraThread: HandlerThread? = null
+    private var cameraHandler: Handler? = null
 
     // ── SLAM & Detection ──────────────────────────────────────────────────────
     private lateinit var slamEngine: SlamEngine
@@ -68,10 +81,11 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     private lateinit var yoloDetector: YoloDetector
 
     private var lastDetectionTime = 0L
-    private val detectionInterval = 1500L
+    private val detectionInterval = 800L
     private val detectionExecutor = Executors.newSingleThreadExecutor()
     private val detectionInProgress = AtomicBoolean(false)
     @Volatile private var lastInferenceMs = 0L
+    @Volatile private var latestPose: com.google.ar.core.Pose? = null
 
     // ── Flutter bridge ────────────────────────────────────────────────────────
     private var methodChannel: MethodChannel? = null
@@ -100,7 +114,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         displayRotationHelper = DisplayRotationHelper(this)
         buildLayout()
 
-        slamEngine = SlamEngine()
+        slamEngine  = SlamEngine()
         semanticMap = SemanticMapManager()
 
         try {
@@ -114,15 +128,16 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     }
 
     private fun buildLayout() {
-        // Standard GLSurfaceView — ARCore renders the camera here via BackgroundRenderer.
-        // No TextureView, no CPU blit, no manual rotation math.
-        // ARCore's transformCoordinates2d() handles all orientation automatically.
         surfaceView = GLSurfaceView(this).apply {
             preserveEGLContextOnPause = true
             setEGLContextClientVersion(2)
             setEGLConfigChooser(8, 8, 8, 8, 16, 0)
             setRenderer(this@ArActivity)
             renderMode = GLSurfaceView.RENDERMODE_CONTINUOUSLY
+        }
+
+        overlayView = DetectionOverlayView(this).apply {
+            setBackgroundColor(Color.TRANSPARENT)
         }
 
         hudTextView = TextView(this).apply {
@@ -135,6 +150,10 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
 
         val root = FrameLayout(this)
         root.addView(surfaceView, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT,
+            FrameLayout.LayoutParams.MATCH_PARENT
+        ))
+        root.addView(overlayView, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT,
             FrameLayout.LayoutParams.MATCH_PARENT
         ))
@@ -165,12 +184,15 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         surfaceView.onPause()
         displayRotationHelper?.onPause()
         session?.pause()
+        overlayView.clearDetections()
+        teardownSharedCamera()
     }
 
     override fun onDestroy() {
         super.onDestroy()
         try { yoloDetector.close() } catch (_: Exception) {}
         detectionExecutor.shutdownNow()
+        teardownSharedCamera()
         session?.close()
         session = null
     }
@@ -208,7 +230,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     }
 
     // ═════════════════════════════════════════════════════════════════════════
-    // ARCore session
+    // ARCore session — created with SHARED_CAMERA feature
     // ═════════════════════════════════════════════════════════════════════════
 
     private fun ensureSessionReady(): Boolean {
@@ -216,31 +238,135 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         return try {
             when (ArCoreApk.getInstance().requestInstall(this, !installRequested)) {
                 ArCoreApk.InstallStatus.INSTALLED -> {
-                    session = Session(this).also { configureSession(it) }
-                    println("$TAG: ARCore session created")
+                    // Create session with shared camera feature enabled
+                    session = Session(this, setOf(Session.Feature.SHARED_CAMERA)).also { s ->
+                        configureSession(s)
+                        setupSharedCamera(s)
+                    }
+                    println("$TAG: ARCore shared-camera session created")
                     true
                 }
                 ArCoreApk.InstallStatus.INSTALL_REQUESTED -> {
                     installRequested = true; false
                 }
             }
-        } catch (e: UnavailableArcoreNotInstalledException) { arUnavailable("ARCore not installed"); false }
-        catch (e: UnavailableUserDeclinedInstallationException) { arUnavailable("ARCore install declined"); false }
-        catch (e: UnavailableApkTooOldException) { arUnavailable("ARCore APK too old"); false }
-        catch (e: UnavailableSdkTooOldException) { arUnavailable("SDK too old"); false }
-        catch (e: UnavailableDeviceNotCompatibleException) { arUnavailable("Device not compatible"); false }
-        catch (e: Exception) { arUnavailable("AR init failed: ${e.message}"); false }
+        } catch (e: UnavailableArcoreNotInstalledException)     { arUnavailable("ARCore not installed"); false }
+        catch (e: UnavailableUserDeclinedInstallationException)  { arUnavailable("ARCore install declined"); false }
+        catch (e: UnavailableApkTooOldException)                 { arUnavailable("ARCore APK too old"); false }
+        catch (e: UnavailableSdkTooOldException)                 { arUnavailable("SDK too old"); false }
+        catch (e: UnavailableDeviceNotCompatibleException)       { arUnavailable("Device not compatible"); false }
+        catch (e: Exception)                                     { arUnavailable("AR init failed: ${e.message}"); false }
     }
 
     private fun configureSession(session: Session) {
         Config(session).apply {
-            focusMode = Config.FocusMode.AUTO
-            updateMode = Config.UpdateMode.LATEST_CAMERA_IMAGE
-            planeFindingMode = Config.PlaneFindingMode.HORIZONTAL_AND_VERTICAL
+            focusMode           = Config.FocusMode.AUTO
+            updateMode          = Config.UpdateMode.LATEST_CAMERA_IMAGE
+            planeFindingMode    = Config.PlaneFindingMode.HORIZONTAL_AND_VERTICAL
             lightEstimationMode = Config.LightEstimationMode.AMBIENT_INTENSITY
-            depthMode = if (session.isDepthModeSupported(Config.DepthMode.AUTOMATIC))
+            depthMode           = if (session.isDepthModeSupported(Config.DepthMode.AUTOMATIC))
                 Config.DepthMode.AUTOMATIC else Config.DepthMode.DISABLED
         }.also { session.configure(it) }
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // Shared Camera setup — ARCore shares the camera with our ImageReader
+    // ═════════════════════════════════════════════════════════════════════════
+
+    private fun setupSharedCamera(session: Session) {
+        sharedCamera = session.sharedCamera
+
+        cameraThread = HandlerThread("SharedCameraThread").also { it.start() }
+        cameraHandler = Handler(cameraThread!!.looper)
+
+        // Create an ImageReader at portrait size matching training data
+        yoloImageReader = ImageReader.newInstance(
+            YOLO_WIDTH, YOLO_HEIGHT, ImageFormat.YUV_420_888, 2
+        ).apply {
+            setOnImageAvailableListener({ reader ->
+                val image = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
+                try {
+                    val now = System.currentTimeMillis()
+                    if (now - lastDetectionTime < detectionInterval ||
+                        !detectionInProgress.compareAndSet(false, true)) {
+                        image.close()
+                        return@setOnImageAvailableListener
+                    }
+                    lastDetectionTime = now
+
+                    val yPlane = image.planes[0]
+                    val uPlane = image.planes[1]
+                    val vPlane = image.planes[2]
+                    val yBytes = ByteArray(yPlane.buffer.remaining()).also { yPlane.buffer.get(it) }
+                    val uBytes = ByteArray(uPlane.buffer.remaining()).also { uPlane.buffer.get(it) }
+                    val vBytes = ByteArray(vPlane.buffer.remaining()).also { vPlane.buffer.get(it) }
+                    val yStride = yPlane.rowStride
+                    val uvStride = uPlane.rowStride
+                    val uvPixStride = uPlane.pixelStride
+                    val w = image.width
+                    val h = image.height
+                    val pose = latestPose
+
+                    image.close()
+
+                    detectionExecutor.execute {
+                        val t0 = System.currentTimeMillis()
+                        try {
+                            val detections = yoloDetector.detectFromYuv(
+                                yBytes, uBytes, vBytes, yStride, uvStride, uvPixStride, w, h
+                            )
+                            lastInferenceMs = System.currentTimeMillis() - t0
+
+                            overlayView.updateDetections(detections, w, h)
+
+                            if (detections.isNotEmpty()) {
+                                println("$TAG: detected ${detections.size}: " +
+                                        detections.joinToString { "${it.label}@${"%.2f".format(it.confidence)}" })
+                            }
+
+                            if (pose != null) {
+                                detections.forEach { det ->
+                                    val worldPos = estimate3DPosition(
+                                        det.boundingBox.toRect(), pose, w, h
+                                    ) ?: return@forEach
+                                    mergeOrAddObject(det, worldPos)
+                                }
+                            }
+                        } catch (e: Exception) {
+                            println("$TAG: detection worker: ${e.message}")
+                        } finally {
+                            detectionInProgress.set(false)
+                        }
+                    }
+                } catch (e: Exception) {
+                    println("$TAG: shared camera image error: ${e.message}")
+                    try { image.close() } catch (_: Exception) {}
+                    detectionInProgress.set(false)
+                }
+            }, cameraHandler)
+        }
+
+        // Register our ImageReader surface with ARCore's shared camera
+        sharedCamera?.setAppSurfaces(
+            session.cameraConfig.cameraId,
+            listOf(yoloImageReader!!.surface)
+        )
+
+        println("$TAG: Shared camera set up, YOLO surface ${YOLO_WIDTH}x${YOLO_HEIGHT}")
+    }
+
+    private fun teardownSharedCamera() {
+        try {
+            yoloImageReader?.close()
+            yoloImageReader = null
+            cameraThread?.quitSafely()
+            cameraThread?.join(500)
+            cameraThread = null
+            cameraHandler = null
+            sharedCamera = null
+        } catch (e: Exception) {
+            println("$TAG: teardown error: ${e.message}")
+        }
     }
 
     private fun arUnavailable(msg: String) {
@@ -249,7 +375,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     }
 
     // ═════════════════════════════════════════════════════════════════════════
-    // GL Renderer — called on the GL thread
+    // GL Renderer
     // ═════════════════════════════════════════════════════════════════════════
 
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
@@ -266,22 +392,15 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
 
     override fun onDrawFrame(gl: GL10?) {
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT or GLES20.GL_DEPTH_BUFFER_BIT)
-
-        // Guard: backgroundRenderer must be initialised on the GL thread first
         if (!::backgroundRenderer.isInitialized) return
         val session = session ?: return
 
         try {
-            // CRITICAL ORDER:
-            // 1. Tell ARCore which OES texture to write the camera image into
-            // 2. Tell ARCore the current display geometry (rotation + size)
-            // 3. Call update() — ARCore writes the frame into the texture
-            // 4. Draw the texture to screen via BackgroundRenderer
             session.setCameraTextureName(backgroundRenderer.textureId)
             displayRotationHelper?.updateSessionIfNeeded(session)
 
-            val frame = session.update()
-            backgroundRenderer.draw(frame)   // handles transformCoordinates2d internally
+            val frame  = session.update()
+            backgroundRenderer.draw(frame)
 
             val camera = frame.camera
             updateHud(camera)
@@ -289,11 +408,6 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             if (camera.trackingState == TrackingState.TRACKING) {
                 updateSlam(frame, camera)
                 val now = System.currentTimeMillis()
-                if (now - lastDetectionTime >= detectionInterval) {
-                    lastDetectionTime = now
-                    maybeRunDetection(frame, camera)
-                    semanticMap.removeStaleObjects()
-                }
                 if (now - lastFlutterUpdateTime >= flutterUpdateIntervalMs) {
                     lastFlutterUpdateTime = now
                     sendUpdatesToFlutter()
@@ -311,6 +425,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     private fun updateSlam(frame: Frame, camera: Camera) {
         try {
             val pose = camera.pose
+            latestPose = pose
             slamEngine.addPose(Point3D(pose.tx(), pose.ty(), pose.tz()))
             frame.getUpdatedTrackables(Plane::class.java).forEach { plane ->
                 if (plane.trackingState == TrackingState.TRACKING) {
@@ -324,95 +439,48 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     }
 
     // ═════════════════════════════════════════════════════════════════════════
-    // Object detection
+    // Object merge / add
     // ═════════════════════════════════════════════════════════════════════════
 
-    private fun maybeRunDetection(frame: Frame, camera: Camera) {
-        if (!detectionInProgress.compareAndSet(false, true)) return
-        val bmp = try {
-            frame.acquireCameraImage().use { yuv420ToBitmap(it) }
-        } catch (_: NotYetAvailableException) {
-            detectionInProgress.set(false); return
-        } catch (e: Exception) {
-            println("$TAG: acquire: ${e.message}"); detectionInProgress.set(false); return
-        }
-        val pose = camera.pose
-        detectionExecutor.execute {
-            val t0 = System.currentTimeMillis()
-            try {
-                val detections = yoloDetector.detect(bmp)
-                lastInferenceMs = System.currentTimeMillis() - t0
-                if (detections.isNotEmpty()) println("$TAG: detected ${detections.size} objects")
-                detections.forEach { det ->
-                    val worldPos = estimate3DPosition(
-                        det.boundingBox.toRect(), pose, bmp.width, bmp.height
-                    ) ?: return@forEach
-                    semanticMap.addObject(SemanticObject(
-                        id = "${det.label}_${worldPos.x.toInt()}_${worldPos.z.toInt()}_${System.currentTimeMillis()}",
-                        type = ObjectType.fromLabel(det.label),
-                        category = det.label,
-                        position = worldPos,
-                        boundingBox = BoundingBox2D(
-                            det.boundingBox.left, det.boundingBox.top,
-                            det.boundingBox.right, det.boundingBox.bottom
-                        ),
-                        confidence = det.confidence,
-                        firstSeen = System.currentTimeMillis(),
-                        lastSeen = System.currentTimeMillis()
-                    ))
-                }
-            } catch (e: Exception) {
-                println("$TAG: detection worker: ${e.message}")
-            } finally {
-                bmp.recycle()
-                detectionInProgress.set(false)
-            }
-        }
-    }
-
-    // ═════════════════════════════════════════════════════════════════════════
-    // YUV → Bitmap (stride-aware)
-    // ═════════════════════════════════════════════════════════════════════════
-
-    private fun yuv420ToBitmap(image: Image): Bitmap {
-        val yPlane = image.planes[0]
-        val uPlane = image.planes[1]
-        val vPlane = image.planes[2]
-
-        val yBuf = yPlane.buffer
-        val uBuf = uPlane.buffer
-        val vBuf = vPlane.buffer
-
-        val yRowStride  = yPlane.rowStride
-        val uvRowStride = uPlane.rowStride
-        val uvPixStride = uPlane.pixelStride
-        val w = image.width
-        val h = image.height
-
-        val nv21 = ByteArray(w * h * 3 / 2)
-        var offset = 0
-
-        // Y plane
-        for (row in 0 until h) {
-            yBuf.position(row * yRowStride)
-            yBuf.get(nv21, offset, w)
-            offset += w
+    private fun mergeOrAddObject(det: YoloDetector.Detection, worldPos: Point3D) {
+        val existing = semanticMap.getAllObjects().firstOrNull { obj ->
+            obj.category == det.label &&
+                    obj.position.distance(worldPos) < MERGE_DISTANCE_METERS
         }
 
-        // Interleaved VU (NV21 = V first)
-        for (row in 0 until h / 2) {
-            for (col in 0 until w / 2) {
-                val idx = row * uvRowStride + col * uvPixStride
-                nv21[offset++] = vBuf.get(idx)
-                nv21[offset++] = uBuf.get(idx)
-            }
+        if (existing != null) {
+            val alpha = 0.2f
+            semanticMap.updateObject(
+                existing.copy(
+                    position = Point3D(
+                        existing.position.x * (1f - alpha) + worldPos.x * alpha,
+                        existing.position.y * (1f - alpha) + worldPos.y * alpha,
+                        existing.position.z * (1f - alpha) + worldPos.z * alpha
+                    ),
+                    confidence   = maxOf(existing.confidence, det.confidence),
+                    lastSeen     = System.currentTimeMillis(),
+                    observations = existing.observations + 1
+                )
+            )
+        } else {
+            val gridX = (worldPos.x / 0.5f).toInt()
+            val gridZ = (worldPos.z / 0.5f).toInt()
+            semanticMap.addObject(
+                SemanticObject(
+                    id          = "${det.label}_${gridX}_${gridZ}",
+                    type        = ObjectType.fromLabel(det.label),
+                    category    = det.label,
+                    position    = worldPos,
+                    boundingBox = BoundingBox2D(
+                        det.boundingBox.left,  det.boundingBox.top,
+                        det.boundingBox.right, det.boundingBox.bottom
+                    ),
+                    confidence  = det.confidence,
+                    firstSeen   = System.currentTimeMillis(),
+                    lastSeen    = System.currentTimeMillis()
+                )
+            )
         }
-
-        val yuv = YuvImage(nv21, ImageFormat.NV21, w, h, null)
-        val out = ByteArrayOutputStream()
-        yuv.compressToJpeg(Rect(0, 0, w, h), 85, out)
-        val bytes = out.toByteArray()
-        return BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
     }
 
     // ═════════════════════════════════════════════════════════════════════════
@@ -425,16 +493,15 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         imgW: Int, imgH: Int
     ): Point3D? {
         return try {
-            val area = (bbox.width() * bbox.height()).toFloat() / (imgW * imgH)
+            val area  = (bbox.width() * bbox.height()).toFloat() / (imgW * imgH)
             val depth = when {
                 area > 0.3f  -> 1.0f
                 area > 0.1f  -> 2.0f
                 area > 0.03f -> 3.5f
                 else         -> 5.0f
             }
-            val q = cameraPose.rotationQuaternion
+            val q  = cameraPose.rotationQuaternion
             val qx = q[0]; val qy = q[1]; val qz = q[2]; val qw = q[3]
-            // Rotate camera forward [0,0,-1] by quaternion
             val fx = 2f * (qx * qz + qy * qw)
             val fy = 2f * (qy * qz - qx * qw)
             val fz = 1f - 2f * (qx * qx + qy * qy)
@@ -454,14 +521,14 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         val now = System.currentTimeMillis()
         if (now - lastHudUpdateTime < hudUpdateIntervalMs) return
         lastHudUpdateTime = now
-        val s = slamEngine.getStatistics()
+        val s   = slamEngine.getStatistics()
         val sem = semanticMap.getStatistics()
         val text = buildString {
             appendLine("AR: ${camera.trackingState}")
             appendLine("Pos  x=${s.currentPosition.x.f2} y=${s.currentPosition.y.f2} z=${s.currentPosition.z.f2}")
             appendLine("Map  cells=${s.cellCount}  edges=${s.edgeCount}")
-            appendLine("Obj  total=${sem.totalObjects}")
-            append("Detect  ${if (detectionInProgress.get()) "⏳ ${lastInferenceMs}ms" else "idle"}")
+            appendLine("Obj  unique=${sem.totalObjects}")
+            append("Detect  ${if (detectionInProgress.get()) "⏳ ${lastInferenceMs}ms" else "idle ${lastInferenceMs}ms"}")
         }
         runOnUiThread { hudTextView.text = text }
     }
@@ -471,27 +538,31 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     // ═════════════════════════════════════════════════════════════════════════
 
     private fun sendUpdatesToFlutter() {
-        val ch = methodChannel ?: return
-        val s = slamEngine.getStatistics()
+        val ch  = methodChannel ?: return
+        val s   = slamEngine.getStatistics()
         val sem = semanticMap.getStatistics()
         val now = System.currentTimeMillis()
         runOnUiThread {
             ch.invokeMethod("updatePose", mapOf(
-                "x" to s.currentPosition.x, "y" to s.currentPosition.y, "z" to s.currentPosition.z
+                "x" to s.currentPosition.x,
+                "y" to s.currentPosition.y,
+                "z" to s.currentPosition.z
             ))
             ch.invokeMethod("onUpdate", mapOf(
-                "position_x" to s.currentPosition.x,
-                "position_y" to s.currentPosition.y,
-                "position_z" to s.currentPosition.z,
-                "edges_count" to s.edgeCount,
-                "cells_count" to s.cellCount,
-                "total_objects" to sem.totalObjects,
-                "doors"   to (sem.objectCounts[ObjectType.DOOR]   ?: 0),
-                "toilets" to (sem.objectCounts[ObjectType.TOILET]  ?: 0),
-                "chairs"  to (sem.objectCounts[ObjectType.CHAIR]   ?: 0),
-                "tables"  to (sem.objectCounts[ObjectType.TABLE]   ?: 0),
-                "laptops" to (sem.objectCounts[ObjectType.LAPTOP]  ?: 0),
-                "windows" to (sem.objectCounts[ObjectType.WINDOW]  ?: 0)
+                "position_x"         to s.currentPosition.x,
+                "position_y"         to s.currentPosition.y,
+                "position_z"         to s.currentPosition.z,
+                "edges_count"        to s.edgeCount,
+                "cells_count"        to s.cellCount,
+                "total_objects"      to sem.totalObjects,
+                "chairs"             to (sem.objectCounts[ObjectType.CHAIR]             ?: 0),
+                "doors"              to (sem.objectCounts[ObjectType.DOOR]              ?: 0),
+                "fire_extinguishers" to (sem.objectCounts[ObjectType.FIRE_EXTINGUISHER] ?: 0),
+                "lift_gates"         to (sem.objectCounts[ObjectType.LIFT_GATE]         ?: 0),
+                "notice_boards"      to (sem.objectCounts[ObjectType.NOTICE_BOARD]      ?: 0),
+                "trash_cans"         to (sem.objectCounts[ObjectType.TRASH_CAN]         ?: 0),
+                "water_purifiers"    to (sem.objectCounts[ObjectType.WATER_PURIFIER]    ?: 0),
+                "windows"            to (sem.objectCounts[ObjectType.WINDOW]            ?: 0)
             ))
             if (now - lastMapUpdateTime >= mapUpdateIntervalMs) {
                 lastMapUpdateTime = now
@@ -516,17 +587,25 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         }
         val objects = semanticMap.getAllObjects().map { obj ->
             mapOf(
-                "id" to obj.id, "type" to obj.type.name, "label" to obj.category,
+                "id"         to obj.id,
+                "type"       to obj.type.name,
+                "label"      to obj.category,
                 "confidence" to obj.confidence,
-                "x" to obj.position.x, "y" to obj.position.y, "z" to obj.position.z,
-                "gridX" to ((obj.position.x / GRID_RESOLUTION_METERS).toInt() - minX),
-                "gridZ" to ((obj.position.z / GRID_RESOLUTION_METERS).toInt() - minZ)
+                "x"          to obj.position.x,
+                "y"          to obj.position.y,
+                "z"          to obj.position.z,
+                "gridX"      to ((obj.position.x / GRID_RESOLUTION_METERS).toInt() - minX),
+                "gridZ"      to ((obj.position.z / GRID_RESOLUTION_METERS).toInt() - minZ)
             )
         }
         return mapOf(
-            "occupancyGrid" to bytes, "gridWidth" to w, "gridHeight" to h,
+            "occupancyGrid"  to bytes,
+            "gridWidth"      to w,
+            "gridHeight"     to h,
             "gridResolution" to GRID_RESOLUTION_METERS.toDouble(),
-            "originX" to minX, "originZ" to minZ, "objects" to objects
+            "originX"        to minX,
+            "originZ"        to minZ,
+            "objects"        to objects
         )
     }
 }

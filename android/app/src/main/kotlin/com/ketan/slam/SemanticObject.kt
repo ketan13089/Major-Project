@@ -33,49 +33,31 @@ data class BoundingBox2D(
 // ── Object Type Enum ──────────────────────────────────────────────────────────
 
 enum class ObjectType {
-    // Architectural
-    DOOR, WINDOW, LIFT_GATE,
+    // New 8-class model classes
+    CHAIR,
+    DOOR,
+    FIRE_EXTINGUISHER,
+    LIFT_GATE,
+    NOTICE_BOARD,
+    TRASH_CAN,
+    WATER_PURIFIER,
+    WINDOW,
 
-    // Furniture
-    CHAIR, TABLE, DESK, BED, COUCH, CUPBOARD,
-
-    // Electronics
-    LAPTOP, AC, TV,
-
-    // Fixtures
-    TOILET, SINK, NOTICE_BOARD, SIGN,
-
-    // Objects
-    COFFEE_CUP, BOTTLE, BOOK, BAG,
-
-    // Generic
-    FURNITURE, UNKNOWN;
+    // Generic fallback
+    UNKNOWN;
 
     companion object {
         fun fromLabel(label: String): ObjectType {
-            return when (label.lowercase().replace("_", "")) {
-                "door"                              -> DOOR
-                "window"                            -> WINDOW
-                "liftgate", "lift"                  -> LIFT_GATE
-                "chair"                             -> CHAIR
-                "table", "diningtable"              -> TABLE
-                "desk"                              -> DESK
-                "bed"                               -> BED
-                "couch", "sofa"                     -> COUCH
-                "cupboard", "cabinet", "wardrobe"   -> CUPBOARD
-                "laptop", "computer"                -> LAPTOP
-                "ac", "airconditioner"              -> AC
-                "tv", "television", "monitor"       -> TV
-                "toilet"                            -> TOILET
-                "sink"                              -> SINK
-                "noticeboard", "board", "whiteboard"-> NOTICE_BOARD
-                "sign", "signboard"                 -> SIGN
-                "coffeecup", "cup", "mug"           -> COFFEE_CUP
-                "bottle", "waterbottle"             -> BOTTLE
-                "book"                              -> BOOK
-                "bag", "backpack", "handbag"        -> BAG
-                else -> if (label.contains("furniture") || label.contains("shelf"))
-                    FURNITURE else UNKNOWN
+            return when (label.lowercase().trim()) {
+                "chair"             -> CHAIR
+                "door"              -> DOOR
+                "fire_extinguisher" -> FIRE_EXTINGUISHER
+                "lift_gate"         -> LIFT_GATE
+                "notice_board"      -> NOTICE_BOARD
+                "trash_can"         -> TRASH_CAN
+                "water_purifier"    -> WATER_PURIFIER
+                "window"            -> WINDOW
+                else                -> UNKNOWN
             }
         }
     }
