@@ -46,9 +46,11 @@ import kotlin.math.sqrt
 class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
 
     companion object {
-        private const val CHANNEL  = "com.ketan.slam/ar"
-        private const val TAG      = "SLAM"
-        private const val CAM_PERM = 1001
+        private const val CHANNEL     = "com.ketan.slam/ar"
+        private const val NAV_CHANNEL = "com.ketan.slam/nav"
+        private const val TAG         = "SLAM"
+        private const val CAM_PERM    = 1001
+        private const val MIC_PERM    = 1002
 
         // Grid resolution — 20 cm per cell gives good spatial detail
         private const val RES = 0.20f
@@ -72,6 +74,8 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     private lateinit var surfaceView: GLSurfaceView
     private lateinit var hudView: TextView
     private lateinit var overlayView: DetectionOverlayView
+    private lateinit var navView: TextView     // nav instruction banner
+    private lateinit var micButton: TextView   // voice nav trigger
 
     // ── ARCore ────────────────────────────────────────────────────────────────
     private var session: Session? = null
@@ -113,7 +117,11 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
 
     // ── Flutter ───────────────────────────────────────────────────────────────
     private var methodChannel: MethodChannel? = null
+    private var navChannel: MethodChannel? = null
     private var lastHudMs = 0L; private var lastFlutterMs = 0L; private var lastMapMs = 0L
+
+    // ── Navigation ────────────────────────────────────────────────────────────
+    private var navigationManager: NavigationManager? = null
 
     // ─────────────────────────────────────────────────────────────────────────
     // Lifecycle
@@ -125,6 +133,18 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
 
         FlutterEngineCache.getInstance().get("slam_engine")?.let {
             methodChannel = MethodChannel(it.dartExecutor.binaryMessenger, CHANNEL)
+            navChannel    = MethodChannel(it.dartExecutor.binaryMessenger, NAV_CHANNEL)
+            navChannel?.setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "startVoiceNav"  -> {
+                        if (hasMicPerm()) navigationManager?.startVoiceCommand()
+                        else reqMicPerm()
+                        result.success(null)
+                    }
+                    "stopNavigation" -> { navigationManager?.stopNavigation(); result.success(null) }
+                    else             -> result.notImplemented()
+                }
+            }
         }
 
         displayRotationHelper = DisplayRotationHelper(this)
@@ -132,6 +152,18 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
 
         slamEngine  = SlamEngine()
         semanticMap = SemanticMapManager()
+        navigationManager = NavigationManager(
+            context       = this,
+            res           = RES,
+            onStateChange = { state, msg -> runOnUiThread { updateNavHud(state, msg) } },
+            onInstruction = { instr -> runOnUiThread {
+                navChannel?.invokeMethod("navInstruction", mapOf(
+                    "text"           to instr.text,
+                    "turn"           to instr.turn.name,
+                    "distanceMetres" to instr.distanceMetres.toDouble()))
+            }},
+            onPathUpdated = { _ -> /* path is included in the next buildMapPayload call */ }
+        )
 
         try { yoloDetector = YoloDetector(this); println("$TAG: YOLO ready") }
         catch (e: Exception) { println("$TAG: YOLO init failed: ${e.message}") }
@@ -160,6 +192,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     override fun onDestroy() {
         super.onDestroy()
         try { yoloDetector.close() } catch (_: Exception) {}
+        navigationManager?.destroy(); navigationManager = null
         detectionExecutor.shutdownNow()
         teardownCamera()
         session?.close(); session = null
@@ -185,12 +218,34 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             setPadding(20, 14, 20, 14)
             text = "Initializing…"
         }
+        navView = TextView(this).apply {
+            setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            setBackgroundColor(0xCC1D4ED8.toInt())
+            setPadding(24, 14, 24, 14)
+            gravity = Gravity.CENTER
+            visibility = android.view.View.GONE
+        }
+        micButton = TextView(this).apply {
+            text = "🎤"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 20f)
+            setBackgroundColor(0xCC2563EB.toInt())
+            setTextColor(Color.WHITE)
+            setPadding(20, 14, 20, 14)
+            setOnClickListener { onMicTapped() }
+        }
         val root = FrameLayout(this)
         root.addView(surfaceView, mpmp())
         root.addView(overlayView, mpmp())
         root.addView(hudView, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT,
             Gravity.TOP or Gravity.START).apply { setMargins(24, 48, 24, 0) })
+        root.addView(navView, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT,
+            Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply { setMargins(16, 0, 16, 90) })
+        root.addView(micButton, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT,
+            Gravity.BOTTOM or Gravity.END).apply { setMargins(0, 0, 24, 24) })
         setContentView(root)
     }
 
@@ -204,18 +259,32 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     private fun hasCamPerm() = ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) ==
             PackageManager.PERMISSION_GRANTED
 
+    private fun hasMicPerm() = ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) ==
+            PackageManager.PERMISSION_GRANTED
+
     private fun reqCamPerm() = ActivityCompat.requestPermissions(
         this, arrayOf(Manifest.permission.CAMERA), CAM_PERM)
 
+    private fun reqMicPerm() = ActivityCompat.requestPermissions(
+        this, arrayOf(Manifest.permission.RECORD_AUDIO), MIC_PERM)
+
     override fun onRequestPermissionsResult(rc: Int, p: Array<out String>, results: IntArray) {
         super.onRequestPermissionsResult(rc, p, results)
-        if (rc != CAM_PERM) return
-        if (results.isEmpty() || results[0] != PackageManager.PERMISSION_GRANTED) {
-            Toast.makeText(this, "Camera permission required.", Toast.LENGTH_LONG).show(); finish(); return
+        when (rc) {
+            CAM_PERM -> {
+                if (results.isEmpty() || results[0] != PackageManager.PERMISSION_GRANTED) {
+                    Toast.makeText(this, "Camera permission required.", Toast.LENGTH_LONG).show(); finish(); return
+                }
+                if (!ensureSession()) return
+                try { session?.resume(); surfaceView.onResume(); displayRotationHelper?.onResume() }
+                catch (e: Exception) { println("$TAG: resume after perm: ${e.message}") }
+            }
+            MIC_PERM -> {
+                if (results.isNotEmpty() && results[0] == PackageManager.PERMISSION_GRANTED) {
+                    navigationManager?.startVoiceCommand()
+                }
+            }
         }
-        if (!ensureSession()) return
-        try { session?.resume(); surfaceView.onResume(); displayRotationHelper?.onResume() }
-        catch (e: Exception) { println("$TAG: resume after perm: ${e.message}") }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -410,6 +479,16 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             }
 
             semanticMap.removeStaleObjects()
+
+            // Navigation: compute heading and tick the guidance loop
+            val q    = pose.rotationQuaternion
+            val sinY = 2f * (q[3] * q[1] + q[2] * q[0])
+            val cosY = 1f - 2f * (q[1] * q[1] + q[2] * q[2])
+            latestHeading = kotlin.math.atan2(sinY, cosY)
+            val nm = navigationManager
+            if (nm != null && nm.needsGrid) {
+                nm.tick(cx, cz, latestHeading, HashMap(grid), semanticMap)
+            }
         } catch (e: Exception) { println("$TAG: slam: ${e.message}") }
     }
 
@@ -711,6 +790,11 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             )
         }
 
+        // Include active navigation path (local grid coordinates, same origin as occupancy grid)
+        val navPath = navigationManager?.currentSession?.path?.map { wp ->
+            mapOf("x" to (wp.gridX - gMinX), "z" to (wp.gridZ - gMinZ))
+        } ?: emptyList<Any>()
+
         return mapOf(
             "occupancyGrid"  to bytes,
             "gridWidth"      to w,      "gridHeight"     to h,
@@ -718,8 +802,39 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             "originX"        to gMinX,  "originZ"        to gMinZ,
             "robotGridX"     to (worldToGrid(curPos.x) - gMinX),
             "robotGridZ"     to (worldToGrid(curPos.z) - gMinZ),
-            "objects"        to objects
+            "objects"        to objects,
+            "navPath"        to navPath
         )
+    }
+
+    // ── Navigation UI helpers ─────────────────────────────────────────────────
+
+    private fun updateNavHud(state: NavigationState, message: String) {
+        val (label, bgColor) = when (state) {
+            NavigationState.LISTENING  -> "🎤 $message" to 0xCC7C3AED.toInt()
+            NavigationState.PLANNING   -> "🔍 $message" to 0xCC2563EB.toInt()
+            NavigationState.NAVIGATING -> "🧭 $message" to 0xCC1D4ED8.toInt()
+            NavigationState.ARRIVED    -> "✅ $message"  to 0xCC16A34A.toInt()
+            NavigationState.ERROR      -> "⚠️ $message"  to 0xCCDC2626.toInt()
+            NavigationState.IDLE       -> ""             to 0
+        }
+        navView.setBackgroundColor(bgColor)
+        navView.text       = label
+        navView.visibility = if (state == NavigationState.IDLE) android.view.View.GONE
+                             else android.view.View.VISIBLE
+        micButton.text     = if (state == NavigationState.NAVIGATING) "⏹" else "🎤"
+        // Mirror state to Flutter map viewer
+        navChannel?.invokeMethod("navStateChange",
+            mapOf("state" to state.name, "message" to message))
+    }
+
+    private fun onMicTapped() {
+        if (!hasMicPerm()) { reqMicPerm(); return }
+        if (navigationManager?.state == NavigationState.NAVIGATING) {
+            navigationManager?.stopNavigation()
+        } else {
+            navigationManager?.startVoiceCommand()
+        }
     }
 }
 

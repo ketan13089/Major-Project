@@ -24,9 +24,9 @@ private data class Candidate(
 )
 
 class DetectionConfirmationGate(
-    private val requiredHits: Int   = 3,
-    private val windowMs:     Long  = 4_000L,
-    private val minIoU:       Float = 0.35f
+    private val requiredHits: Int   = 1,        // was 3 → instant add on first detection
+    private val windowMs:     Long  = 2_000L,   // reduced for faster updates
+    private val minIoU:       Float = 0.25f     // was 0.35f
 ) {
     private val candidates = mutableListOf<Candidate>()
 
@@ -81,14 +81,14 @@ class YoloDetector(context: Context) {
     companion object {
         private const val TAG = "YoloDetector"
         private const val INPUT_SIZE = 640
-        private const val CONFIDENCE_THRESHOLD = 0.60f  // gate filters further with 3-hit rule
+        private const val CONFIDENCE_THRESHOLD = 0.45f  // was 0.60f
         private const val IOU_THRESHOLD = 0.45f
         private const val MODEL_FILE = "indoor_nav_best_float16.tflite"
 
-        private const val MIN_BOX_FRACTION = 0.004f
-        private const val MAX_BOX_FRACTION = 0.80f
-        private const val MIN_ASPECT = 0.10f
-        private const val MAX_ASPECT = 9.0f
+        private const val MIN_BOX_FRACTION = 0.002f     // was 0.004f
+        private const val MAX_BOX_FRACTION = 0.90f      // was 0.80f
+        private const val MIN_ASPECT = 0.08f            // was 0.10f
+        private const val MAX_ASPECT = 10.0f            // was 9.0f
     }
 
     private var interpreter: Interpreter? = null
@@ -219,7 +219,7 @@ class YoloDetector(context: Context) {
     private fun loadModel(context: Context) {
         try {
             val model = FileUtil.loadMappedFile(context, MODEL_FILE)
-            interpreter = Interpreter(model, Interpreter.Options().apply { numThreads = 4; useNNAPI = false })
+            interpreter = Interpreter(model, Interpreter.Options().apply { numThreads = 6; useNNAPI = true })
             val outShape = interpreter!!.getOutputTensor(0).shape()
             println("$TAG: in=${interpreter!!.getInputTensor(0).shape().toList()} out=${outShape.toList()}")
             numClasses = if (outShape.size >= 3) maxOf(minOf(outShape[1], outShape[2]) - 4, 1) else allLabels.size

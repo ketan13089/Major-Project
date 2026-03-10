@@ -117,7 +117,8 @@ class IndoorMapViewer extends StatefulWidget {
 
 class _IndoorMapViewerState extends State<IndoorMapViewer>
     with TickerProviderStateMixin {
-  static const _ch = MethodChannel('com.ketan.slam/ar');
+  static const _ch    = MethodChannel('com.ketan.slam/ar');
+  static const _navCh = MethodChannel('com.ketan.slam/nav');
 
   // ── Data ──────────────────────────────────────────────────────────────────
   Uint8List? grid;
@@ -137,6 +138,12 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
   int? _selObj;
   bool _showLegend = false;
 
+  // ── Navigation ────────────────────────────────────────────────────────────
+  String _navState       = 'IDLE';
+  String _navMessage     = '';
+  String _navInstruction = '';
+  Set<int> _navPathCells = {};
+
   // ── Animations ────────────────────────────────────────────────────────────
   late AnimationController _pulseCtrl;
 
@@ -144,6 +151,7 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
   void initState() {
     super.initState();
     _ch.setMethodCallHandler(_onCall);
+    _navCh.setMethodCallHandler(_onNavCall);
     _pulseCtrl = AnimationController(
         vsync: this, duration: const Duration(seconds: 2))
       ..repeat();
@@ -207,13 +215,66 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
         originX = newOX; originZ = newOZ;
         robotGX = newRGX; robotGZ = newRGZ;
         objects = newObjs; totalObjects = newObjs.length;
+        _navPathCells = _parseNavPath(args['navPath'], newW, newH);
       });
     } catch (e, st) { debugPrint('map error: $e\n$st'); }
+  }
+
+  Set<int> _parseNavPath(dynamic raw, int w, int h) {
+    if (raw is! List || w == 0) return {};
+    final out = <int>{};
+    for (final e in raw) {
+      if (e is! Map) continue;
+      final nx = (e['x'] as num?)?.toInt() ?? -1;
+      final nz = (e['z'] as num?)?.toInt() ?? -1;
+      if (nx >= 0 && nx < w && nz >= 0 && nz < h) out.add(nz * w + nx);
+    }
+    return out;
   }
 
   Future<void> _openAR() async {
     try { await _ch.invokeMethod('openAR'); setState(() => scanning = true); }
     catch (_) {}
+  }
+
+  Future<void> _onNavCall(MethodCall call) async {
+    switch (call.method) {
+      case 'navStateChange':
+        final a = call.arguments as Map;
+        setState(() {
+          _navState   = a['state']   as String? ?? _navState;
+          _navMessage = a['message'] as String? ?? _navMessage;
+          if (_navState == 'IDLE' || _navState == 'ARRIVED') _navInstruction = '';
+        });
+        break;
+      case 'navInstruction':
+        final a = call.arguments as Map;
+        setState(() {
+          _navInstruction = a['text'] as String? ?? _navInstruction;
+        });
+        break;
+    }
+  }
+
+  Future<void> _onNavButtonTap() async {
+    try {
+      if (_navState == 'NAVIGATING') {
+        await _navCh.invokeMethod('stopNavigation');
+      } else {
+        await _navCh.invokeMethod('startVoiceNav');
+      }
+    } catch (_) {}
+  }
+
+  Color _navStateColor() {
+    switch (_navState) {
+      case 'LISTENING':  return const Color(0xFF7C3AED);
+      case 'PLANNING':   return _T.blue;
+      case 'NAVIGATING': return const Color(0xFF1D4ED8);
+      case 'ARRIVED':    return _T.green;
+      case 'ERROR':      return _T.red;
+      default:           return _T.textSec;
+    }
   }
 
   double get _areaSqM {
@@ -300,6 +361,23 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
           ]),
         ),
         Divider(height: 1, color: _T.border),
+        // Nav status row — visible only when navigation is active
+        if (_navState != 'IDLE')
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+            color: _navStateColor().withOpacity(0.08),
+            child: Row(children: [
+              Icon(Icons.assistant_navigation, size: 13, color: _navStateColor()),
+              const SizedBox(width: 6),
+              Expanded(child: Text(
+                _navMessage,
+                style: TextStyle(color: _navStateColor(), fontSize: 12,
+                    fontWeight: FontWeight.w500),
+                overflow: TextOverflow.ellipsis,
+              )),
+            ]),
+          ),
       ]),
     );
   }
@@ -362,6 +440,7 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
                 grid: grid, gridW: gridW, gridH: gridH,
                 gridRes: gridRes,
                 objects: objects, pathCells: pathCells,
+                navPathCells: _navPathCells,
                 selectedObj: _selObj,
                 robotGX: robotGX, robotGZ: robotGZ, heading: heading,
                 scale: scale, pan: pan,
@@ -440,6 +519,53 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
                 ]),
               ),
             ),
+          // Navigation instruction banner
+          if (_navInstruction.isNotEmpty)
+            Positioned(
+              bottom: 60, left: 12, right: 64,
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF1D4ED8),
+                  borderRadius: BorderRadius.circular(10),
+                  boxShadow: [BoxShadow(
+                      color: Colors.black.withOpacity(0.18),
+                      blurRadius: 10, offset: const Offset(0, 3))],
+                ),
+                child: Row(children: [
+                  const Text('🧭', style: TextStyle(fontSize: 15)),
+                  const SizedBox(width: 8),
+                  Expanded(child: Text(
+                    _navInstruction,
+                    style: const TextStyle(color: Colors.white, fontSize: 13,
+                        fontWeight: FontWeight.w600),
+                  )),
+                ]),
+              ),
+            ),
+          // Voice nav / stop button
+          Positioned(
+            right: 12,
+            bottom: _navInstruction.isNotEmpty ? 60 : 12,
+            child: GestureDetector(
+              onTap: _onNavButtonTap,
+              child: Container(
+                width: 48, height: 48,
+                decoration: BoxDecoration(
+                  color: _navState == 'NAVIGATING' ? _T.red : _T.blue,
+                  shape: BoxShape.circle,
+                  boxShadow: [BoxShadow(
+                      color: Colors.black.withOpacity(0.18),
+                      blurRadius: 8, offset: const Offset(0, 2))],
+                ),
+                child: Icon(
+                  _navState == 'LISTENING'  ? Icons.mic_none_rounded :
+                  _navState == 'NAVIGATING' ? Icons.stop_rounded     : Icons.mic_rounded,
+                  color: Colors.white, size: 22,
+                ),
+              ),
+            ),
+          ),
         ]),
       ),
     );
@@ -636,6 +762,7 @@ class _MapPainter extends CustomPainter {
   final double gridRes;
   final List<MapObject> objects;
   final Set<int> pathCells;
+  final Set<int> navPathCells;
   final int? selectedObj;
   final int robotGX, robotGZ;
   final double heading, scale, pulse;
@@ -644,6 +771,7 @@ class _MapPainter extends CustomPainter {
   const _MapPainter({
     required this.grid, required this.gridW, required this.gridH,
     required this.gridRes, required this.objects, required this.pathCells,
+    required this.navPathCells,
     required this.selectedObj,
     required this.robotGX, required this.robotGZ,
     required this.heading, required this.scale, required this.pan, required this.pulse,
@@ -657,6 +785,7 @@ class _MapPainter extends CustomPainter {
 
     _drawGrid(canvas, size, origin);
     _drawCells(canvas, origin);
+    _drawNavPath(canvas, origin);
     _drawPath(canvas, origin);
     _drawObjects(canvas, origin);
     _drawRobot(canvas, origin);
@@ -699,6 +828,19 @@ class _MapPainter extends CustomPainter {
           case cellObstacle: canvas.drawRect(rect, pObstacle); break;
         }
       }
+    }
+  }
+
+  void _drawNavPath(Canvas canvas, Offset origin) {
+    if (navPathCells.isEmpty || gridW == 0) return;
+    // Solid emerald green — distinct from the blue BFS selection path
+    final paint = Paint()..color = const Color(0xFF10B981).withOpacity(0.65);
+    final cp = scale;
+    for (final id in navPathCells) {
+      final cx = id % gridW; final cz = id ~/ gridW;
+      canvas.drawRect(
+          Rect.fromLTWH(origin.dx + cx * cp, origin.dy + cz * cp, cp, cp),
+          paint);
     }
   }
 
@@ -795,6 +937,7 @@ class _MapPainter extends CustomPainter {
   @override
   bool shouldRepaint(_MapPainter o) =>
       grid != o.grid || objects != o.objects || pathCells != o.pathCells ||
+          navPathCells != o.navPathCells ||
           robotGX != o.robotGX || robotGZ != o.robotGZ || heading != o.heading ||
           scale != o.scale || pan != o.pan || pulse != o.pulse ||
           selectedObj != o.selectedObj;
