@@ -27,8 +27,9 @@ data class NavWaypoint(val gridX: Int, val gridZ: Int) {
 class PathPlanner(private val res: Float) {
 
     companion object {
-        /** Safety margin (cells) inflated around OBSTACLE/WALL cells. */
-        private const val INFLATE = 1
+        /** Safety margin (cells) inflated around OBSTACLE/WALL cells.
+         *  2 cells × 0.20 m = 0.40 m clearance — realistic for walking. */
+        private const val INFLATE = 2
 
         // Feature 2.4: semantic cost modifiers
         /** Cost multiplier for cells near stable landmarks (lower = preferred). */
@@ -73,6 +74,19 @@ class PathPlanner(private val res: Float) {
         fun isWalkableOrGoal(x: Int, z: Int) =
             (x == goalGX && z == goalGZ) || isWalkable(x, z)
 
+        // Pre-check: if start is blocked, find nearest walkable cell
+        var actualStartGX = startGX
+        var actualStartGZ = startGZ
+        if (!isWalkable(startGX, startGZ)) {
+            val alt = findNearestWalkable(startGX, startGZ, ::isWalkable, 3)
+            if (alt != null) { actualStartGX = alt.x; actualStartGZ = alt.z }
+            else return emptyList()
+        }
+
+        // Pre-check: verify at least one walkable cell near goal
+        val goalReachable = (-2..2).any { dx -> (-2..2).any { dz -> isWalkable(goalGX + dx, goalGZ + dz) } }
+        if (!goalReachable) return emptyList()
+
         // ── A* ────────────────────────────────────────────────────────────────
         data class Node(val x: Int, val z: Int, val g: Float, val f: Float)
 
@@ -101,9 +115,10 @@ class PathPlanner(private val res: Float) {
             }
         }
 
-        gCost[start]  = 0f
-        parent[start] = null
-        open.add(Node(startGX, startGZ, 0f, octile(startGX, startGZ, goalGX, goalGZ)))
+        val actualStart = GridCell(actualStartGX, actualStartGZ)
+        gCost[actualStart]  = 0f
+        parent[actualStart] = null
+        open.add(Node(actualStartGX, actualStartGZ, 0f, octile(actualStartGX, actualStartGZ, goalGX, goalGZ)))
 
         val dirs = arrayOf(
             intArrayOf( 1,  0), intArrayOf(-1,  0),
@@ -157,7 +172,15 @@ class PathPlanner(private val res: Float) {
         raw.reverse()
 
         // ── String-pull (LOS smoothing) ───────────────────────────────────────
-        return smoothPath(raw, ::isWalkableOrGoal)
+        val smoothed = smoothPath(raw, ::isWalkableOrGoal)
+
+        // Verify smoothed path — string-pulling can create invalid shortcuts
+        for (i in 0 until smoothed.size - 1) {
+            if (!hasLOS(smoothed[i], smoothed[i + 1], ::isWalkableOrGoal)) {
+                return raw  // smoothing created an invalid shortcut, use raw path
+            }
+        }
+        return smoothed
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -209,6 +232,17 @@ class PathPlanner(private val res: Float) {
             }
         }
         return blocked
+    }
+
+    /** Find nearest walkable cell within a given radius. */
+    private fun findNearestWalkable(cx: Int, cz: Int, walkable: (Int, Int) -> Boolean, radius: Int): GridCell? {
+        for (r in 1..radius) {
+            for (dz in -r..r) for (dx in -r..r) {
+                if (abs(dx) != r && abs(dz) != r) continue  // only check the ring
+                if (walkable(cx + dx, cz + dz)) return GridCell(cx + dx, cz + dz)
+            }
+        }
+        return null
     }
 
     /** Octile distance — admissible heuristic for 8-directional A*. */

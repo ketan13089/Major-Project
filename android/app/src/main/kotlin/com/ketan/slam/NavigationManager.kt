@@ -104,6 +104,16 @@ class NavigationManager(
             return
         }
 
+        // ── Path validity check — verify path hasn't been blocked by new obstacles ─
+        val pathInvalidated = session.path.any { wp ->
+            val cellType = grid[GridCell(wp.gridX, wp.gridZ)]?.toInt() ?: 0
+            cellType == 3 || cellType == 2  // CELL_WALL or CELL_OBSTACLE
+        }
+        if (pathInvalidated) {
+            rePlan(userX, userZ, session, grid, semanticMap)
+            return
+        }
+
         // ── Deviation → re-plan ───────────────────────────────────────────────
         if (minDistToPath(userX, userZ, session.path) > DEVIATION_M) {
             rePlan(userX, userZ, session, grid, semanticMap)

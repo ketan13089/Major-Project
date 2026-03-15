@@ -25,6 +25,9 @@ class SemanticMapManager {
     private val spatialGrid = ConcurrentHashMap<GridCell, MutableList<SemanticObject>>()
     private val objectsById  = ConcurrentHashMap<String, SemanticObject>()
 
+    /** Callback invoked when a stale object is removed — used by MapBuilder to clear footprints. */
+    var onObjectRemoved: ((SemanticObject) -> Unit)? = null
+
     // Feature 2.1: Object relationship graph (internal system use only)
     val relationGraph = ObjectRelationGraph()
 
@@ -93,12 +96,14 @@ class SemanticMapManager {
     fun removeStaleObjects() {
         synchronized(this) {
             val now = System.currentTimeMillis()
-            objectsById.values
+            val stale = objectsById.values
                 .filter { (now - it.lastSeen) > STALE_TIME_MS && it.observations < MIN_OBSERVATIONS }
-                .forEach { obj ->
-                    objectsById.remove(obj.id)
-                    spatialGrid[toGridCell(obj.position)]?.remove(obj)
-                }
+            stale.forEach { obj ->
+                objectsById.remove(obj.id)
+                spatialGrid[toGridCell(obj.position)]?.remove(obj)
+                // Notify MapBuilder to clear this object's obstacle footprint
+                onObjectRemoved?.invoke(obj)
+            }
         }
     }
 

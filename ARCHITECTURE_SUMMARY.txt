@@ -40,9 +40,45 @@ Android Kotlin (core engine)
   - ARCore session lifecycle and shared camera setup.
   - GL rendering loop integration.
   - YOLO inference triggering and detection processing.
-  - Occupancy grid and log-odds updates.
+  - Delegates mapping to MapBuilder, pose tracking to PoseTracker.
+  - Captures keyframes into ObservationStore.
+  - Manages reference anchors for drift detection.
+  - Triggers periodic grid rebuilds on background thread.
   - Semantic object merge/add and obstacle footprint marking.
   - Navigation manager ticking and payload bridging to Flutter.
+
+- MapBuilder.kt (occupancy grid engine)
+  - Owns the log-odds probabilistic occupancy grid.
+  - Provides incremental updates (per-frame) for low-latency feedback.
+  - Performs full grid rebuilds from ObservationStore keyframes.
+  - Temporal decay: occupied cells lose confidence if not re-observed.
+  - Spatial consistency: removes isolated wall cells, fills wall gaps.
+  - Plane rasterization (horizontal→free, vertical→wall).
+  - Ray-cast free-space marking (7-ray fan, max 2.5m range).
+  - Obstacle footprint marking and cleanup.
+
+- ObservationStore.kt
+  - Thread-safe ring buffer of Keyframes (max 500).
+  - Versioned — MapBuilder only rebuilds when version changes.
+  - Stores plane snapshots, ray observations, pose data per keyframe.
+
+- PoseTracker.kt
+  - Pose history tracking with keyframe selection criteria.
+  - Reference anchor management for drift detection.
+  - Places ARCore Anchors every ~5m of movement.
+  - Detects when ARCore corrects its coordinate frame (drift > 5cm).
+
+- Keyframe.kt
+  - Data classes: Keyframe, PlaneSnapshot, PlaneType, ObjectSighting.
+  - Keyframes store all spatial observations at a moment in time.
+  - PlaneSnapshots store world-space polygon vertices.
+
+- ObjectLocalizer.kt
+  - Estimates 3D position of YOLO detections.
+  - Strategy 1: ARCore hit-test with correct coordinate mapping
+    (accounts for YOLO's 90° rotation and 80px padding).
+  - Strategy 2: Continuous inverse-sqrt depth model (fallback).
+  - Provides per-type obstacle footprint sizes.
 
 - BackgroundRenderer.kt
   - Draws AR camera feed on GLSurfaceView using external OES texture.
@@ -59,9 +95,8 @@ Android Kotlin (core engine)
   - Includes DetectionConfirmationGate for temporal consistency.
 
 - SlamEngine.kt
-  - Tracks pose history and total distance.
+  - Tracks pose history and total distance (legacy, kept for Flutter HUD).
   - Counts edge segments from plane polygons.
-  - Occupancy grid storage itself is managed in ArActivity.
 
 - SemanticObject.kt
   - Core geometry/data types (Point3D, BoundingBox2D, SemanticObject, ObjectType).
@@ -70,6 +105,7 @@ Android Kotlin (core engine)
   - Object store with spatial indexing.
   - Deduplicates/merges nearby same-type detections.
   - Maintains relationship graph and removes stale low-confidence objects.
+  - Fires onObjectRemoved callback for footprint cleanup on stale removal.
 
 - ObjectRelationGraph.kt
   - Builds internal spatial relations among objects:
@@ -82,9 +118,10 @@ Android Kotlin (core engine)
 
 - PathPlanner.kt
   - A* planner on occupancy grid.
-  - Obstacle/wall inflation for safety margin.
+  - Obstacle/wall inflation: 2-cell (40cm) safety margin.
+  - Pre-checks: blocked start → find nearest walkable, goal reachability.
   - Diagonal movement with anti corner-cutting checks.
-  - Line-of-sight smoothing for cleaner path.
+  - Line-of-sight smoothing with post-smoothing validity verification.
   - Semantic cost modifiers near landmark/hazard object types.
 
 - NavigationGuide.kt
@@ -94,6 +131,8 @@ Android Kotlin (core engine)
 - NavigationManager.kt
   - Orchestrates full navigation pipeline:
     voice intent -> destination selection -> path planning -> guidance + rerouting.
+  - Path validity monitoring: detects when path crosses newly-occupied cells.
+  - Deviation detection and automatic re-planning.
   - Maintains state machine:
     IDLE, LISTENING, PLANNING, NAVIGATING, ARRIVED, ERROR.
 
@@ -125,16 +164,27 @@ Method channels:
 1. Flutter requests AR opening.
 2. ArActivity starts ARCore shared-camera session.
 3. GL loop updates frames; YOLO runs periodically on YUV camera frames.
-4. Confirmed detections are localized in 3D (AR hit-test first, fallback depth estimate).
+4. Confirmed detections are localized in 3D via ObjectLocalizer
+   (ARCore hit-test first with correct coordinate mapping, fallback depth estimate).
 5. Semantic map is updated (merge existing or add new object).
-6. Occupancy map is updated from:
-   - camera traversed cells
-   - ray-cast free-space fan
-   - ARCore horizontal planes as free area
-   - ARCore vertical planes as walls
-   - detected object footprints as occupied
-7. NavigationManager (when active/pending) ticks with latest pose + grid + semantic map.
-8. Kotlin pushes live updates to Flutter map viewer.
+6. Per-frame incremental map update via MapBuilder:
+   - camera traversed cells marked visited/free
+   - ray-cast free-space fan (7 rays, 2.5m range)
+7. Plane snapshots captured and integrated:
+   - ARCore horizontal planes → free area
+   - ARCore vertical planes → wall cells
+8. Keyframes captured (when pose changes >15cm or >10°):
+   - Stored in ObservationStore ring buffer
+9. Periodic full grid rebuild (~2s) from keyframes:
+   - Re-projects all observations from corrected poses
+   - Applies temporal decay to unconfirmed occupied cells
+   - Enforces spatial consistency (remove isolated walls, fill gaps)
+10. Drift detection via reference anchors:
+    - When drift > 5cm, immediate grid rebuild triggered
+11. NavigationManager (when active/pending) ticks with latest pose + grid:
+    - Path validity check against current grid
+    - Deviation detection and re-planning
+12. Kotlin pushes live updates to Flutter map viewer.
 
 
 5) OCCUPANCY GRID MODEL
@@ -150,14 +200,25 @@ Cell values:
 - 4 Visited
 
 Probability model:
-- Log-odds map (ConcurrentHashMap<GridCell, Float>) in ArActivity.
-- Updates clamp between L_MIN and L_MAX.
+- Log-odds map (ConcurrentHashMap<GridCell, Float>) in MapBuilder.
+- Updates clamp between L_MIN (-3.0) and L_MAX (2.5).
 - Thresholding converts log-odds to cell type.
+- Temporal decay: occupied cells lose 0.05 log-odds per rebuild if not re-observed.
 
 Important behavior:
 - Camera vicinity is strongly marked free/visited.
-- Multi-ray fan marks forward corridor free.
+- Multi-ray fan marks forward corridor free (2.5m range, was 4.0m).
 - Occupied cells stop ray progression.
+- Isolated wall cells (< 2 wall neighbors) are removed.
+- Single-cell gaps in walls (wall on 2 opposing sides) are filled.
+- Object footprints are cleaned up when stale objects are removed.
+
+Grid rebuild approach:
+- Incremental updates on GL thread every frame (low latency).
+- Full rebuild from keyframe store on background thread every ~2s.
+- Immediate rebuild when drift detected via reference anchors.
+- Rebuild re-projects all stored keyframes from corrected poses,
+  fixing drift-induced wall misalignments.
 
 
 6) SEMANTIC AND NAVIGATION FEATURES
@@ -174,14 +235,19 @@ Detected object classes:
 
 Semantic map behavior:
 - Duplicate suppression and merge by type + distance.
+- Drift-aware position updates: weight = 1/sqrt(n) for observation n.
 - Observation counting.
-- Stale object cleanup.
+- Stale object cleanup with footprint clearing callback.
 - Object relationship graph maintained internally.
 
 Navigation behavior:
 - Voice command parsing with intent qualifiers.
 - Candidate destination filtering by object type and confidence stability.
-- Path planning with safety inflation and semantic preference/penalty.
+- Path planning with 40cm safety inflation and semantic preference/penalty.
+- Start-cell adjustment: if user is in inflated zone, find nearest walkable cell.
+- Goal reachability pre-check before A* search.
+- Path smoothing with post-smoothing validity verification.
+- Path validity monitoring: detects newly-blocked waypoints.
 - Deviation detection and rerouting.
 - Spoken guidance and arrival detection.
 
@@ -214,4 +280,6 @@ The project is best understood as:
 
 "Flutter UI client + Kotlin-native indoor perception and navigation engine."
 
-For most feature or bug work, start in Kotlin (ArActivity, planner, semantic and nav modules), then adjust Flutter payload handling/rendering if data contracts change.
+For most feature or bug work, start in Kotlin (ArActivity, MapBuilder, PoseTracker,
+ObjectLocalizer, PathPlanner, and NavigationManager), then adjust Flutter payload
+handling/rendering if data contracts change.

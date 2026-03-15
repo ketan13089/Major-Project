@@ -34,17 +34,20 @@ import com.google.ar.core.exceptions.UnavailableSdkTooOldException
 import com.google.ar.core.exceptions.UnavailableUserDeclinedInstallationException
 import io.flutter.embedding.engine.FlutterEngineCache
 import io.flutter.plugin.common.MethodChannel
-import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
-import kotlin.math.abs
-import kotlin.math.cos
-import kotlin.math.roundToInt
-import kotlin.math.sin
 import kotlin.math.sqrt
 
+/**
+ * Central AR orchestrator — manages ARCore lifecycle, GL rendering,
+ * YOLO inference triggering, and bridges to Flutter.
+ *
+ * All mapping logic is delegated to [MapBuilder], pose tracking to
+ * [PoseTracker], observations stored in [ObservationStore], and
+ * 3D localization handled by [ObjectLocalizer].
+ */
 class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
 
     companion object {
@@ -54,49 +57,26 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         private const val CAM_PERM    = 1001
         private const val MIC_PERM    = 1002
 
-        // Grid resolution — 20 cm per cell gives good spatial detail
+        // Grid resolution — 20 cm per cell
         private const val RES = 0.20f
 
-        // Cell type constants sent to Flutter
-        private const val CELL_UNKNOWN  = 0
-        private const val CELL_FREE     = 1
-        private const val CELL_OBSTACLE = 2   // detected objects / plane boundaries
-        private const val CELL_WALL     = 3   // vertical plane projections
-        private const val CELL_VISITED  = 4   // camera has been here
-
-        // Shared camera capture size (landscape — what the sensor delivers natively)
+        // Shared camera capture size (landscape)
         private const val CAM_W = 640
         private const val CAM_H = 480
 
         private const val MERGE_DIST = 1.2f       // metres, same-label merge radius
         private const val STALE_MS   = 30_000L    // remove unseen objects after 30 s
 
-        // Log-odds probabilistic occupancy tuning
-        private const val L_FREE         = -0.4f   // log-odds decrement per free observation
-        private const val L_OCCUPIED     = 0.7f    // log-odds increment per obstacle observation
-        private const val L_MIN          = -2.0f   // clamp floor (strongly free)
-        private const val L_MAX          = 3.5f    // clamp ceiling (strongly occupied)
-        private const val LO_THRESH_FREE = -0.5f   // below this -> CELL_FREE
-        private const val LO_THRESH_OCC  = 1.0f    // above this -> CELL_OBSTACLE/CELL_WALL
-
-        // Multi-ray fan angles (radians)
-        private val RAY_FAN_ANGLES = floatArrayOf(
-            Math.toRadians(-30.0).toFloat(),
-            Math.toRadians(-20.0).toFloat(),
-            Math.toRadians(-10.0).toFloat(),
-            0f,
-            Math.toRadians(10.0).toFloat(),
-            Math.toRadians(20.0).toFloat(),
-            Math.toRadians(30.0).toFloat()
-        )
+        // Map rebuild interval (ms)
+        private const val REBUILD_INTERVAL_MS = 2000L
     }
 
     // ── Views ─────────────────────────────────────────────────────────────────
     private lateinit var surfaceView: GLSurfaceView
     private lateinit var hudView: TextView
     private lateinit var overlayView: DetectionOverlayView
-    private lateinit var navView: TextView     // nav instruction banner
-    private lateinit var micButton: TextView   // voice nav trigger
+    private lateinit var navView: TextView
+    private lateinit var micButton: TextView
 
     // ── ARCore ────────────────────────────────────────────────────────────────
     private var session: Session? = null
@@ -104,7 +84,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     private var displayRotationHelper: DisplayRotationHelper? = null
     private lateinit var backgroundRenderer: BackgroundRenderer
 
-    // Surface dimensions — needed to map bbox pixel coords to GL viewport for hit-test
+    // Surface dimensions — needed for hit-test coordinate mapping
     @Volatile private var surfaceWidth  = CAM_W
     @Volatile private var surfaceHeight = CAM_H
 
@@ -113,19 +93,13 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     private var camThread: HandlerThread? = null
     private var camHandler: Handler? = null
 
-    // ── SLAM ──────────────────────────────────────────────────────────────────
+    // ── Core modules (new architecture) ───────────────────────────────────────
+    private lateinit var poseTracker: PoseTracker
+    private lateinit var mapBuilder: MapBuilder
+    private lateinit var observationStore: ObservationStore
+    private lateinit var objectLocalizer: ObjectLocalizer
     private lateinit var slamEngine: SlamEngine
     private lateinit var semanticMap: SemanticMapManager
-
-    // ── Occupancy grid ────────────────────────────────────────────────────────
-    // Thread-safe cell map: GridCell → cell type byte (derived from logOdds)
-    private val grid = ConcurrentHashMap<GridCell, Byte>()
-    private var minGX = 0; private var maxGX = 0
-    private var minGZ = 0; private var maxGZ = 0
-
-    // ── Log-odds probabilistic grid (Feature 1.4) ─────────────────────────────
-    // Each cell accumulates a float score: negative = likely free, positive = likely occupied
-    private val logOdds = ConcurrentHashMap<GridCell, Float>()
 
     // ── Detection ─────────────────────────────────────────────────────────────
     private lateinit var yoloDetector: YoloDetector
@@ -136,9 +110,14 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     private val detectInterval = 900L
     @Volatile private var lastInferenceMs = 0L
     @Volatile private var latestPose: com.google.ar.core.Pose? = null
-    // FIX 1: also store the latest ARCore frame for hit-testing in estimate3D
     @Volatile private var latestFrame: Frame? = null
-    @Volatile private var latestHeading = 0f  // radians, for Flutter robot marker
+    @Volatile private var latestHeading = 0f
+
+    // ── Map rebuild scheduling ────────────────────────────────────────────────
+    private val rebuildExecutor = Executors.newSingleThreadExecutor()
+    private val rebuilding = AtomicBoolean(false)
+    private var lastRebuildMs = 0L
+    @Volatile private var lastRebuildVersion = 0L
 
     // ── Flutter ───────────────────────────────────────────────────────────────
     private var methodChannel: MethodChannel? = null
@@ -175,8 +154,20 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         displayRotationHelper = DisplayRotationHelper(this)
         buildLayout()
 
+        // Initialize core modules
+        poseTracker = PoseTracker()
+        mapBuilder = MapBuilder(RES)
+        observationStore = ObservationStore()
+        objectLocalizer = ObjectLocalizer()
         slamEngine  = SlamEngine()
         semanticMap = SemanticMapManager()
+
+        // Wire up stale-object cleanup → footprint clearing
+        semanticMap.onObjectRemoved = { obj ->
+            val halfM = ObjectLocalizer.footprintHalfMetres(obj.category)
+            mapBuilder.clearObstacleFootprint(obj.position, halfM)
+        }
+
         navigationManager = NavigationManager(
             context       = this,
             res           = RES,
@@ -218,7 +209,9 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         super.onDestroy()
         try { yoloDetector.close() } catch (_: Exception) {}
         navigationManager?.destroy(); navigationManager = null
+        poseTracker.destroy()
         detectionExecutor.shutdownNow()
+        rebuildExecutor.shutdownNow()
         teardownCamera()
         session?.close(); session = null
     }
@@ -373,7 +366,6 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
                     val vB = ByteArray(vP.buffer.remaining()).also { vP.buffer.get(it) }
                     val yStride = yP.rowStride; val uvStride = uP.rowStride; val uvPix = uP.pixelStride
                     val pose = latestPose
-                    // FIX 1: capture the current frame reference before the executor lambda
                     val currentFrame = latestFrame
                     img.close()
 
@@ -381,24 +373,24 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
                         val t0 = System.currentTimeMillis()
                         try {
                             val raw = yoloDetector.detectFromYuv(yB, uB, vB, yStride, uvStride, uvPix, CAM_W, CAM_H)
-                            // Feed through confirmation gate — only 3x-confirmed detections proceed
                             val confirmed = confirmationGate.feed(raw)
                             lastInferenceMs = System.currentTimeMillis() - t0
 
-                            overlayView.updateDetections(raw, CAM_W, CAM_H)  // show raw for HUD
+                            overlayView.updateDetections(raw, CAM_W, CAM_H)
 
                             if (confirmed.isNotEmpty() && pose != null) {
                                 println("$TAG: confirmed ${confirmed.size}: " +
                                         confirmed.joinToString { "${it.label}@${"%.2f".format(it.confidence)}" })
                                 confirmed.forEach { det ->
-                                    // FIX 1: pass currentFrame for ARCore hit-test based placement
-                                    val wp = estimate3D(
-                                        det.boundingBox.toRect(), pose, CAM_W, CAM_H,
-                                        frame = currentFrame
+                                    val wp = objectLocalizer.estimate3D(
+                                        det.boundingBox, pose, CAM_W, CAM_H,
+                                        frame = currentFrame,
+                                        surfaceWidth = surfaceWidth,
+                                        surfaceHeight = surfaceHeight
                                     ) ?: return@forEach
                                     mergeOrAdd(det, wp)
-                                    // FIX 2: pass object type for correct footprint size
-                                    markObstacleFootprint(wp, det.label)
+                                    val halfM = ObjectLocalizer.footprintHalfMetres(det.label)
+                                    mapBuilder.markObstacleFootprint(wp, halfM)
                                 }
                             }
                         } catch (e: Exception) { println("$TAG: detection: ${e.message}") }
@@ -435,7 +427,6 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
 
     override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
         GLES20.glViewport(0, 0, width, height)
-        // FIX 1: track surface size so estimate3D can map bbox coords correctly
         surfaceWidth  = width
         surfaceHeight = height
         displayRotationHelper?.onSurfaceChanged(width, height)
@@ -449,13 +440,12 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             sess.setCameraTextureName(backgroundRenderer.textureId)
             displayRotationHelper?.updateSessionIfNeeded(sess)
             val frame  = sess.update()
-            // FIX 1: store frame so ImageReader lambda can use it for hit-testing
             latestFrame = frame
             backgroundRenderer.draw(frame)
             val camera = frame.camera
             updateHud(camera)
             if (camera.trackingState == TrackingState.TRACKING) {
-                updateSlam(frame, camera)
+                updateSlam(frame, camera, sess)
                 val now = System.currentTimeMillis()
                 if (now - lastFlutterMs >= 300L) { lastFlutterMs = now; sendToFlutter() }
             }
@@ -466,286 +456,118 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     // SLAM — called every GL frame
     // ─────────────────────────────────────────────────────────────────────────
 
-    private fun updateSlam(frame: Frame, camera: Camera) {
+    private fun updateSlam(frame: Frame, camera: Camera, session: Session) {
         try {
             val pose = camera.pose
             latestPose = pose
 
             val cx = pose.tx(); val cz = pose.tz()
-            slamEngine.addPose(Point3D(cx, pose.ty(), cz))
+            val posPoint = Point3D(cx, pose.ty(), cz)
+            slamEngine.addPose(posPoint)
+            poseTracker.addPose(posPoint)
 
-            // --- Mark camera cell and a 0.5m radius as visited/free ---
-            val gx = worldToGrid(cx); val gz = worldToGrid(cz)
-            markFree(gx, gz, CELL_VISITED)
-            for (dz in -2..2) for (dx in -2..2) {
-                if (dx * dx + dz * dz <= 4) markFreeIfUnknown(gx + dx, gz + dz)
-            }
-
-            // --- Feature 1.2: Multi-ray fan to mark clear corridor ---
-            val q  = pose.rotationQuaternion
+            // Compute forward direction
+            val q = pose.rotationQuaternion
             val fwdX = 2f * (q[0] * q[2] + q[1] * q[3])
             val fwdZ = 1f - 2f * (q[0] * q[0] + q[1] * q[1])
-            castRayFan(cx, cz, fwdX, fwdZ)
 
-            // --- Integrate ARCore planes ---
+            // Compute heading
+            val sinY = 2f * (q[3] * q[1] + q[2] * q[0])
+            val cosY = 1f - 2f * (q[1] * q[1] + q[2] * q[2])
+            latestHeading = kotlin.math.atan2(sinY, cosY)
+
+            // --- Incremental map update (low-latency, every frame) ---
+            mapBuilder.incrementalUpdate(cx, cz, latestHeading, fwdX, fwdZ)
+
+            // --- Capture plane snapshots and integrate ---
+            val planeSnapshots = mutableListOf<PlaneSnapshot>()
             frame.getUpdatedTrackables(Plane::class.java).forEach { plane ->
                 if (plane.trackingState != TrackingState.TRACKING) return@forEach
                 val poly = plane.polygon ?: return@forEach
                 if (!poly.hasRemaining()) return@forEach
 
-                if (plane.type == Plane.Type.HORIZONTAL_UPWARD_FACING) {
-                    rasterisePlaneAsFree(plane, poly)
-                }
-                if (plane.type == Plane.Type.VERTICAL) {
-                    rasterisePlaneAsWall(plane, poly)
-                }
+                val snapshot = capturePlaneSnapshot(plane, poly)
+                planeSnapshots.add(snapshot)
+
+                // Incremental plane integration for immediate visual feedback
+                mapBuilder.integratePlane(snapshot)
 
                 slamEngine.addEdges(poly)
             }
 
+            // --- Keyframe capture ---
+            if (poseTracker.shouldCaptureKeyframe(cx, cz, latestHeading)) {
+                val keyframe = Keyframe(
+                    timestamp = System.currentTimeMillis(),
+                    poseX = cx, poseY = pose.ty(), poseZ = cz,
+                    headingRad = latestHeading,
+                    forwardX = fwdX, forwardZ = fwdZ,
+                    planes = planeSnapshots,
+                    objectSightings = emptyList()  // objects added separately via detection pipeline
+                )
+                observationStore.append(keyframe)
+                poseTracker.markKeyframeCaptured(cx, cz, latestHeading)
+            }
+
+            // --- Reference anchor management (drift detection) ---
+            poseTracker.maybeCreateAnchor(session, frame)
+
+            // --- Periodic grid rebuild from observation store ---
+            val now = System.currentTimeMillis()
+            val shouldRebuild = (now - lastRebuildMs >= REBUILD_INTERVAL_MS) ||
+                    poseTracker.hasDriftExceededThreshold()
+
+            if (shouldRebuild && !rebuilding.get()) {
+                val currentVersion = observationStore.version
+                if (currentVersion != lastRebuildVersion) {
+                    lastRebuildMs = now
+                    lastRebuildVersion = currentVersion
+                    val keyframes = observationStore.snapshot()
+                    rebuilding.set(true)
+                    rebuildExecutor.execute {
+                        try {
+                            mapBuilder.rebuild(keyframes)
+                        } catch (e: Exception) {
+                            println("$TAG: rebuild: ${e.message}")
+                        } finally {
+                            rebuilding.set(false)
+                        }
+                    }
+                }
+            }
+
             semanticMap.removeStaleObjects()
 
-            // Navigation: compute heading and tick the guidance loop
-            val qNav = pose.rotationQuaternion
-            val sinY = 2f * (qNav[3] * qNav[1] + qNav[2] * qNav[0])
-            val cosY = 1f - 2f * (qNav[1] * qNav[1] + qNav[2] * qNav[2])
-            latestHeading = kotlin.math.atan2(sinY, cosY)
+            // Navigation tick
             val nm = navigationManager
             if (nm != null && nm.needsGrid) {
-                nm.tick(cx, cz, latestHeading, HashMap(grid), semanticMap)
+                nm.tick(cx, cz, latestHeading, HashMap(mapBuilder.grid), semanticMap)
             }
         } catch (e: Exception) { println("$TAG: slam: ${e.message}") }
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Occupancy grid helpers
-    // ─────────────────────────────────────────────────────────────────────────
-
-    private fun worldToGrid(v: Float) = (v / RES).roundToInt()
-    private fun gridToWorld(g: Int)   = g * RES
-
-    // ── Log-odds cell helpers (Feature 1.4) ───────────────────────────────────
-
-    /** Update log-odds and derive the byte cell type. */
-    private fun updateLogOdds(gx: Int, gz: Int, delta: Float, wallHint: Boolean = false) {
-        val cell = GridCell(gx, gz)
-        val cur = logOdds.getOrDefault(cell, 0f)
-        val updated = (cur + delta).coerceIn(L_MIN, L_MAX)
-        logOdds[cell] = updated
-        grid[cell] = thresholdCell(updated, wallHint)
-        if (gx < minGX) minGX = gx; if (gx > maxGX) maxGX = gx
-        if (gz < minGZ) minGZ = gz; if (gz > maxGZ) maxGZ = gz
-    }
-
-    /** Force a cell to a specific log-odds value and derive cell type. */
-    private fun forceLogOdds(gx: Int, gz: Int, value: Float, cellType: Int) {
-        val cell = GridCell(gx, gz)
-        logOdds[cell] = value
-        grid[cell] = cellType.toByte()
-        if (gx < minGX) minGX = gx; if (gx > maxGX) maxGX = gx
-        if (gz < minGZ) minGZ = gz; if (gz > maxGZ) maxGZ = gz
-    }
-
-    /** Convert log-odds value to a cell-type byte. */
-    private fun thresholdCell(lo: Float, wallHint: Boolean = false): Byte = when {
-        lo >= LO_THRESH_OCC  -> if (wallHint) CELL_WALL.toByte() else CELL_OBSTACLE.toByte()
-        lo <= LO_THRESH_FREE -> CELL_FREE.toByte()
-        else                 -> CELL_UNKNOWN.toByte()
-    }
-
-    // ── Legacy-compatible cell methods (now backed by log-odds) ───────────────
-
-    private fun setCell(gx: Int, gz: Int, type: Int) {
-        grid[GridCell(gx, gz)] = type.toByte()
-        if (gx < minGX) minGX = gx; if (gx > maxGX) maxGX = gx
-        if (gz < minGZ) minGZ = gz; if (gz > maxGZ) maxGZ = gz
-    }
-
-    /** Mark as visited (camera was here) — strongly free. */
-    private fun markFree(gx: Int, gz: Int, type: Int = CELL_FREE) {
-        forceLogOdds(gx, gz, L_MIN, type)
-    }
-
-    /** Probabilistic free observation — only if cell is not strongly occupied. */
-    private fun markFreeIfUnknown(gx: Int, gz: Int) {
-        updateLogOdds(gx, gz, L_FREE)
-    }
-
-    /** Ray-cast a single direction, marking cells as free until hitting a wall/obstacle. */
-    private fun rayCastFree(originX: Float, originZ: Float, dirX: Float, dirZ: Float, maxDist: Float) {
-        val len = sqrt(dirX * dirX + dirZ * dirZ).coerceAtLeast(0.001f)
-        val nx = dirX / len; val nz = dirZ / len
-        var d = 0f
-        while (d < maxDist) {
-            val wx = originX + nx * d; val wz = originZ + nz * d
-            val gx = worldToGrid(wx); val gz = worldToGrid(wz)
-            val lo = logOdds.getOrDefault(GridCell(gx, gz), 0f)
-            if (lo >= LO_THRESH_OCC) break   // stop at occupied cells
-            markFreeIfUnknown(gx, gz)
-            d += RES
-        }
-    }
-
-    // ── Feature 1.2: Multi-ray fan ────────────────────────────────────────────
-
-    /** Cast 7 rays spanning ±30° around the forward direction. */
-    private fun castRayFan(cx: Float, cz: Float, fwdX: Float, fwdZ: Float) {
-        val len = sqrt(fwdX * fwdX + fwdZ * fwdZ).coerceAtLeast(0.001f)
-        val nx = fwdX / len; val nz = fwdZ / len
-        for (angle in RAY_FAN_ANGLES) {
-            val cosA = cos(angle.toDouble()).toFloat()
-            val sinA = sin(angle.toDouble()).toFloat()
-            val rx = nx * cosA - nz * sinA
-            val rz = nx * sinA + nz * cosA
-            rayCastFree(cx, cz, rx, rz, maxDist = 4.0f)
-        }
-    }
-
-    private fun rasterisePlaneAsFree(plane: Plane, poly: java.nio.FloatBuffer) {
+    /**
+     * Capture a PlaneSnapshot from an ARCore Plane — transforms polygon
+     * vertices from plane-local space to world space.
+     */
+    private fun capturePlaneSnapshot(plane: Plane, poly: java.nio.FloatBuffer): PlaneSnapshot {
+        val planePose = plane.centerPose
         val verts = mutableListOf<Pair<Float, Float>>()
-        val planePose = plane.centerPose
         poly.rewind()
         while (poly.remaining() >= 2) {
             val lx = poly.get(); val lz = poly.get()
             val world = planePose.transformPoint(floatArrayOf(lx, 0f, lz))
-            verts += Pair(world[0], world[2])
+            verts.add(Pair(world[0], world[2]))
         }
-        if (verts.size < 3) return
-
-        val minX = verts.minOf { it.first }; val maxX = verts.maxOf { it.first }
-        val minZ = verts.minOf { it.second }; val maxZ = verts.maxOf { it.second }
-
-        var wx = minX
-        while (wx <= maxX) {
-            var wz = minZ
-            while (wz <= maxZ) {
-                if (pointInPolygon(wx, wz, verts)) markFreeIfUnknown(worldToGrid(wx), worldToGrid(wz))
-                wz += RES
-            }
-            wx += RES
+        val type = when (plane.type) {
+            Plane.Type.VERTICAL -> PlaneType.VERTICAL_WALL
+            else -> PlaneType.HORIZONTAL_FREE
         }
-    }
-
-    private fun rasterisePlaneAsWall(plane: Plane, poly: java.nio.FloatBuffer) {
-        val planePose = plane.centerPose
-        poly.rewind()
-        val pts = mutableListOf<Pair<Float, Float>>()
-        while (poly.remaining() >= 2) {
-            val lx = poly.get(); val lz = poly.get()
-            val world = planePose.transformPoint(floatArrayOf(lx, 0f, lz))
-            pts += Pair(world[0], world[2])
-        }
-        for (i in pts.indices) {
-            val a = pts[i]; val b = pts[(i + 1) % pts.size]
-            bresenhamLine(worldToGrid(a.first), worldToGrid(a.second),
-                worldToGrid(b.first), worldToGrid(b.second)) { gx, gz ->
-                updateLogOdds(gx, gz, L_OCCUPIED, wallHint = true)
-            }
-        }
-    }
-
-    // FIX 2: per-type obstacle footprint sizes instead of a fixed 0.4 m × 0.4 m box
-    private fun markObstacleFootprint(wp: Point3D, objectType: String) {
-        val halfM: Float = when (objectType.uppercase()) {
-            "DOOR"              -> 0.45f   // ~0.9 m door leaf
-            "WINDOW"            -> 0.50f
-            "NOTICE_BOARD"      -> 0.35f
-            "FIRE_EXTINGUISHER" -> 0.20f
-            "LIFT_GATE"         -> 0.60f
-            "WATER_PURIFIER"    -> 0.25f
-            "TRASH_CAN"         -> 0.20f
-            "CHAIR"             -> 0.25f
-            else                -> 0.30f
-        }
-        val halfCells = (halfM / RES).roundToInt().coerceAtLeast(1)
-        val ogx = worldToGrid(wp.x); val ogz = worldToGrid(wp.z)
-        for (dz in -halfCells..halfCells) for (dx in -halfCells..halfCells)
-            updateLogOdds(ogx + dx, ogz + dz, L_OCCUPIED)
-    }
-
-    // Winding number point-in-polygon
-    private fun pointInPolygon(px: Float, pz: Float, verts: List<Pair<Float, Float>>): Boolean {
-        var winding = 0
-        val n = verts.size
-        for (i in 0 until n) {
-            val ax = verts[i].first; val az = verts[i].second
-            val bx = verts[(i+1)%n].first; val bz = verts[(i+1)%n].second
-            if (az <= pz) { if (bz > pz && crossZ(ax, az, bx, bz, px, pz) > 0) winding++ }
-            else          { if (bz <= pz && crossZ(ax, az, bx, bz, px, pz) < 0) winding-- }
-        }
-        return winding != 0
-    }
-
-    private fun crossZ(ax: Float, az: Float, bx: Float, bz: Float, px: Float, pz: Float) =
-        (bx - ax) * (pz - az) - (bz - az) * (px - ax)
-
-    private fun bresenhamLine(x0: Int, z0: Int, x1: Int, z1: Int, draw: (Int, Int) -> Unit) {
-        var x = x0; var z = z0
-        val dx = abs(x1 - x0); val dz = abs(z1 - z0)
-        val sx = if (x0 < x1) 1 else -1; val sz = if (z0 < z1) 1 else -1
-        var err = dx - dz
-        while (true) {
-            draw(x, z)
-            if (x == x1 && z == z1) break
-            val e2 = 2 * err
-            if (e2 > -dz) { err -= dz; x += sx }
-            if (e2 < dx)  { err += dx; z += sz }
-        }
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // 3-D position estimation
-    // FIX 1: try ARCore hit-test first; fall back to area-based depth estimate
-    // ─────────────────────────────────────────────────────────────────────────
-
-    private fun estimate3D(
-        bbox: android.graphics.Rect,
-        cameraPose: com.google.ar.core.Pose,
-        imgW: Int, imgH: Int,
-        frame: Frame? = null
-    ): Point3D? {
-        return try {
-            // Step 1: ARCore hit-test at bbox centre mapped to GL viewport coordinates
-            if (frame != null) {
-                val normX = bbox.exactCenterX() / imgW.toFloat()
-                val normY = bbox.exactCenterY() / imgH.toFloat()
-                val screenX = normX * surfaceWidth
-                val screenY = normY * surfaceHeight
-                val hits = frame.hitTest(screenX, screenY)
-                val best = hits.firstOrNull { h ->
-                    val t = h.trackable
-                    (t is Plane && t.isPoseInPolygon(h.hitPose)) ||
-                            t is com.google.ar.core.DepthPoint
-                }
-                if (best != null) {
-                    val hp = best.hitPose
-                    return Point3D(hp.tx(), hp.ty(), hp.tz())
-                }
-            }
-
-            // Step 2: area-based depth fallback
-            val area  = (bbox.width() * bbox.height()).toFloat() / (imgW * imgH)
-            val depth = when {
-                area > 0.30f -> 1.0f
-                area > 0.10f -> 2.0f
-                area > 0.03f -> 3.5f
-                else         -> 5.0f
-            }
-            val q = cameraPose.rotationQuaternion
-            val fx = 2f * (q[0] * q[2] + q[1] * q[3])
-            val fy = 2f * (q[1] * q[2] - q[0] * q[3])
-            val fz = 1f - 2f * (q[0] * q[0] + q[1] * q[1])
-            Point3D(
-                cameraPose.tx() + fx * depth,
-                cameraPose.ty() + fy * depth,
-                cameraPose.tz() - fz * depth
-            )
-        } catch (_: Exception) { null }
+        return PlaneSnapshot(type, verts, plane.hashCode())
     }
 
     // ─────────────────────────────────────────────────────────────────────────
     // Semantic object merge / add
-    // FIX 3: use worldToGrid (RES = 0.2 m snap) for object id instead of 0.5 m
     // ─────────────────────────────────────────────────────────────────────────
 
     private fun mergeOrAdd(det: YoloDetector.Detection, wp: Point3D) {
@@ -753,18 +575,20 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             o.category == det.label && o.position.distance(wp) < MERGE_DIST
         }
         if (existing != null) {
-            val a = 0.2f
+            // Weight recent observations more heavily to correct for drift
+            val n = existing.observations + 1
+            val weight = (1f / sqrt(n.toFloat())).coerceIn(0.1f, 0.5f)
             semanticMap.updateObject(existing.copy(
-                position    = Point3D(existing.position.x*(1-a)+wp.x*a,
-                    existing.position.y*(1-a)+wp.y*a,
-                    existing.position.z*(1-a)+wp.z*a),
+                position    = Point3D(
+                    existing.position.x * (1 - weight) + wp.x * weight,
+                    existing.position.y * (1 - weight) + wp.y * weight,
+                    existing.position.z * (1 - weight) + wp.z * weight),
                 confidence  = maxOf(existing.confidence, det.confidence),
                 lastSeen    = System.currentTimeMillis(),
-                observations = existing.observations + 1
+                observations = n
             ))
         } else {
-            // FIX 3: was (wp.x / 0.5f).toInt() — coarser than RES, caused id collisions
-            val gx = worldToGrid(wp.x); val gz = worldToGrid(wp.z)
+            val gx = mapBuilder.worldToGrid(wp.x); val gz = mapBuilder.worldToGrid(wp.z)
             semanticMap.addObject(SemanticObject(
                 id          = "${det.label}_${gx}_${gz}",
                 type        = ObjectType.fromLabel(det.label),
@@ -788,12 +612,15 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         if (now - lastHudMs < 300L) return; lastHudMs = now
         val s   = slamEngine.getStatistics()
         val sem = semanticMap.getStatistics()
+        val grid = mapBuilder.grid
+        val drift = poseTracker.checkDrift()
         val text = buildString {
             appendLine("AR: ${camera.trackingState}")
             appendLine("Pos x=${s.currentPosition.x.f2} z=${s.currentPosition.z.f2}")
-            appendLine("Cells free=${grid.count { it.value.toInt() == CELL_FREE || it.value.toInt() == CELL_VISITED }} " +
-                    "obstacle=${grid.count { it.value.toInt() == CELL_OBSTACLE }}")
+            appendLine("Cells free=${grid.count { it.value.toInt() == MapBuilder.CELL_FREE || it.value.toInt() == MapBuilder.CELL_VISITED }} " +
+                    "obstacle=${grid.count { it.value.toInt() == MapBuilder.CELL_OBSTACLE }}")
             appendLine("Objects confirmed=${sem.totalObjects}")
+            appendLine("KFs=${observationStore.size()} drift=${"%.3f".format(drift)}m")
             append("Inference ${lastInferenceMs}ms")
         }
         runOnUiThread { hudView.text = text }
@@ -840,7 +667,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     }
 
     private fun buildMapPayload(curPos: Point3D): Map<String, Any> {
-        val localGrid = HashMap(grid)
+        val localGrid = HashMap(mapBuilder.grid)
         if (localGrid.isEmpty()) return mapOf(
             "occupancyGrid" to ByteArray(0), "gridWidth" to 0, "gridHeight" to 0,
             "gridResolution" to RES.toDouble(), "objects" to emptyList<Any>()
@@ -861,13 +688,12 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
                 "id"       to obj.id,       "type"       to obj.type.name,
                 "label"    to obj.category, "confidence" to obj.confidence,
                 "x"        to obj.position.x, "y" to obj.position.y, "z" to obj.position.z,
-                "gridX"    to (worldToGrid(obj.position.x) - gMinX),
-                "gridZ"    to (worldToGrid(obj.position.z) - gMinZ),
+                "gridX"    to (mapBuilder.worldToGrid(obj.position.x) - gMinX),
+                "gridZ"    to (mapBuilder.worldToGrid(obj.position.z) - gMinZ),
                 "observations" to obj.observations
             )
         }
 
-        // Include active navigation path (local grid coordinates, same origin as occupancy grid)
         val navPath = navigationManager?.currentSession?.path?.map { wp ->
             mapOf("x" to (wp.gridX - gMinX), "z" to (wp.gridZ - gMinZ))
         } ?: emptyList<Any>()
@@ -877,8 +703,8 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             "gridWidth"      to w,      "gridHeight"     to h,
             "gridResolution" to RES.toDouble(),
             "originX"        to gMinX,  "originZ"        to gMinZ,
-            "robotGridX"     to (worldToGrid(curPos.x) - gMinX),
-            "robotGridZ"     to (worldToGrid(curPos.z) - gMinZ),
+            "robotGridX"     to (mapBuilder.worldToGrid(curPos.x) - gMinX),
+            "robotGridZ"     to (mapBuilder.worldToGrid(curPos.z) - gMinZ),
             "objects"        to objects,
             "navPath"        to navPath
         )
@@ -900,7 +726,6 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         navView.visibility = if (state == NavigationState.IDLE) android.view.View.GONE
                              else android.view.View.VISIBLE
         micButton.text     = if (state == NavigationState.NAVIGATING) "⏹" else "🎤"
-        // Mirror state to Flutter map viewer
         navChannel?.invokeMethod("navStateChange",
             mapOf("state" to state.name, "message" to message))
     }
