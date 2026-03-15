@@ -62,10 +62,12 @@ class MapObject {
   final String id, label, type;
   final double confidence, x, y, z;
   final int gridX, gridZ, observations;
+  final String? textContent, roomNumber;
   const MapObject({
     required this.id, required this.label, required this.type,
     required this.confidence, required this.x, required this.y, required this.z,
     required this.gridX, required this.gridZ, required this.observations,
+    this.textContent, this.roomNumber,
   });
 }
 
@@ -207,6 +209,8 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
             gridX:        (o['gridX']        as num?)?.toInt() ?? 0,
             gridZ:        (o['gridZ']        as num?)?.toInt() ?? 0,
             observations: (o['observations'] as num?)?.toInt() ?? 0,
+            textContent:  o['textContent']?.toString(),
+            roomNumber:   o['roomNumber']?.toString(),
           ));
         }
       }
@@ -629,7 +633,7 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
                     Text(_emoji(o.type), style: const TextStyle(fontSize: 14)),
                     const SizedBox(width: 6),
                     Text(
-                      o.label.replaceAll('_', ' '),
+                      _displayLabel(o),
                       style: TextStyle(
                         color: selected ? col : _T.textPri,
                         fontSize: 12, fontWeight: FontWeight.w500,
@@ -887,9 +891,9 @@ class _MapPainter extends CustomPainter {
       // Emoji label
       _txt(canvas, _emoji(obj.type), pos + const Offset(0, -5), 13, Colors.black);
 
-      // Text label when zoomed in enough
+      // Text label when zoomed in enough — show room number or text content
       if (scale > 20) {
-        _txt(canvas, obj.label.replaceAll('_', ' '),
+        _txt(canvas, _displayLabel(obj),
             pos + Offset(0, scale * 0.6 + 6), 9, col);
       }
     }
@@ -956,6 +960,14 @@ Color _typeColor(String type) {
     case 'TRASH_CAN':         return const Color(0xFF78716C);
     case 'WATER_PURIFIER':    return const Color(0xFF0891B2);
     case 'WINDOW':            return const Color(0xFF0E7490);
+    // OCR text landmark types
+    case 'EXIT_SIGN':         return const Color(0xFFDC2626);
+    case 'WASHROOM_SIGN':     return const Color(0xFF7C3AED);
+    case 'STAIRS_SIGN':       return const Color(0xFFD97706);
+    case 'ROOM_LABEL':        return const Color(0xFF059669);
+    case 'FACILITY_SIGN':     return const Color(0xFF2563EB);
+    case 'WARNING_SIGN':      return const Color(0xFFEA580C);
+    case 'TEXT_SIGN':         return const Color(0xFF6B7280);
     default:                  return const Color(0xFF6B7280);
   }
 }
@@ -970,6 +982,21 @@ String _emoji(String type) {
     case 'TRASH_CAN':         return '🗑';
     case 'WATER_PURIFIER':    return '💧';
     case 'WINDOW':            return '🪟';
+    // OCR text landmark types
+    case 'EXIT_SIGN':         return '🚪';
+    case 'WASHROOM_SIGN':     return '🚻';
+    case 'STAIRS_SIGN':       return '🪜';
+    case 'ROOM_LABEL':        return '🔢';
+    case 'FACILITY_SIGN':     return '🏢';
+    case 'WARNING_SIGN':      return '⚠️';
+    case 'TEXT_SIGN':         return '📝';
     default:                  return '📍';
   }
+}
+
+/// Display label for a map object — shows room number or text content when available.
+String _displayLabel(MapObject obj) {
+  if (obj.roomNumber != null) return 'Room ${obj.roomNumber}';
+  if (obj.textContent != null && obj.textContent!.length <= 20) return obj.textContent!;
+  return obj.label.replaceAll('_', ' ');
 }

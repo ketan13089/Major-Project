@@ -65,4 +65,7 @@ dependencies {
 
     // Coroutines for async operations
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
+
+    // ML Kit Text Recognition for OCR
+    implementation("com.google.mlkit:text-recognition:16.0.1")
 }

@@ -151,6 +151,14 @@ class ObjectLocalizer(private val yoloInputSize: Int = 640) {
             "WATER_PURIFIER"    -> 0.25f
             "TRASH_CAN"         -> 0.20f
             "CHAIR"             -> 0.25f
+            // OCR text landmarks — small footprint (signs on walls)
+            "EXIT_SIGN"         -> 0.15f
+            "WASHROOM_SIGN"     -> 0.15f
+            "STAIRS_SIGN"       -> 0.15f
+            "ROOM_LABEL"        -> 0.10f
+            "FACILITY_SIGN"     -> 0.15f
+            "WARNING_SIGN"      -> 0.15f
+            "TEXT_SIGN"         -> 0.10f
             else                -> 0.30f
         }
     }

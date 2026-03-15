@@ -11,7 +11,11 @@ import java.util.Locale
 data class NavigationIntent(
     val destinationType: ObjectType,
     val qualifier: DestinationQualifier,
-    val rawText: String
+    val rawText: String,
+    /** Room number for room-based navigation (e.g., "203", "305A"). */
+    val roomNumber: String? = null,
+    /** Free-text search term for text-landmark matching. */
+    val textQuery: String? = null
 )
 
 enum class DestinationQualifier { NEAREST, FARTHEST, LEFT_MOST, RIGHT_MOST }
@@ -88,6 +92,22 @@ class VoiceCommandProcessor(
             else                                           -> DestinationQualifier.NEAREST
         }
 
+        // ── Room number detection (e.g., "take me to room 203") ─────────────
+        val roomMatch = ROOM_PATTERN.find(lower)
+        if (roomMatch != null) {
+            val roomNum = roomMatch.groupValues[1].uppercase()
+            return NavigationIntent(ObjectType.ROOM_LABEL, qualifier, text, roomNumber = roomNum)
+        }
+
+        // ── OCR sign keywords (washroom, exit, stairs, etc.) ────────────────
+        val ocrType = OCR_KEYWORD_MAP.entries.firstOrNull { (keywords, _) ->
+            keywords.any { lower.contains(it) }
+        }?.value
+        if (ocrType != null) {
+            return NavigationIntent(ocrType, qualifier, text, textQuery = lower)
+        }
+
+        // ── Original YOLO-based object keywords ─────────────────────────────
         val destType = KEYWORD_MAP.entries.firstOrNull { (keywords, _) ->
             keywords.any { lower.contains(it) }
         }?.value ?: return null
@@ -116,6 +136,23 @@ class VoiceCommandProcessor(
             listOf("trash can", "dustbin", "bin", "waste bin")       to ObjectType.TRASH_CAN,
             listOf("chair", "seat", "sitting")                       to ObjectType.CHAIR,
             listOf("window")                                         to ObjectType.WINDOW
+        )
+
+        /** Pattern matching room/lab numbers in voice commands. */
+        private val ROOM_PATTERN = Regex(
+            """(?:room|lab|class|hall|office|cabin)\s+(\d{1,4}[A-Za-z]?)""",
+            RegexOption.IGNORE_CASE
+        )
+
+        /**
+         * OCR text landmark keywords → ObjectType.
+         * Checked BEFORE the YOLO keyword map to give OCR signs priority.
+         */
+        val OCR_KEYWORD_MAP: Map<List<String>, ObjectType> = mapOf(
+            listOf("washroom", "toilet", "restroom", "bathroom", "lavatory") to ObjectType.WASHROOM_SIGN,
+            listOf("exit sign", "exit")                                       to ObjectType.EXIT_SIGN,
+            listOf("stairs", "staircase", "stairway")                        to ObjectType.STAIRS_SIGN,
+            listOf("canteen", "cafeteria", "library", "reception")           to ObjectType.FACILITY_SIGN,
         )
 
         private fun errorMessage(code: Int) = when (code) {

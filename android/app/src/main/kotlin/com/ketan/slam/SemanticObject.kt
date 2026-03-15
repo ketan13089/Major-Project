@@ -33,7 +33,7 @@ data class BoundingBox2D(
 // ── Object Type Enum ──────────────────────────────────────────────────────────
 
 enum class ObjectType {
-    // New 8-class model classes
+    // 8-class YOLO model classes
     CHAIR,
     DOOR,
     FIRE_EXTINGUISHER,
@@ -42,6 +42,15 @@ enum class ObjectType {
     TRASH_CAN,
     WATER_PURIFIER,
     WINDOW,
+
+    // OCR-detected text landmarks
+    EXIT_SIGN,
+    WASHROOM_SIGN,
+    STAIRS_SIGN,
+    ROOM_LABEL,
+    FACILITY_SIGN,
+    WARNING_SIGN,
+    TEXT_SIGN,
 
     // Generic fallback
     UNKNOWN;
@@ -57,8 +66,25 @@ enum class ObjectType {
                 "trash_can"         -> TRASH_CAN
                 "water_purifier"    -> WATER_PURIFIER
                 "window"            -> WINDOW
+                "exit_sign"         -> EXIT_SIGN
+                "washroom_sign"     -> WASHROOM_SIGN
+                "stairs_sign"       -> STAIRS_SIGN
+                "room_label"        -> ROOM_LABEL
+                "facility_sign"     -> FACILITY_SIGN
+                "warning_sign"      -> WARNING_SIGN
+                "text_sign"         -> TEXT_SIGN
                 else                -> UNKNOWN
             }
+        }
+
+        fun fromTextLandmark(type: TextLandmarkType?): ObjectType = when (type) {
+            TextLandmarkType.EXIT_SIGN     -> EXIT_SIGN
+            TextLandmarkType.WASHROOM_SIGN -> WASHROOM_SIGN
+            TextLandmarkType.STAIRS_SIGN   -> STAIRS_SIGN
+            TextLandmarkType.LIFT_SIGN     -> LIFT_GATE
+            TextLandmarkType.FACILITY_SIGN -> FACILITY_SIGN
+            TextLandmarkType.WARNING_SIGN  -> WARNING_SIGN
+            null                           -> TEXT_SIGN
         }
     }
 }
@@ -75,7 +101,11 @@ data class SemanticObject(
     val firstSeen: Long,
     var lastSeen: Long,
     var observations: Int = 1,
-    var label: String? = null
+    var label: String? = null,
+    /** OCR-detected text content (for signs, notices). */
+    val textContent: String? = null,
+    /** Room number extracted from OCR (e.g., "203", "305A"). */
+    val roomNumber: String? = null
 ) {
     fun isSimilarTo(other: SemanticObject, distanceThreshold: Float = 0.5f): Boolean {
         if (this.category != other.category) return false

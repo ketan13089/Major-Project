@@ -103,12 +103,16 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
 
     // ── Detection ─────────────────────────────────────────────────────────────
     private lateinit var yoloDetector: YoloDetector
+    private lateinit var textRecognizer: TextRecognizer
     private val confirmationGate = DetectionConfirmationGate(requiredHits = 3, windowMs = 5_000L)
     private val detectionExecutor = Executors.newSingleThreadExecutor()
     private val detecting = AtomicBoolean(false)
     private var lastDetectMs = 0L
     private val detectInterval = 900L
+    private var lastOcrMs = 0L
+    private val ocrInterval = 3000L  // OCR every 3 seconds (less frequent than YOLO)
     @Volatile private var lastInferenceMs = 0L
+    @Volatile private var lastOcrInferenceMs = 0L
     @Volatile private var latestPose: com.google.ar.core.Pose? = null
     @Volatile private var latestFrame: Frame? = null
     @Volatile private var latestHeading = 0f
@@ -184,6 +188,9 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         try { yoloDetector = YoloDetector(this); println("$TAG: YOLO ready") }
         catch (e: Exception) { println("$TAG: YOLO init failed: ${e.message}") }
 
+        textRecognizer = TextRecognizer()
+        println("$TAG: OCR ready")
+
         if (!hasCamPerm()) reqCamPerm()
     }
 
@@ -208,6 +215,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     override fun onDestroy() {
         super.onDestroy()
         try { yoloDetector.close() } catch (_: Exception) {}
+        try { textRecognizer.close() } catch (_: Exception) {}
         navigationManager?.destroy(); navigationManager = null
         poseTracker.destroy()
         detectionExecutor.shutdownNow()
@@ -372,6 +380,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
                     detectionExecutor.execute {
                         val t0 = System.currentTimeMillis()
                         try {
+                            // ── YOLO object detection ───────────────────────────
                             val raw = yoloDetector.detectFromYuv(yB, uB, vB, yStride, uvStride, uvPix, CAM_W, CAM_H)
                             val confirmed = confirmationGate.feed(raw)
                             lastInferenceMs = System.currentTimeMillis() - t0
@@ -391,6 +400,24 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
                                     mergeOrAdd(det, wp)
                                     val halfM = ObjectLocalizer.footprintHalfMetres(det.label)
                                     mapBuilder.markObstacleFootprint(wp, halfM)
+                                }
+                            }
+
+                            // ── OCR text recognition (every 3s) ─────────────────
+                            val ocrNow = System.currentTimeMillis()
+                            if (ocrNow - lastOcrMs >= ocrInterval && pose != null) {
+                                lastOcrMs = ocrNow
+                                val ocrT0 = System.currentTimeMillis()
+                                val textDetections = textRecognizer.detectText(
+                                    yB, uB, vB, yStride, uvStride, uvPix, CAM_W, CAM_H)
+                                lastOcrInferenceMs = System.currentTimeMillis() - ocrT0
+
+                                if (textDetections.isNotEmpty()) {
+                                    println("$TAG: OCR found ${textDetections.size}: " +
+                                            textDetections.joinToString { "\"${it.text}\"(${it.classification})" })
+                                    textDetections.forEach { textDet ->
+                                        processTextDetection(textDet, pose!!, currentFrame)
+                                    }
                                 }
                             }
                         } catch (e: Exception) { println("$TAG: detection: ${e.message}") }
@@ -604,6 +631,124 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
+    // OCR text detection processing
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Process a single OCR text detection: estimate 3D position, create or
+     * merge a semantic object, and optionally associate room numbers with
+     * nearby door objects.
+     */
+    private fun processTextDetection(
+        textDet: TextDetection,
+        pose: com.google.ar.core.Pose,
+        frame: Frame?
+    ) {
+        // Estimate 3D position using the same localizer as YOLO
+        val wp = objectLocalizer.estimate3D(
+            textDet.boundingBox, pose, CAM_W, CAM_H,
+            frame = frame,
+            surfaceWidth = surfaceWidth,
+            surfaceHeight = surfaceHeight
+        ) ?: return
+
+        when (textDet.classification) {
+            TextClassification.ROOM_NUMBER -> {
+                val roomNum = textDet.roomNumber ?: return
+                // Try to associate with a nearby door
+                val nearbyDoor = semanticMap.getAllObjects().firstOrNull { o ->
+                    o.type == ObjectType.DOOR && o.position.distance(wp) < 2.0f
+                }
+                if (nearbyDoor != null) {
+                    // Attach room number to the existing door object
+                    semanticMap.updateObject(nearbyDoor.copy(
+                        roomNumber = roomNum,
+                        textContent = textDet.text,
+                        lastSeen = System.currentTimeMillis()
+                    ))
+                    println("$TAG: OCR linked room $roomNum to door ${nearbyDoor.id}")
+                } else {
+                    // Create standalone room label
+                    mergeOrAddText(textDet, wp, ObjectType.ROOM_LABEL, roomNum)
+                }
+            }
+            TextClassification.SIGN -> {
+                val objType = ObjectType.fromTextLandmark(textDet.landmarkType)
+                mergeOrAddText(textDet, wp, objType, null)
+            }
+            TextClassification.NOTICE -> {
+                // Associate with a nearby notice board if one exists
+                val nearbyBoard = semanticMap.getAllObjects().firstOrNull { o ->
+                    o.type == ObjectType.NOTICE_BOARD && o.position.distance(wp) < 2.0f
+                }
+                if (nearbyBoard != null) {
+                    semanticMap.updateObject(nearbyBoard.copy(
+                        textContent = textDet.text,
+                        lastSeen = System.currentTimeMillis()
+                    ))
+                    println("$TAG: OCR linked notice text to board ${nearbyBoard.id}")
+                } else {
+                    mergeOrAddText(textDet, wp, ObjectType.TEXT_SIGN, null)
+                }
+            }
+            TextClassification.GENERAL -> {
+                // Store as generic text sign if sufficiently confident
+                if (textDet.confidence >= 0.5f) {
+                    mergeOrAddText(textDet, wp, ObjectType.TEXT_SIGN, null)
+                }
+            }
+        }
+    }
+
+    /**
+     * Merge or add a text-based semantic object. Similar to [mergeOrAdd] but
+     * uses text content for identity matching instead of YOLO label.
+     */
+    private fun mergeOrAddText(textDet: TextDetection, wp: Point3D, objType: ObjectType, roomNum: String?) {
+        val category = objType.name.lowercase()
+        val textNorm = textDet.text.trim().lowercase()
+
+        // Merge with existing text object if same type and nearby with similar text
+        val existing = semanticMap.getAllObjects().firstOrNull { o ->
+            o.type == objType &&
+            o.position.distance(wp) < MERGE_DIST &&
+            (o.textContent?.trim()?.lowercase() == textNorm || o.roomNumber == roomNum)
+        }
+
+        if (existing != null) {
+            val n = existing.observations + 1
+            val weight = (1f / kotlin.math.sqrt(n.toFloat())).coerceIn(0.1f, 0.5f)
+            semanticMap.updateObject(existing.copy(
+                position = Point3D(
+                    existing.position.x * (1 - weight) + wp.x * weight,
+                    existing.position.y * (1 - weight) + wp.y * weight,
+                    existing.position.z * (1 - weight) + wp.z * weight),
+                confidence = maxOf(existing.confidence, textDet.confidence),
+                lastSeen = System.currentTimeMillis(),
+                observations = n,
+                textContent = textDet.text,
+                roomNumber = roomNum ?: existing.roomNumber
+            ))
+        } else {
+            val gx = mapBuilder.worldToGrid(wp.x); val gz = mapBuilder.worldToGrid(wp.z)
+            semanticMap.addObject(SemanticObject(
+                id = "${category}_${gx}_${gz}",
+                type = objType,
+                category = category,
+                position = wp,
+                boundingBox = BoundingBox2D(
+                    textDet.boundingBox.left, textDet.boundingBox.top,
+                    textDet.boundingBox.right, textDet.boundingBox.bottom),
+                confidence = textDet.confidence,
+                firstSeen = System.currentTimeMillis(),
+                lastSeen = System.currentTimeMillis(),
+                textContent = textDet.text,
+                roomNumber = roomNum
+            ))
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
     // HUD
     // ─────────────────────────────────────────────────────────────────────────
 
@@ -621,7 +766,9 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
                     "obstacle=${grid.count { it.value.toInt() == MapBuilder.CELL_OBSTACLE }}")
             appendLine("Objects confirmed=${sem.totalObjects}")
             appendLine("KFs=${observationStore.size()} drift=${"%.3f".format(drift)}m")
-            append("Inference ${lastInferenceMs}ms")
+            appendLine("YOLO ${lastInferenceMs}ms  OCR ${lastOcrInferenceMs}ms")
+            val textObjs = semanticMap.getAllObjects().count { it.textContent != null }
+            append("Text landmarks: $textObjs")
         }
         runOnUiThread { hudView.text = text }
     }
@@ -684,7 +831,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         }
 
         val objects = semanticMap.getAllObjects().map { obj ->
-            mapOf(
+            val m = mutableMapOf<String, Any>(
                 "id"       to obj.id,       "type"       to obj.type.name,
                 "label"    to obj.category, "confidence" to obj.confidence,
                 "x"        to obj.position.x, "y" to obj.position.y, "z" to obj.position.z,
@@ -692,6 +839,9 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
                 "gridZ"    to (mapBuilder.worldToGrid(obj.position.z) - gMinZ),
                 "observations" to obj.observations
             )
+            obj.textContent?.let { m["textContent"] = it }
+            obj.roomNumber?.let  { m["roomNumber"]  = it }
+            m as Map<String, Any>
         }
 
         val navPath = navigationManager?.currentSession?.path?.map { wp ->

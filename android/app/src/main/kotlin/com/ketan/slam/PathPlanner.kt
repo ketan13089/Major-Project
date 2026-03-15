@@ -42,7 +42,11 @@ class PathPlanner(private val res: Float) {
         /** Object types that act as stable landmarks for internal path preference. */
         private val LANDMARK_TYPES = setOf(
             ObjectType.DOOR, ObjectType.LIFT_GATE,
-            ObjectType.FIRE_EXTINGUISHER, ObjectType.WINDOW
+            ObjectType.FIRE_EXTINGUISHER, ObjectType.WINDOW,
+            // OCR text landmarks are stable reference points
+            ObjectType.EXIT_SIGN, ObjectType.WASHROOM_SIGN,
+            ObjectType.STAIRS_SIGN, ObjectType.ROOM_LABEL,
+            ObjectType.FACILITY_SIGN
         )
         /** Object types that represent furniture hazards (narrow gaps). */
         private val HAZARD_TYPES = setOf(ObjectType.CHAIR)

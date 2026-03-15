@@ -197,16 +197,75 @@ class NavigationManager(
      * Selects the best destination from [SemanticMapManager] based on the
      * [NavigationIntent.qualifier]. Only objects with ≥ 2 observations are
      * considered to avoid acting on hallucinated single-frame detections.
+     *
+     * Supports three selection modes:
+     * 1. Room number match — "take me to room 203"
+     * 2. Text content match — "find the washroom" (matches OCR text landmarks)
+     * 3. Object type match — "go to the nearest door" (original behavior)
      */
     private fun selectDestination(
         intent: NavigationIntent,
         userX: Float, userZ: Float,
         semanticMap: SemanticMapManager
     ): SemanticObject? {
-        val candidates = semanticMap.getAllObjects()
+        val allObjects = semanticMap.getAllObjects()
+
+        // ── Mode 1: Room number search ──────────────────────────────────────
+        if (intent.roomNumber != null) {
+            // First check ROOM_LABEL objects
+            val roomCandidates = allObjects.filter {
+                it.roomNumber != null &&
+                it.roomNumber.equals(intent.roomNumber, ignoreCase = true) &&
+                it.observations >= 1
+            }
+            if (roomCandidates.isNotEmpty()) {
+                return roomCandidates.minByOrNull { dist(userX, userZ, it.position.x, it.position.z) }
+            }
+            // Also check doors that have room numbers attached
+            val doorWithRoom = allObjects.filter {
+                it.type == ObjectType.DOOR &&
+                it.roomNumber != null &&
+                it.roomNumber.equals(intent.roomNumber, ignoreCase = true)
+            }
+            if (doorWithRoom.isNotEmpty()) {
+                return doorWithRoom.minByOrNull { dist(userX, userZ, it.position.x, it.position.z) }
+            }
+            return null
+        }
+
+        // ── Mode 2: Text content search (OCR landmarks) ────────────────────
+        if (intent.textQuery != null) {
+            val textCandidates = allObjects.filter {
+                it.type == intent.destinationType && it.observations >= 1
+            }
+            if (textCandidates.isNotEmpty()) {
+                return applyQualifier(textCandidates, intent.qualifier, userX, userZ)
+            }
+            // Fallback: search by textContent field
+            val textMatch = allObjects.filter {
+                it.textContent != null &&
+                it.textContent.lowercase().contains(intent.textQuery) &&
+                it.observations >= 1
+            }
+            if (textMatch.isNotEmpty()) {
+                return textMatch.minByOrNull { dist(userX, userZ, it.position.x, it.position.z) }
+            }
+        }
+
+        // ── Mode 3: Standard type-based search (original behavior) ──────────
+        val candidates = allObjects
             .filter { it.type == intent.destinationType && it.observations >= 2 }
         if (candidates.isEmpty()) return null
-        return when (intent.qualifier) {
+        return applyQualifier(candidates, intent.qualifier, userX, userZ)
+    }
+
+    private fun applyQualifier(
+        candidates: List<SemanticObject>,
+        qualifier: DestinationQualifier,
+        userX: Float, userZ: Float
+    ): SemanticObject? {
+        if (candidates.isEmpty()) return null
+        return when (qualifier) {
             DestinationQualifier.NEAREST    -> candidates.minByOrNull { dist(userX, userZ, it.position.x, it.position.z) }
             DestinationQualifier.FARTHEST   -> candidates.maxByOrNull { dist(userX, userZ, it.position.x, it.position.z) }
             DestinationQualifier.LEFT_MOST  -> candidates.minByOrNull { it.position.x }
