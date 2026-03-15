@@ -25,6 +25,9 @@ class SemanticMapManager {
     private val spatialGrid = ConcurrentHashMap<GridCell, MutableList<SemanticObject>>()
     private val objectsById  = ConcurrentHashMap<String, SemanticObject>()
 
+    // Feature 2.1: Object relationship graph (internal system use only)
+    val relationGraph = ObjectRelationGraph()
+
     // ── Add ───────────────────────────────────────────────────────────────────
     // Returns false when merged into an existing object, true when a new entry
     // was created.
@@ -57,6 +60,7 @@ class SemanticMapManager {
                         objectsById[existing.id] = merged
                         nearbyObjects.remove(existing)
                         nearbyObjects.add(merged)
+                        relationGraph.rebuild(objectsById.values.toList())
                         return false
                     }
                 }
@@ -65,6 +69,7 @@ class SemanticMapManager {
             // No duplicate found — insert as new
             spatialGrid.getOrPut(cell) { mutableListOf() }.add(obj)
             objectsById[obj.id] = obj
+            relationGraph.rebuild(objectsById.values.toList())
             return true
         }
     }
@@ -80,6 +85,7 @@ class SemanticMapManager {
             // Insert updated entry
             objectsById[obj.id] = obj
             spatialGrid.getOrPut(toGridCell(obj.position)) { mutableListOf() }.add(obj)
+            relationGraph.rebuild(objectsById.values.toList())
         }
     }
 

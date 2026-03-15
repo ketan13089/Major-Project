@@ -1,4 +1,4 @@
-﻿package com.ketan.slam
+package com.ketan.slam
 
 import android.Manifest
 import android.content.pm.PackageManager
@@ -40,7 +40,9 @@ import java.util.concurrent.atomic.AtomicBoolean
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
 import kotlin.math.abs
+import kotlin.math.cos
 import kotlin.math.roundToInt
+import kotlin.math.sin
 import kotlin.math.sqrt
 
 class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
@@ -68,6 +70,25 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
 
         private const val MERGE_DIST = 1.2f       // metres, same-label merge radius
         private const val STALE_MS   = 30_000L    // remove unseen objects after 30 s
+
+        // Log-odds probabilistic occupancy tuning
+        private const val L_FREE         = -0.4f   // log-odds decrement per free observation
+        private const val L_OCCUPIED     = 0.7f    // log-odds increment per obstacle observation
+        private const val L_MIN          = -2.0f   // clamp floor (strongly free)
+        private const val L_MAX          = 3.5f    // clamp ceiling (strongly occupied)
+        private const val LO_THRESH_FREE = -0.5f   // below this -> CELL_FREE
+        private const val LO_THRESH_OCC  = 1.0f    // above this -> CELL_OBSTACLE/CELL_WALL
+
+        // Multi-ray fan angles (radians)
+        private val RAY_FAN_ANGLES = floatArrayOf(
+            Math.toRadians(-30.0).toFloat(),
+            Math.toRadians(-20.0).toFloat(),
+            Math.toRadians(-10.0).toFloat(),
+            0f,
+            Math.toRadians(10.0).toFloat(),
+            Math.toRadians(20.0).toFloat(),
+            Math.toRadians(30.0).toFloat()
+        )
     }
 
     // ── Views ─────────────────────────────────────────────────────────────────
@@ -97,10 +118,14 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     private lateinit var semanticMap: SemanticMapManager
 
     // ── Occupancy grid ────────────────────────────────────────────────────────
-    // Thread-safe cell map: GridCell → cell type byte
+    // Thread-safe cell map: GridCell → cell type byte (derived from logOdds)
     private val grid = ConcurrentHashMap<GridCell, Byte>()
     private var minGX = 0; private var maxGX = 0
     private var minGZ = 0; private var maxGZ = 0
+
+    // ── Log-odds probabilistic grid (Feature 1.4) ─────────────────────────────
+    // Each cell accumulates a float score: negative = likely free, positive = likely occupied
+    private val logOdds = ConcurrentHashMap<GridCell, Float>()
 
     // ── Detection ─────────────────────────────────────────────────────────────
     private lateinit var yoloDetector: YoloDetector
@@ -456,11 +481,11 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
                 if (dx * dx + dz * dz <= 4) markFreeIfUnknown(gx + dx, gz + dz)
             }
 
-            // --- Ray-cast forward to mark clear corridor ---
+            // --- Feature 1.2: Multi-ray fan to mark clear corridor ---
             val q  = pose.rotationQuaternion
             val fwdX = 2f * (q[0] * q[2] + q[1] * q[3])
             val fwdZ = 1f - 2f * (q[0] * q[0] + q[1] * q[1])
-            rayCastFree(cx, cz, fwdX, fwdZ, maxDist = 4.0f)
+            castRayFan(cx, cz, fwdX, fwdZ)
 
             // --- Integrate ARCore planes ---
             frame.getUpdatedTrackables(Plane::class.java).forEach { plane ->
@@ -481,9 +506,9 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             semanticMap.removeStaleObjects()
 
             // Navigation: compute heading and tick the guidance loop
-            val q    = pose.rotationQuaternion
-            val sinY = 2f * (q[3] * q[1] + q[2] * q[0])
-            val cosY = 1f - 2f * (q[1] * q[1] + q[2] * q[2])
+            val qNav = pose.rotationQuaternion
+            val sinY = 2f * (qNav[3] * qNav[1] + qNav[2] * qNav[0])
+            val cosY = 1f - 2f * (qNav[1] * qNav[1] + qNav[2] * qNav[2])
             latestHeading = kotlin.math.atan2(sinY, cosY)
             val nm = navigationManager
             if (nm != null && nm.needsGrid) {
@@ -499,17 +524,54 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     private fun worldToGrid(v: Float) = (v / RES).roundToInt()
     private fun gridToWorld(g: Int)   = g * RES
 
+    // ── Log-odds cell helpers (Feature 1.4) ───────────────────────────────────
+
+    /** Update log-odds and derive the byte cell type. */
+    private fun updateLogOdds(gx: Int, gz: Int, delta: Float, wallHint: Boolean = false) {
+        val cell = GridCell(gx, gz)
+        val cur = logOdds.getOrDefault(cell, 0f)
+        val updated = (cur + delta).coerceIn(L_MIN, L_MAX)
+        logOdds[cell] = updated
+        grid[cell] = thresholdCell(updated, wallHint)
+        if (gx < minGX) minGX = gx; if (gx > maxGX) maxGX = gx
+        if (gz < minGZ) minGZ = gz; if (gz > maxGZ) maxGZ = gz
+    }
+
+    /** Force a cell to a specific log-odds value and derive cell type. */
+    private fun forceLogOdds(gx: Int, gz: Int, value: Float, cellType: Int) {
+        val cell = GridCell(gx, gz)
+        logOdds[cell] = value
+        grid[cell] = cellType.toByte()
+        if (gx < minGX) minGX = gx; if (gx > maxGX) maxGX = gx
+        if (gz < minGZ) minGZ = gz; if (gz > maxGZ) maxGZ = gz
+    }
+
+    /** Convert log-odds value to a cell-type byte. */
+    private fun thresholdCell(lo: Float, wallHint: Boolean = false): Byte = when {
+        lo >= LO_THRESH_OCC  -> if (wallHint) CELL_WALL.toByte() else CELL_OBSTACLE.toByte()
+        lo <= LO_THRESH_FREE -> CELL_FREE.toByte()
+        else                 -> CELL_UNKNOWN.toByte()
+    }
+
+    // ── Legacy-compatible cell methods (now backed by log-odds) ───────────────
+
     private fun setCell(gx: Int, gz: Int, type: Int) {
         grid[GridCell(gx, gz)] = type.toByte()
         if (gx < minGX) minGX = gx; if (gx > maxGX) maxGX = gx
         if (gz < minGZ) minGZ = gz; if (gz > maxGZ) maxGZ = gz
     }
 
-    private fun markFree(gx: Int, gz: Int, type: Int = CELL_FREE) = setCell(gx, gz, type)
-    private fun markFreeIfUnknown(gx: Int, gz: Int) {
-        if (!grid.containsKey(GridCell(gx, gz))) setCell(gx, gz, CELL_FREE)
+    /** Mark as visited (camera was here) — strongly free. */
+    private fun markFree(gx: Int, gz: Int, type: Int = CELL_FREE) {
+        forceLogOdds(gx, gz, L_MIN, type)
     }
 
+    /** Probabilistic free observation — only if cell is not strongly occupied. */
+    private fun markFreeIfUnknown(gx: Int, gz: Int) {
+        updateLogOdds(gx, gz, L_FREE)
+    }
+
+    /** Ray-cast a single direction, marking cells as free until hitting a wall/obstacle. */
     private fun rayCastFree(originX: Float, originZ: Float, dirX: Float, dirZ: Float, maxDist: Float) {
         val len = sqrt(dirX * dirX + dirZ * dirZ).coerceAtLeast(0.001f)
         val nx = dirX / len; val nz = dirZ / len
@@ -517,10 +579,25 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         while (d < maxDist) {
             val wx = originX + nx * d; val wz = originZ + nz * d
             val gx = worldToGrid(wx); val gz = worldToGrid(wz)
-            val existing = grid[GridCell(gx, gz)]?.toInt() ?: CELL_UNKNOWN
-            if (existing == CELL_OBSTACLE || existing == CELL_WALL) break
+            val lo = logOdds.getOrDefault(GridCell(gx, gz), 0f)
+            if (lo >= LO_THRESH_OCC) break   // stop at occupied cells
             markFreeIfUnknown(gx, gz)
             d += RES
+        }
+    }
+
+    // ── Feature 1.2: Multi-ray fan ────────────────────────────────────────────
+
+    /** Cast 7 rays spanning ±30° around the forward direction. */
+    private fun castRayFan(cx: Float, cz: Float, fwdX: Float, fwdZ: Float) {
+        val len = sqrt(fwdX * fwdX + fwdZ * fwdZ).coerceAtLeast(0.001f)
+        val nx = fwdX / len; val nz = fwdZ / len
+        for (angle in RAY_FAN_ANGLES) {
+            val cosA = cos(angle.toDouble()).toFloat()
+            val sinA = sin(angle.toDouble()).toFloat()
+            val rx = nx * cosA - nz * sinA
+            val rz = nx * sinA + nz * cosA
+            rayCastFree(cx, cz, rx, rz, maxDist = 4.0f)
         }
     }
 
@@ -562,7 +639,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             val a = pts[i]; val b = pts[(i + 1) % pts.size]
             bresenhamLine(worldToGrid(a.first), worldToGrid(a.second),
                 worldToGrid(b.first), worldToGrid(b.second)) { gx, gz ->
-                setCell(gx, gz, CELL_WALL)
+                updateLogOdds(gx, gz, L_OCCUPIED, wallHint = true)
             }
         }
     }
@@ -583,7 +660,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         val halfCells = (halfM / RES).roundToInt().coerceAtLeast(1)
         val ogx = worldToGrid(wp.x); val ogz = worldToGrid(wp.z)
         for (dz in -halfCells..halfCells) for (dx in -halfCells..halfCells)
-            setCell(ogx + dx, ogz + dz, CELL_OBSTACLE)
+            updateLogOdds(ogx + dx, ogz + dz, L_OCCUPIED)
     }
 
     // Winding number point-in-polygon

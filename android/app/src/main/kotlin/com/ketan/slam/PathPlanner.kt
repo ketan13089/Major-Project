@@ -2,6 +2,7 @@ package com.ketan.slam
 
 import java.util.PriorityQueue
 import kotlin.math.abs
+import kotlin.math.roundToInt
 import kotlin.math.sqrt
 
 /** A waypoint in world-grid coordinates. */
@@ -28,16 +29,34 @@ class PathPlanner(private val res: Float) {
     companion object {
         /** Safety margin (cells) inflated around OBSTACLE/WALL cells. */
         private const val INFLATE = 1
+
+        // Feature 2.4: semantic cost modifiers
+        /** Cost multiplier for cells near stable landmarks (lower = preferred). */
+        private const val LANDMARK_COST = 0.8f
+        /** Cost multiplier for cells near furniture hazards (higher = penalised). */
+        private const val HAZARD_COST   = 1.5f
+        /** Radius (cells) around semantic objects for cost adjustment. */
+        private const val SEMANTIC_RADIUS = 2
+
+        /** Object types that act as stable landmarks for internal path preference. */
+        private val LANDMARK_TYPES = setOf(
+            ObjectType.DOOR, ObjectType.LIFT_GATE,
+            ObjectType.FIRE_EXTINGUISHER, ObjectType.WINDOW
+        )
+        /** Object types that represent furniture hazards (narrow gaps). */
+        private val HAZARD_TYPES = setOf(ObjectType.CHAIR)
     }
 
     /**
      * Plan a collision-free path from (startGX, startGZ) to (goalGX, goalGZ).
      * Returns an ordered list of waypoints start → goal, or empty if unreachable.
+     * Optionally accepts [semanticObjects] for internal cost modifiers (Feature 2.4).
      */
     fun planPath(
         grid: Map<GridCell, Byte>,
         startGX: Int, startGZ: Int,
-        goalGX: Int, goalGZ: Int
+        goalGX: Int, goalGZ: Int,
+        semanticObjects: List<SemanticObject> = emptyList()
     ): List<NavWaypoint> {
         if (grid.isEmpty()) return emptyList()
 
@@ -63,6 +82,24 @@ class PathPlanner(private val res: Float) {
         val start   = GridCell(startGX, startGZ)
         val goal    = GridCell(goalGX,  goalGZ)
         val sqrt2   = sqrt(2f)
+
+        // Feature 2.4: Build semantic cost modifier sets
+        val landmarkCells = HashSet<GridCell>()
+        val hazardCells   = HashSet<GridCell>()
+        for (obj in semanticObjects) {
+            val ogx = (obj.position.x / res).roundToInt()
+            val ogz = (obj.position.z / res).roundToInt()
+            val targetSet = when {
+                obj.type in LANDMARK_TYPES -> landmarkCells
+                obj.type in HAZARD_TYPES   -> hazardCells
+                else -> null
+            }
+            if (targetSet != null) {
+                for (dz in -SEMANTIC_RADIUS..SEMANTIC_RADIUS)
+                    for (dx in -SEMANTIC_RADIUS..SEMANTIC_RADIUS)
+                        targetSet.add(GridCell(ogx + dx, ogz + dz))
+            }
+        }
 
         gCost[start]  = 0f
         parent[start] = null
@@ -91,7 +128,14 @@ class PathPlanner(private val res: Float) {
                         !isWalkableOrGoal(cur.x, cur.z + d[1])) continue
                 }
                 val nc      = GridCell(nx, nz)
-                val moveCost = if (d[0] != 0 && d[1] != 0) sqrt2 else 1f
+                val baseCost = if (d[0] != 0 && d[1] != 0) sqrt2 else 1f
+                // Feature 2.4: apply semantic cost modifiers (internal system use only)
+                val semanticMod = when {
+                    nc in hazardCells   -> HAZARD_COST
+                    nc in landmarkCells -> LANDMARK_COST
+                    else                -> 1.0f
+                }
+                val moveCost = baseCost * semanticMod
                 val ng      = cg + moveCost
                 if (ng < (gCost[nc] ?: Float.MAX_VALUE)) {
                     gCost[nc]  = ng

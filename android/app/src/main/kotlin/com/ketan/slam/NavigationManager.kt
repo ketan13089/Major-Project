@@ -106,7 +106,7 @@ class NavigationManager(
 
         // ── Deviation → re-plan ───────────────────────────────────────────────
         if (minDistToPath(userX, userZ, session.path) > DEVIATION_M) {
-            rePlan(userX, userZ, session, grid)
+            rePlan(userX, userZ, session, grid, semanticMap)
             return
         }
 
@@ -158,7 +158,8 @@ class NavigationManager(
         val goalGX  = (dest.position.x / res).roundToInt()
         val goalGZ  = (dest.position.z / res).roundToInt()
 
-        val path = planner.planPath(grid, startGX, startGZ, goalGX, goalGZ)
+        val path = planner.planPath(grid, startGX, startGZ, goalGX, goalGZ,
+            semanticObjects = semanticMap.getAllObjects())
         if (path.isEmpty()) {
             setState(NavigationState.ERROR, "No clear path — route may be blocked")
             guide.speak("Cannot find a clear path to the $label. Try scanning more of the area.")
@@ -206,14 +207,16 @@ class NavigationManager(
     private fun rePlan(
         userX: Float, userZ: Float,
         session: NavigationSession,
-        grid: Map<GridCell, Byte>
+        grid: Map<GridCell, Byte>,
+        semanticMap: SemanticMapManager
     ) {
         val startGX = (userX / res).roundToInt()
         val startGZ = (userZ / res).roundToInt()
         val goalGX  = (session.destination.position.x / res).roundToInt()
         val goalGZ  = (session.destination.position.z / res).roundToInt()
 
-        val newPath = planner.planPath(grid, startGX, startGZ, goalGX, goalGZ)
+        val newPath = planner.planPath(grid, startGX, startGZ, goalGX, goalGZ,
+            semanticObjects = semanticMap.getAllObjects())
         if (newPath.isEmpty()) {
             currentSession = null
             setState(NavigationState.ERROR, "Re-routing failed — path blocked")

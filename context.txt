@@ -1,6 +1,6 @@
 ================================================================================
 PROJECT CONTEXT — SLAM Indoor Navigation App
-Last updated: 2026-03-02
+Last updated: 2026-03-14
 ================================================================================
 
 --------------------------------------------------------------------------------
@@ -28,18 +28,20 @@ KEY DEPENDENCIES / TECH
 FILE STRUCTURE — Kotlin (android/app/src/main/kotlin/com/ketan/slam/)
 --------------------------------------------------------------------------------
 MainActivity.kt         — Flutter entry point; launches ArActivity via "openAR" method channel
-ArActivity.kt           — Core AR activity; SLAM loop, YOLO, occupancy grid, navigation tick
+ArActivity.kt           — Core AR activity; SLAM loop, YOLO, log-odds map, navigation tick
   - buildLayout()       — adds micButton (🎤/⏹) + navView (instruction banner) to AR view
-  - updateSlam()        — computes heading, calls NavigationManager.tick() every GL frame
-  - buildMapPayload()   — sends occupancy grid + objects + navPath to Flutter every 800ms
+  - updateSlam()        — computes heading, casts 7-ray fan (±30°), calls NavigationManager.tick()
+  - buildMapPayload()   — thresholds log-odds to byte cells; sends map + objects + navPath to Flutter
   - updateNavHud()      — updates native nav banner + mirrors state to Flutter navChannel
   - onMicTapped()       — starts voice nav or stops current navigation
 
 BackgroundRenderer.kt   — OpenGL ES2 camera background renderer
 DisplayRotationHelper.kt — ARCore display rotation helper
 DetectionOverlayView.kt — Native YOLO bounding box overlay (used in ArActivity)
-SlamEngine.kt           — Pose history, occupancy grid edges, statistics
+SlamEngine.kt           — Pose history and wall edge counting (grid is exclusively in ArActivity)
 SemanticMapManager.kt   — Spatial grid of detected SemanticObjects (ConcurrentHashMap)
+  - relationGraph       — Internal ObjectRelationGraph for spatial intelligence
+ObjectRelationGraph.kt  — Tracks NEAR_TO, NEXT_TO, ACROSS_FROM edges between SemanticObjects
 SemanticObject.kt       — Data classes: Point3D, BoundingBox2D, ObjectType, SemanticObject, GridCell
 YoloDetector.kt         — TFLite YOLO inference + DetectionConfirmationGate
 
@@ -48,8 +50,8 @@ VoiceCommandProcessor.kt — Android SpeechRecognizer wrapper + rule-based NLP i
   - parseIntent(text)   — extracts ObjectType + DestinationQualifier from transcript
   - KEYWORD_MAP         — maps keyword lists → ObjectType (door, lift, chair, etc.)
 
-PathPlanner.kt          — A* path planner on the occupancy grid
-  - planPath()          — A* with 8-dir movement, obstacle inflation (INFLATE=1 cell), corner-cut prevention
+PathPlanner.kt          — Semantic-aware A* path planner
+  - planPath()          — A* with obstacle inflation, landmark preference, and hazard avoidance
   - smoothPath()        — Line-of-sight string-pull pass to reduce waypoint count
   - inflateObstacles()  — expands WALL/OBSTACLE cells by 1 cell for safety margin
   - octile()            — admissible heuristic for 8-directional A*
@@ -61,9 +63,9 @@ NavigationGuide.kt      — TTS + turn-by-turn instruction generator
 
 NavigationManager.kt    — State machine orchestrating the full pipeline
   - tick()              — called every GL frame; resolves intent, checks arrival/deviation, emits instructions
-  - resolveIntent()     — destination selection (≥2 observations) + A* planning
+  - resolveIntent()     — destination selection (≥2 observations) + semantic A* planning
   - selectDestination() — filters SemanticMap by type + qualifier (nearest/farthest/left/right)
-  - rePlan()            — re-runs A* when user deviates > 2.0m from path
+  - rePlan()            — re-runs semantic A* when user deviates > 2.0m from path
   - needsGrid           — optimization flag: skip grid HashMap copy when IDLE
 
 --------------------------------------------------------------------------------
