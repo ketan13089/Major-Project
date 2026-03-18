@@ -7,7 +7,7 @@ package com.ketan.slam
  * on a background coroutine. The store caps at [maxKeyframes] entries —
  * oldest keyframes are discarded when the limit is reached.
  */
-class ObservationStore(private val maxKeyframes: Int = 500) {
+class ObservationStore(private val maxKeyframes: Int = 2000) {
 
     private val buffer = ArrayDeque<Keyframe>(maxKeyframes)
 

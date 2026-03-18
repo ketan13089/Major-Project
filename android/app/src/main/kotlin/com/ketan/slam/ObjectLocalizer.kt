@@ -44,13 +44,22 @@ class ObjectLocalizer(private val yoloInputSize: Int = 640) {
         imgH: Int,
         frame: Frame?,
         surfaceWidth: Int,
-        surfaceHeight: Int
+        surfaceHeight: Int,
+        frameTimestampNs: Long = 0L,
+        currentFrameTimestampNs: Long = 0L
     ): Point3D? {
         return try {
-            // Strategy 1: ARCore hit-test
+            // Strategy 1: ARCore hit-test — only if frame is fresh (< 67ms old = 2 frames at 30fps)
+            // This prevents the "FrameHitTest invoked on old frame" error that placed
+            // objects at wrong positions.
             if (frame != null && frame.camera.trackingState == TrackingState.TRACKING) {
-                val hitResult = tryHitTest(bbox, frame, imgW, imgH, surfaceWidth, surfaceHeight)
-                if (hitResult != null) return hitResult
+                val ageMs = if (frameTimestampNs > 0L && currentFrameTimestampNs > 0L)
+                    (currentFrameTimestampNs - frameTimestampNs) / 1_000_000L
+                else 0L
+                if (ageMs < 67L) {
+                    val hitResult = tryHitTest(bbox, frame, imgW, imgH, surfaceWidth, surfaceHeight)
+                    if (hitResult != null) return hitResult
+                }
             }
 
             // Strategy 2: Area-based depth fallback
@@ -98,7 +107,7 @@ class ObjectLocalizer(private val yoloInputSize: Int = 640) {
         val bestHit = hits.firstOrNull { h ->
             val t = h.trackable
             (t is Plane && t.isPoseInPolygon(h.hitPose) && h.distance <= 8f) ||
-                t is com.google.ar.core.DepthPoint
+                    t is com.google.ar.core.DepthPoint
         }
 
         if (bestHit != null) {

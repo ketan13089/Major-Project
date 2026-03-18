@@ -115,6 +115,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     @Volatile private var lastOcrInferenceMs = 0L
     @Volatile private var latestPose: com.google.ar.core.Pose? = null
     @Volatile private var latestFrame: Frame? = null
+    @Volatile private var latestFrameTs: Long = 0L   // timestamp of latestFrame
     @Volatile private var latestHeading = 0f
 
     // ── Map rebuild scheduling ────────────────────────────────────────────────
@@ -122,6 +123,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     private val rebuilding = AtomicBoolean(false)
     private var lastRebuildMs = 0L
     @Volatile private var lastRebuildVersion = 0L
+    private var lastDepthSampleMs = 0L          // throttle depth-hit sampling
 
     // ── Flutter ───────────────────────────────────────────────────────────────
     private var methodChannel: MethodChannel? = null
@@ -375,6 +377,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
                     val yStride = yP.rowStride; val uvStride = uP.rowStride; val uvPix = uP.pixelStride
                     val pose = latestPose
                     val currentFrame = latestFrame
+                    val capturedFrameTs = latestFrameTs   // timestamp when this frame was current
                     img.close()
 
                     detectionExecutor.execute {
@@ -395,7 +398,9 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
                                         det.boundingBox, pose, CAM_W, CAM_H,
                                         frame = currentFrame,
                                         surfaceWidth = surfaceWidth,
-                                        surfaceHeight = surfaceHeight
+                                        surfaceHeight = surfaceHeight,
+                                        frameTimestampNs = capturedFrameTs,
+                                        currentFrameTimestampNs = latestFrameTs
                                     ) ?: return@forEach
                                     mergeOrAdd(det, wp)
                                     val halfM = ObjectLocalizer.footprintHalfMetres(det.label)
@@ -468,6 +473,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             displayRotationHelper?.updateSessionIfNeeded(sess)
             val frame  = sess.update()
             latestFrame = frame
+            latestFrameTs = frame.timestamp
             backgroundRenderer.draw(frame)
             val camera = frame.camera
             updateHud(camera)
@@ -536,6 +542,16 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
                 poseTracker.markKeyframeCaptured(cx, cz, latestHeading)
             }
 
+            // --- Depth-hit wall extraction (every 300ms on GL thread) ---
+            // This runs on the GL thread so `frame` is always the current frame.
+            // It samples a 8×6 grid of screen points and hit-tests each one,
+            // marking floor hits as free and wall hits as occupied.
+            val depthNow = System.currentTimeMillis()
+            if (depthNow - lastDepthSampleMs >= 300L) {
+                lastDepthSampleMs = depthNow
+                extractWallsFromDepth(frame, camera)
+            }
+
             // --- Reference anchor management (drift detection) ---
             poseTracker.maybeCreateAnchor(session, frame)
 
@@ -571,6 +587,64 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
                 nm.tick(cx, cz, latestHeading, HashMap(mapBuilder.grid), semanticMap)
             }
         } catch (e: Exception) { println("$TAG: slam: ${e.message}") }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Depth-hit wall extraction
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Sample a grid of screen positions with ARCore hit-tests and classify each
+     * hit point as floor (free space) or wall (occupied) based on its height
+     * relative to the camera.
+     *
+     * This is the primary source of wall data because:
+     * 1. It runs on the GL thread with the CURRENT frame — no stale-frame problem.
+     * 2. It works even when ARCore's vertical plane detection fails (common indoors).
+     * 3. It samples 48 points per call (8 cols × 6 rows) — dense enough for walls.
+     *
+     * Height rules (relative to camera Y):
+     *   relY < -0.5m  → floor level  → mark as free
+     *   -0.5m ≤ relY ≤ 0.8m → torso/wall level → mark as occupied (wall)
+     *   relY > 0.8m   → ceiling/above head → ignore
+     */
+    private fun extractWallsFromDepth(frame: Frame, camera: Camera) {
+        if (camera.trackingState != TrackingState.TRACKING) return
+        val cameraY = camera.pose.ty()
+        val stepX = surfaceWidth  / 8f
+        val stepY = surfaceHeight / 6f
+
+        for (col in 0..7) {
+            for (row in 0..5) {
+                val sx = col * stepX + stepX / 2f
+                val sy = row * stepY + stepY / 2f
+                try {
+                    val hits = frame.hitTest(sx, sy)
+                    val hit = hits.firstOrNull { h ->
+                        val t = h.trackable
+                        (t is Plane && t.trackingState == TrackingState.TRACKING) ||
+                                t is com.google.ar.core.DepthPoint ||
+                                t is com.google.ar.core.InstantPlacementPoint
+                    } ?: continue
+
+                    val hp  = hit.hitPose
+                    val hx  = hp.tx()
+                    val hz  = hp.tz()
+                    val hy  = hp.ty()
+                    val dist = hit.distance
+
+                    // Ignore hits that are too far away — unreliable depth
+                    if (dist > 5.0f) continue
+
+                    val relY = hy - cameraY
+                    when {
+                        relY < -0.5f           -> mapBuilder.markHitFree(hx, hz)
+                        relY in -0.5f..0.8f    -> mapBuilder.markHitOccupied(hx, hz)
+                        // above 0.8m = ceiling or tall furniture — ignore
+                    }
+                } catch (_: Exception) { /* hit-test can throw on degraded tracking */ }
+            }
+        }
     }
 
     /**
@@ -649,7 +723,9 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             textDet.boundingBox, pose, CAM_W, CAM_H,
             frame = frame,
             surfaceWidth = surfaceWidth,
-            surfaceHeight = surfaceHeight
+            surfaceHeight = surfaceHeight,
+            frameTimestampNs = 0L,          // OCR runs async; skip hit-test, use fallback
+            currentFrameTimestampNs = latestFrameTs
         ) ?: return
 
         when (textDet.classification) {
@@ -711,8 +787,8 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         // Merge with existing text object if same type and nearby with similar text
         val existing = semanticMap.getAllObjects().firstOrNull { o ->
             o.type == objType &&
-            o.position.distance(wp) < MERGE_DIST &&
-            (o.textContent?.trim()?.lowercase() == textNorm || o.roomNumber == roomNum)
+                    o.position.distance(wp) < MERGE_DIST &&
+                    (o.textContent?.trim()?.lowercase() == textNorm || o.roomNumber == roomNum)
         }
 
         if (existing != null) {
@@ -874,7 +950,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         navView.setBackgroundColor(bgColor)
         navView.text       = label
         navView.visibility = if (state == NavigationState.IDLE) android.view.View.GONE
-                             else android.view.View.VISIBLE
+        else android.view.View.VISIBLE
         micButton.text     = if (state == NavigationState.NAVIGATING) "⏹" else "🎤"
         navChannel?.invokeMethod("navStateChange",
             mapOf("state" to state.name, "message" to message))
