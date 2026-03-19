@@ -146,7 +146,7 @@ class YoloDetector(context: Context) {
             for (px in 0 until INPUT_SIZE) {
                 val rotX = px - padX
                 if (rotX < 0 || rotX >= rotW) { buf.putFloat(0f); buf.putFloat(0f); buf.putFloat(0f); continue }
-                val srcX  = (srcHeight - 1 - py).coerceIn(0, srcHeight - 1)
+                val srcX  = (srcWidth - 1 - py).coerceIn(0, srcWidth - 1)
                 val srcY  = rotX.coerceIn(0, srcWidth - 1)
                 val yVal  = yBytes[srcY * yRowStride + srcX].toInt() and 0xFF
                 val uvIdx = (srcY / 2) * uvRowStride + (srcX / 2) * uvPixStride

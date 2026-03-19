@@ -3,6 +3,7 @@ package com.ketan.slam
 import kotlin.math.roundToInt
 import kotlin.math.sqrt
 
+
 enum class NavigationState { IDLE, LISTENING, PLANNING, NAVIGATING, ARRIVED, ERROR }
 
 data class NavigationSession(
@@ -55,6 +56,8 @@ class NavigationManager(
     /** Pending intent queued by voice processor, resolved on next tick() with map access. */
     @Volatile private var pendingIntent: NavigationIntent? = null
     private var lastInstructionMs = 0L
+    /** Cached observation counts from the latest tick(), used in resolveIntent/rePlan. */
+    @Volatile private var cachedObservationCounts: Map<GridCell, Int>? = null
 
     /** True when this manager needs the occupancy grid snapshot in tick(). */
     val needsGrid: Boolean get() = state != NavigationState.IDLE || pendingIntent != null
@@ -79,8 +82,16 @@ class NavigationManager(
         userX: Float, userZ: Float,
         headingRad: Float,
         grid: Map<GridCell, Byte>,
-        semanticMap: SemanticMapManager
+        semanticMap: SemanticMapManager,
+        isTracking: Boolean = true,
+        observationCounts: Map<GridCell, Int>? = null
     ) {
+        // When tracking is lost, freeze navigation state — don't cancel session
+        if (!isTracking) return
+
+        // Cache observation counts for resolveIntent and rePlan
+        cachedObservationCounts = observationCounts
+
         // Resolve pending voice intent now that grid + map are available
         pendingIntent?.also { intent ->
             pendingIntent = null
@@ -169,7 +180,8 @@ class NavigationManager(
         val goalGZ  = (dest.position.z / res).roundToInt()
 
         val path = planner.planPath(grid, startGX, startGZ, goalGX, goalGZ,
-            semanticObjects = semanticMap.getAllObjects())
+            semanticObjects = semanticMap.getAllObjects(),
+            observationCounts = cachedObservationCounts)
         if (path.isEmpty()) {
             setState(NavigationState.ERROR, "No clear path — route may be blocked")
             guide.speak("Cannot find a clear path to the $label. Try scanning more of the area.")
@@ -285,7 +297,8 @@ class NavigationManager(
         val goalGZ  = (session.destination.position.z / res).roundToInt()
 
         val newPath = planner.planPath(grid, startGX, startGZ, goalGX, goalGZ,
-            semanticObjects = semanticMap.getAllObjects())
+            semanticObjects = semanticMap.getAllObjects(),
+            observationCounts = cachedObservationCounts)
         if (newPath.isEmpty()) {
             currentSession = null
             setState(NavigationState.ERROR, "Re-routing failed — path blocked")

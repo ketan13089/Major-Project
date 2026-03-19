@@ -36,6 +36,7 @@ class ObjectLocalizer(private val yoloInputSize: Int = 640) {
      * @param frame         ARCore frame for hit-testing (may be null)
      * @param surfaceWidth  GL surface width in pixels
      * @param surfaceHeight GL surface height in pixels
+     * @param label         object label for class-specific depth scaling
      */
     fun estimate3D(
         bbox: RectF,
@@ -46,24 +47,47 @@ class ObjectLocalizer(private val yoloInputSize: Int = 640) {
         surfaceWidth: Int,
         surfaceHeight: Int,
         frameTimestampNs: Long = 0L,
-        currentFrameTimestampNs: Long = 0L
+        currentFrameTimestampNs: Long = 0L,
+        label: String = ""
     ): Point3D? {
         return try {
+            val result = estimate3DWithMethod(bbox, cameraPose, imgW, imgH, frame,
+                surfaceWidth, surfaceHeight, frameTimestampNs, currentFrameTimestampNs, label)
+            result?.position
+        } catch (_: Exception) { null }
+    }
+
+    /**
+     * Estimate 3D position with method and confidence metadata.
+     */
+    fun estimate3DWithMethod(
+        bbox: RectF,
+        cameraPose: com.google.ar.core.Pose,
+        imgW: Int,
+        imgH: Int,
+        frame: Frame?,
+        surfaceWidth: Int,
+        surfaceHeight: Int,
+        frameTimestampNs: Long = 0L,
+        currentFrameTimestampNs: Long = 0L,
+        label: String = ""
+    ): LocalizationSmoother.LocalizationResult? {
+        return try {
             // Strategy 1: ARCore hit-test — only if frame is fresh (< 67ms old = 2 frames at 30fps)
-            // This prevents the "FrameHitTest invoked on old frame" error that placed
-            // objects at wrong positions.
             if (frame != null && frame.camera.trackingState == TrackingState.TRACKING) {
                 val ageMs = if (frameTimestampNs > 0L && currentFrameTimestampNs > 0L)
                     (currentFrameTimestampNs - frameTimestampNs) / 1_000_000L
                 else 0L
                 if (ageMs < 67L) {
                     val hitResult = tryHitTest(bbox, frame, imgW, imgH, surfaceWidth, surfaceHeight)
-                    if (hitResult != null) return hitResult
+                    if (hitResult != null) return LocalizationSmoother.LocalizationResult(
+                        hitResult, "hit_test", 0.9f)
                 }
             }
 
-            // Strategy 2: Area-based depth fallback
-            areaBasedFallback(bbox, cameraPose, imgW, imgH)
+            // Strategy 2: Area-based depth fallback with class-specific scale
+            val fallback = areaBasedFallback(bbox, cameraPose, imgW, imgH, label)
+            LocalizationSmoother.LocalizationResult(fallback, "fallback", 0.4f)
         } catch (_: Exception) { null }
     }
 
@@ -119,7 +143,7 @@ class ObjectLocalizer(private val yoloInputSize: Int = 640) {
 
     /**
      * Fallback: estimate depth from bounding box area using a continuous
-     * inverse-sqrt model. More accurate than the previous 4-bucket approach.
+     * inverse-sqrt model with class-specific depth scale factors.
      *
      * Calibrated for typical indoor objects (0.3m–1.5m real-world size):
      * - Large bbox (fills 30% of image) → ~1m away
@@ -129,10 +153,15 @@ class ObjectLocalizer(private val yoloInputSize: Int = 640) {
         bbox: RectF,
         cameraPose: com.google.ar.core.Pose,
         imgW: Int,
-        imgH: Int
+        imgH: Int,
+        label: String = ""
     ): Point3D {
         val area = (bbox.width() * bbox.height()) / (yoloInputSize.toFloat() * yoloInputSize.toFloat())
-        val depth = (0.5f / sqrt(area.coerceAtLeast(0.001f))).coerceIn(0.8f, 6.0f)
+        val baseDepth = (0.5f / sqrt(area.coerceAtLeast(0.001f))).coerceIn(0.8f, 6.0f)
+        // Class-specific depth scale factors — objects of known sizes appear at
+        // predictable depths for a given bbox area
+        val scaleFactor = depthScaleFactor(label)
+        val depth = (baseDepth * scaleFactor).coerceIn(0.8f, 6.0f)
 
         // Project along camera's forward axis (ARCore: -Z is forward)
         val q = cameraPose.rotationQuaternion
@@ -145,6 +174,19 @@ class ObjectLocalizer(private val yoloInputSize: Int = 640) {
             cameraPose.ty() + fy * depth,
             cameraPose.tz() - fz * depth
         )
+    }
+
+    /** Class-specific depth scale factors for fallback localization. */
+    private fun depthScaleFactor(label: String): Float = when (label.uppercase()) {
+        "DOOR"              -> 0.65f
+        "CHAIR"             -> 0.40f
+        "FIRE_EXTINGUISHER" -> 0.35f
+        "LIFT_GATE"         -> 0.70f
+        "WINDOW"            -> 0.55f
+        "NOTICE_BOARD"      -> 0.45f
+        "TRASH_CAN"         -> 0.35f
+        "WATER_PURIFIER"    -> 0.40f
+        else                -> 0.50f  // default scale
     }
 
     companion object {

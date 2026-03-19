@@ -61,7 +61,8 @@ class PathPlanner(private val res: Float) {
         grid: Map<GridCell, Byte>,
         startGX: Int, startGZ: Int,
         goalGX: Int, goalGZ: Int,
-        semanticObjects: List<SemanticObject> = emptyList()
+        semanticObjects: List<SemanticObject> = emptyList(),
+        observationCounts: Map<GridCell, Int>? = null
     ): List<NavWaypoint> {
         if (grid.isEmpty()) return emptyList()
 
@@ -154,7 +155,11 @@ class PathPlanner(private val res: Float) {
                     nc in landmarkCells -> LANDMARK_COST
                     else                -> 1.0f
                 }
-                val moveCost = baseCost * semanticMod
+                // Corridor width scoring — prefer wider passages
+                val widthCost = corridorWidthCost(nc, d, grid)
+                // Mapping confidence scoring — prefer well-mapped areas
+                val confidenceCost = mappingConfidenceCost(nc, grid, observationCounts)
+                val moveCost = baseCost * semanticMod * widthCost * confidenceCost
                 val ng      = cg + moveCost
                 if (ng < (gCost[nc] ?: Float.MAX_VALUE)) {
                     gCost[nc]  = ng
@@ -185,6 +190,76 @@ class PathPlanner(private val res: Float) {
             }
         }
         return smoothed
+    }
+
+    // ── Path Safety Scoring ──────────────────────────────────────────────────
+
+    /**
+     * Count free cells perpendicular to the movement direction (max 5 each side).
+     * Returns a cost multiplier: wider corridors are preferred.
+     */
+    private fun corridorWidthCost(cell: GridCell, dir: IntArray, grid: Map<GridCell, Byte>): Float {
+        // Perpendicular direction to movement
+        val perpX = -dir[1]  // rotate 90°
+        val perpZ = dir[0]
+        // If stationary direction (both 0), use X-axis perpendicular
+        val px = if (perpX == 0 && perpZ == 0) 1 else perpX
+        val pz = if (perpX == 0 && perpZ == 0) 0 else perpZ
+
+        val freeCount = countPerpFree(cell, px, pz, grid, 5) +
+                        countPerpFree(cell, -px, -pz, grid, 5)
+
+        return when {
+            freeCount >= 6 -> 0.85f  // wide corridor — prefer
+            freeCount >= 3 -> 1.0f   // adequate width — neutral
+            freeCount >= 1 -> 1.2f   // narrow — slight penalty
+            else           -> 1.5f   // very narrow / dead end — strong penalty
+        }
+    }
+
+    /** Count consecutive free cells in a direction (max [limit]). */
+    private fun countPerpFree(cell: GridCell, dx: Int, dz: Int, grid: Map<GridCell, Byte>, limit: Int): Int {
+        var count = 0
+        for (i in 1..limit) {
+            val nc = GridCell(cell.x + dx * i, cell.z + dz * i)
+            val t = grid[nc]?.toInt() ?: break
+            if (t == 1 || t == 4) count++  // FREE or VISITED
+            else break
+        }
+        return count
+    }
+
+    /**
+     * Mapping confidence cost based on observation counts and proximity to unknown cells.
+     * Well-mapped areas are preferred over poorly-mapped or unknown areas.
+     */
+    private fun mappingConfidenceCost(
+        cell: GridCell,
+        grid: Map<GridCell, Byte>,
+        observationCounts: Map<GridCell, Int>?
+    ): Float {
+        if (observationCounts == null) return 1.0f
+
+        val obs = observationCounts.getOrDefault(cell, 0)
+        val nearUnknown = hasUnknownNeighbor(cell, grid)
+
+        return when {
+            obs >= 5 && !nearUnknown -> 0.9f   // well-mapped, no unknowns nearby — prefer
+            obs >= 2                 -> 1.0f   // adequately mapped — neutral
+            nearUnknown              -> 1.3f   // near unknown territory — penalty
+            else                     -> 1.15f  // poorly mapped — slight penalty
+        }
+    }
+
+    /** Check if any of the 8 neighbors is an unknown cell. */
+    private fun hasUnknownNeighbor(cell: GridCell, grid: Map<GridCell, Byte>): Boolean {
+        for (dz in -1..1) for (dx in -1..1) {
+            if (dx == 0 && dz == 0) continue
+            val nc = GridCell(cell.x + dx, cell.z + dz)
+            val t = grid[nc]?.toInt()
+            if (t == null || t == 0) return true  // null (not in grid) or UNKNOWN
+        }
+        return false
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────

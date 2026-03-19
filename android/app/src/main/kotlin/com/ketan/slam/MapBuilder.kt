@@ -3,6 +3,7 @@ package com.ketan.slam
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.abs
 import kotlin.math.cos
+import kotlin.math.max
 import kotlin.math.roundToInt
 import kotlin.math.sin
 import kotlin.math.sqrt
@@ -93,20 +94,35 @@ class MapBuilder(private val res: Float) {
         // but wall cells from planes are re-reinforced every rebuild anyway.
         private const val DECAY_PER_REBUILD = 0.12f
 
-        // Ray fan: cast 90° forward arc in 10° steps to mark visible free space.
-        // Reduced fan width from ±30° to ±45° for better corridor coverage.
+        // Ray fan: cast 180° forward arc in 15° steps (13 rays) for wide coverage.
         private val RAY_FAN_ANGLES = floatArrayOf(
+            Math.toRadians(-90.0).toFloat(),
+            Math.toRadians(-75.0).toFloat(),
+            Math.toRadians(-60.0).toFloat(),
             Math.toRadians(-45.0).toFloat(),
             Math.toRadians(-30.0).toFloat(),
             Math.toRadians(-15.0).toFloat(),
             0f,
             Math.toRadians( 15.0).toFloat(),
             Math.toRadians( 30.0).toFloat(),
-            Math.toRadians( 45.0).toFloat()
+            Math.toRadians( 45.0).toFloat(),
+            Math.toRadians( 60.0).toFloat(),
+            Math.toRadians( 75.0).toFloat(),
+            Math.toRadians( 90.0).toFloat()
         )
 
-        // Rays stop at 3m (was 2.5m) — gives better free-space coverage in large rooms.
-        private const val RAY_MAX_DIST = 3.0f
+        // Backward rays: 5 rays ±30° from reverse direction, shorter range.
+        private val RAY_BACK_ANGLES = floatArrayOf(
+            Math.toRadians(-30.0).toFloat(),
+            Math.toRadians(-15.0).toFloat(),
+            0f,
+            Math.toRadians( 15.0).toFloat(),
+            Math.toRadians( 30.0).toFloat()
+        )
+        private const val RAY_BACK_MAX_DIST = 2.0f
+
+        // Rays stop at 3.5m — gives better free-space coverage in large rooms.
+        private const val RAY_MAX_DIST = 3.5f
 
         // Minimum plane polygon area in m² to be rasterized.
         // Rejects degenerate ARCore "invalid statistics" planes.
@@ -132,6 +148,10 @@ class MapBuilder(private val res: Float) {
      */
     private val wallCells = HashSet<GridCell>()
 
+    /** Observation counter per cell — incremented on every log-odds update.
+     *  NOT reset on rebuild; provides a cumulative measure of mapping confidence. */
+    private val observationCounts = ConcurrentHashMap<GridCell, Int>()
+
     /** Bounding box of all known cells. */
     @Volatile var minGX = 0; @Volatile var maxGX = 0
     @Volatile var minGZ = 0; @Volatile var maxGZ = 0
@@ -156,12 +176,17 @@ class MapBuilder(private val res: Float) {
         observedThisRebuild.clear()
         wallCells.clear()           // FIX 1: clear before re-projection
 
-        // FIX 8: Apply decay, then zero out the logOdds values so re-projection
-        // starts fresh. We keep decayed values as a soft prior but reset to 0
-        // for cells not in any keyframe (they'll fade to unknown naturally).
+        // FIX 8: Apply confidence-weighted decay, then zero out the logOdds
+        // values so re-projection starts fresh. Well-observed cells decay slower.
         for ((cell, lo) in logOdds) {
             if (lo > 0f) {
-                logOdds[cell] = (lo - DECAY_PER_REBUILD).coerceAtLeast(0f)
+                val obs = observationCounts.getOrDefault(cell, 0)
+                val decay = when {
+                    obs >= 10 -> 0.04f   // well-observed: very slow decay
+                    obs >= 5  -> 0.08f   // moderately observed
+                    else      -> 0.15f   // poorly observed: fast decay
+                }
+                logOdds[cell] = (lo - decay).coerceAtLeast(0f)
             } else if (lo < 0f) {
                 // Free cells: apply slight positive decay (tend toward unknown)
                 logOdds[cell] = (lo + DECAY_PER_REBUILD * 0.5f).coerceAtMost(0f)
@@ -207,6 +232,9 @@ class MapBuilder(private val res: Float) {
         if (fwdLen < MIN_FORWARD_LEN) return
 
         castRayFan(poseX, poseZ, forwardX, forwardZ)
+
+        // Backward rays: cast behind the camera for better coverage
+        castBackwardRayFan(poseX, poseZ, forwardX, forwardZ)
     }
 
     /**
@@ -320,18 +348,29 @@ class MapBuilder(private val res: Float) {
             wallCells.remove(cell)     // FIX 1: keep wallCells in sync
         }
 
-        // Pass 2: Fill single-cell wall gaps.
-        // A free/unknown cell flanked by occupied cells on two opposing sides
-        // is almost certainly a wall gap (e.g. doorframe pixel missed by Bresenham).
+        // Pass 2: Fill wall gaps (1-cell and 2-cell).
         // FIX 5 + FIX 7: also add promoted cells to wallCells.
         val toPromote = mutableListOf<GridCell>()
         for ((cell, lo) in logOdds) {
             if (lo > LO_THRESH_FREE) continue
-            if (isWallGap(cell)) toPromote.add(cell)
+            if (isWallGap(cell) || isWallGap2(cell)) toPromote.add(cell)
         }
         for (cell in toPromote) {
             logOdds[cell] = LO_THRESH_OCC + 0.1f  // slightly above threshold so deriveGrid picks it up
             wallCells.add(cell)    // FIX 5: gap-filled cells are walls, not obstacles
+        }
+
+        // Pass 2b: Reinforce L-shaped corner cells.
+        // If a cell has occupied neighbors forming an L-shape (2 adjacent occupied
+        // neighbors at 90°), boost its log-odds for wall continuity.
+        val toReinforce = mutableListOf<GridCell>()
+        for ((cell, lo) in logOdds) {
+            if (lo < LO_THRESH_OCC) continue
+            if (isLCorner(cell)) toReinforce.add(cell)
+        }
+        for (cell in toReinforce) {
+            val cur = logOdds.getOrDefault(cell, 0f)
+            logOdds[cell] = (cur + 0.3f).coerceAtMost(L_MAX)
         }
 
         // Pass 3: Dilate walls by 1 cell to ensure they render as 1-cell-thick
@@ -378,6 +417,32 @@ class MapBuilder(private val res: Float) {
         return (left && right) || (up && down)
     }
 
+    /** Detect 2-cell wall gaps: occupied cells separated by 2 on same axis. */
+    private fun isWallGap2(cell: GridCell): Boolean {
+        val left2  = logOdds.getOrDefault(GridCell(cell.x - 2, cell.z    ), 0f) >= LO_THRESH_OCC
+        val right1 = logOdds.getOrDefault(GridCell(cell.x + 1, cell.z    ), 0f) >= LO_THRESH_OCC
+        val left1  = logOdds.getOrDefault(GridCell(cell.x - 1, cell.z    ), 0f) >= LO_THRESH_OCC
+        val right2 = logOdds.getOrDefault(GridCell(cell.x + 2, cell.z    ), 0f) >= LO_THRESH_OCC
+        val up2    = logOdds.getOrDefault(GridCell(cell.x,     cell.z - 2), 0f) >= LO_THRESH_OCC
+        val down1  = logOdds.getOrDefault(GridCell(cell.x,     cell.z + 1), 0f) >= LO_THRESH_OCC
+        val up1    = logOdds.getOrDefault(GridCell(cell.x,     cell.z - 1), 0f) >= LO_THRESH_OCC
+        val down2  = logOdds.getOrDefault(GridCell(cell.x,     cell.z + 2), 0f) >= LO_THRESH_OCC
+        // Cell is part of a 2-cell gap if an occupied cell is 2 away on one side
+        // and the neighbor between them is also unknown/free
+        return (left2 && right1) || (left1 && right2) ||
+               (up2 && down1) || (up1 && down2)
+    }
+
+    /** Detect L-shaped corner pattern: 2 adjacent occupied neighbors at 90°. */
+    private fun isLCorner(cell: GridCell): Boolean {
+        val l = logOdds.getOrDefault(GridCell(cell.x - 1, cell.z), 0f) >= LO_THRESH_OCC
+        val r = logOdds.getOrDefault(GridCell(cell.x + 1, cell.z), 0f) >= LO_THRESH_OCC
+        val u = logOdds.getOrDefault(GridCell(cell.x, cell.z - 1), 0f) >= LO_THRESH_OCC
+        val d = logOdds.getOrDefault(GridCell(cell.x, cell.z + 1), 0f) >= LO_THRESH_OCC
+        // L-shape: exactly 2 cardinal neighbors at 90° (not opposing)
+        return (l && u) || (l && d) || (r && u) || (r && d)
+    }
+
     /**
      * FIX 1: Derive byte grid using wallCells set for correct CELL_WALL vs
      * CELL_OBSTACLE distinction. Previously always passed wallHint=false,
@@ -403,6 +468,7 @@ class MapBuilder(private val res: Float) {
         val cur = logOdds.getOrDefault(cell, 0f)
         val updated = (cur + delta).coerceIn(L_MIN, L_MAX)
         logOdds[cell] = updated
+        observationCounts[cell] = (observationCounts.getOrDefault(cell, 0)) + 1
         if (wallHint) wallCells.add(cell)     // FIX 1: record wall origin
         // Inline threshold for incremental updates (deriveGrid handles rebuilds)
         grid[cell] = when {
@@ -439,6 +505,23 @@ class MapBuilder(private val res: Float) {
             rayCastFree(cx, cz, rx, rz, RAY_MAX_DIST)
         }
     }
+
+    /** Cast backward rays (reverse direction) for coverage behind the user. */
+    private fun castBackwardRayFan(cx: Float, cz: Float, fwdX: Float, fwdZ: Float) {
+        val len = sqrt(fwdX * fwdX + fwdZ * fwdZ).coerceAtLeast(0.001f)
+        // Reverse direction
+        val nx = -fwdX / len; val nz = -fwdZ / len
+        for (angle in RAY_BACK_ANGLES) {
+            val cosA = cos(angle.toDouble()).toFloat()
+            val sinA = sin(angle.toDouble()).toFloat()
+            val rx = nx * cosA - nz * sinA
+            val rz = nx * sinA + nz * cosA
+            rayCastFree(cx, cz, rx, rz, RAY_BACK_MAX_DIST)
+        }
+    }
+
+    /** Thread-safe snapshot of observation counts for path safety scoring. */
+    fun observationCountSnapshot(): Map<GridCell, Int> = HashMap(observationCounts)
 
     private fun rayCastFree(
         originX: Float, originZ: Float,

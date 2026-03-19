@@ -34,6 +34,7 @@ import com.google.ar.core.exceptions.UnavailableSdkTooOldException
 import com.google.ar.core.exceptions.UnavailableUserDeclinedInstallationException
 import io.flutter.embedding.engine.FlutterEngineCache
 import io.flutter.plugin.common.MethodChannel
+import android.os.Vibrator
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import javax.microedition.khronos.egl.EGLConfig
@@ -133,6 +134,18 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     // ── Navigation ────────────────────────────────────────────────────────────
     private var navigationManager: NavigationManager? = null
 
+    // ── Tracking loss recovery ───────────────────────────────────────────────
+    private var lastTrackingState: TrackingState = TrackingState.STOPPED
+    @Volatile private var frozenPose: com.google.ar.core.Pose? = null
+    private var trackingLostTimestamp = 0L
+    private var announcer: NavigationGuide? = null
+
+    // ── Object localization smoothing ────────────────────────────────────────
+    private lateinit var localizationSmoother: LocalizationSmoother
+
+    // ── Hazard warning system ────────────────────────────────────────────────
+    private var hazardWarningSystem: HazardWarningSystem? = null
+
     // ─────────────────────────────────────────────────────────────────────────
     // Lifecycle
     // ─────────────────────────────────────────────────────────────────────────
@@ -165,6 +178,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         mapBuilder = MapBuilder(RES)
         observationStore = ObservationStore()
         objectLocalizer = ObjectLocalizer()
+        localizationSmoother = LocalizationSmoother(RES)
         slamEngine  = SlamEngine()
         semanticMap = SemanticMapManager()
 
@@ -186,6 +200,14 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             }},
             onPathUpdated = { _ -> /* path is included in the next buildMapPayload call */ }
         )
+
+        // Standalone TTS announcer for non-navigation alerts (tracking loss, hazards)
+        announcer = NavigationGuide(this)
+
+        // Hazard warning system
+        @Suppress("DEPRECATION")
+        val vibrator = getSystemService(VIBRATOR_SERVICE) as? Vibrator
+        hazardWarningSystem = HazardWarningSystem(announcer!!, vibrator)
 
         try { yoloDetector = YoloDetector(this); println("$TAG: YOLO ready") }
         catch (e: Exception) { println("$TAG: YOLO init failed: ${e.message}") }
@@ -218,6 +240,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         super.onDestroy()
         try { yoloDetector.close() } catch (_: Exception) {}
         try { textRecognizer.close() } catch (_: Exception) {}
+        announcer?.shutdown(); announcer = null
         navigationManager?.destroy(); navigationManager = null
         poseTracker.destroy()
         detectionExecutor.shutdownNow()
@@ -394,17 +417,22 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
                                 println("$TAG: confirmed ${confirmed.size}: " +
                                         confirmed.joinToString { "${it.label}@${"%.2f".format(it.confidence)}" })
                                 confirmed.forEach { det ->
-                                    val wp = objectLocalizer.estimate3D(
+                                    val locResult = objectLocalizer.estimate3DWithMethod(
                                         det.boundingBox, pose, CAM_W, CAM_H,
                                         frame = currentFrame,
                                         surfaceWidth = surfaceWidth,
                                         surfaceHeight = surfaceHeight,
                                         frameTimestampNs = capturedFrameTs,
-                                        currentFrameTimestampNs = latestFrameTs
+                                        currentFrameTimestampNs = latestFrameTs,
+                                        label = det.label
                                     ) ?: return@forEach
-                                    mergeOrAdd(det, wp)
-                                    val halfM = ObjectLocalizer.footprintHalfMetres(det.label)
-                                    mapBuilder.markObstacleFootprint(wp, halfM)
+                                    // Pass through smoother — only mergeOrAdd when accepted
+                                    val smoothed = localizationSmoother.feed(det.label, locResult)
+                                    if (smoothed != null) {
+                                        mergeOrAdd(det, smoothed, locResult.method)
+                                        val halfM = ObjectLocalizer.footprintHalfMetres(det.label)
+                                        mapBuilder.markObstacleFootprint(smoothed, halfM)
+                                    }
                                 }
                             }
 
@@ -476,8 +504,45 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             latestFrameTs = frame.timestamp
             backgroundRenderer.draw(frame)
             val camera = frame.camera
+            val currentTrackingState = camera.trackingState
+
+            // ── Tracking loss detection & recovery ─────────────────────────
+            if (lastTrackingState == TrackingState.TRACKING && currentTrackingState != TrackingState.TRACKING) {
+                // TRACKING → lost
+                frozenPose = latestPose
+                trackingLostTimestamp = System.currentTimeMillis()
+                announcer?.speak("Tracking lost. Please hold the phone steady.")
+                runOnUiThread { hudView.setBackgroundColor(0xCCCC0000.toInt()) }
+            } else if (lastTrackingState != TrackingState.TRACKING && currentTrackingState == TrackingState.TRACKING
+                       && lastTrackingState != TrackingState.STOPPED) {
+                // Lost → TRACKING recovered
+                val frozen = frozenPose
+                val recovered = camera.pose
+                if (frozen != null) {
+                    val dx = recovered.tx() - frozen.tx()
+                    val dz = recovered.tz() - frozen.tz()
+                    val drift = sqrt(dx * dx + dz * dz)
+                    if (drift > 0.3f) {
+                        announcer?.speak("Tracking recovered. Position shifted ${"%.1f".format(drift)} metres. Rebuilding map.")
+                        // Force immediate rebuild
+                        val keyframes = observationStore.snapshot()
+                        rebuildExecutor.execute {
+                            try { mapBuilder.rebuild(keyframes) }
+                            catch (e: Exception) { println("$TAG: drift rebuild: ${e.message}") }
+                        }
+                    } else {
+                        announcer?.speak("Tracking recovered.")
+                    }
+                } else {
+                    announcer?.speak("Tracking recovered.")
+                }
+                frozenPose = null
+                runOnUiThread { hudView.setBackgroundColor(0xCC000000.toInt()) }
+            }
+            lastTrackingState = currentTrackingState
+
             updateHud(camera)
-            if (camera.trackingState == TrackingState.TRACKING) {
+            if (currentTrackingState == TrackingState.TRACKING) {
                 updateSlam(frame, camera, sess)
                 val now = System.currentTimeMillis()
                 if (now - lastFlutterMs >= 300L) { lastFlutterMs = now; sendToFlutter() }
@@ -580,11 +645,14 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             }
 
             semanticMap.removeStaleObjects()
+            localizationSmoother.removeStale(5000L)
 
             // Navigation tick
             val nm = navigationManager
             if (nm != null && nm.needsGrid) {
-                nm.tick(cx, cz, latestHeading, HashMap(mapBuilder.grid), semanticMap)
+                nm.tick(cx, cz, latestHeading, HashMap(mapBuilder.grid), semanticMap,
+                    isTracking = lastTrackingState == TrackingState.TRACKING,
+                    observationCounts = mapBuilder.observationCountSnapshot())
             }
         } catch (e: Exception) { println("$TAG: slam: ${e.message}") }
     }
@@ -611,11 +679,17 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     private fun extractWallsFromDepth(frame: Frame, camera: Camera) {
         if (camera.trackingState != TrackingState.TRACKING) return
         val cameraY = camera.pose.ty()
-        val stepX = surfaceWidth  / 8f
-        val stepY = surfaceHeight / 6f
+        val userX = camera.pose.tx()
+        val userZ = camera.pose.tz()
+        val cols = 10; val rows = 8  // 80 sample points for denser coverage
+        val stepX = surfaceWidth  / cols.toFloat()
+        val stepY = surfaceHeight / rows.toFloat()
 
-        for (col in 0..7) {
-            for (row in 0..5) {
+        // Collect depth hits for hazard warning system
+        val depthHits = mutableListOf<HazardWarningSystem.DepthHit>()
+
+        for (col in 0 until cols) {
+            for (row in 0 until rows) {
                 val sx = col * stepX + stepX / 2f
                 val sy = row * stepY + stepY / 2f
                 try {
@@ -639,11 +713,25 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
                     val relY = hy - cameraY
                     when {
                         relY < -0.5f           -> mapBuilder.markHitFree(hx, hz)
-                        relY in -0.5f..0.8f    -> mapBuilder.markHitOccupied(hx, hz)
+                        relY in -0.5f..0.8f    -> {
+                            mapBuilder.markHitOccupied(hx, hz)
+                            // Collect wall-level hits for hazard detection
+                            depthHits.add(HazardWarningSystem.DepthHit(hx, hz, dist))
+                        }
                         // above 0.8m = ceiling or tall furniture — ignore
                     }
                 } catch (_: Exception) { /* hit-test can throw on degraded tracking */ }
             }
+        }
+
+        // Feed depth hits to hazard warning system
+        if (depthHits.isNotEmpty()) {
+            val q = camera.pose.rotationQuaternion
+            val fwdX = 2f * (q[0] * q[2] + q[1] * q[3])
+            val fwdZ = 1f - 2f * (q[0] * q[0] + q[1] * q[1])
+            val isNavigating = navigationManager?.state == NavigationState.NAVIGATING
+            hazardWarningSystem?.processDepthHits(depthHits, userX, userZ, fwdX, fwdZ,
+                isNavigating == true)
         }
     }
 
@@ -671,7 +759,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     // Semantic object merge / add
     // ─────────────────────────────────────────────────────────────────────────
 
-    private fun mergeOrAdd(det: YoloDetector.Detection, wp: Point3D) {
+    private fun mergeOrAdd(det: YoloDetector.Detection, wp: Point3D, method: String? = null) {
         val existing = semanticMap.getAllObjects().firstOrNull { o ->
             o.category == det.label && o.position.distance(wp) < MERGE_DIST
         }
@@ -686,7 +774,8 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
                     existing.position.z * (1 - weight) + wp.z * weight),
                 confidence  = maxOf(existing.confidence, det.confidence),
                 lastSeen    = System.currentTimeMillis(),
-                observations = n
+                observations = n,
+                localizationMethod = method ?: existing.localizationMethod
             ))
         } else {
             val gx = mapBuilder.worldToGrid(wp.x); val gz = mapBuilder.worldToGrid(wp.z)
@@ -699,7 +788,8 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
                     det.boundingBox.right, det.boundingBox.bottom),
                 confidence  = det.confidence,
                 firstSeen   = System.currentTimeMillis(),
-                lastSeen    = System.currentTimeMillis()
+                lastSeen    = System.currentTimeMillis(),
+                localizationMethod = method
             ))
         }
     }
@@ -836,6 +926,9 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         val grid = mapBuilder.grid
         val drift = poseTracker.checkDrift()
         val text = buildString {
+            if (camera.trackingState != TrackingState.TRACKING) {
+                appendLine("⚠ TRACKING LOST ⚠")
+            }
             appendLine("AR: ${camera.trackingState}")
             appendLine("Pos x=${s.currentPosition.x.f2} z=${s.currentPosition.z.f2}")
             appendLine("Cells free=${grid.count { it.value.toInt() == MapBuilder.CELL_FREE || it.value.toInt() == MapBuilder.CELL_VISITED }} " +

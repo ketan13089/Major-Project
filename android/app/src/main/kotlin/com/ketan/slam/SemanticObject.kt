@@ -105,7 +105,9 @@ data class SemanticObject(
     /** OCR-detected text content (for signs, notices). */
     val textContent: String? = null,
     /** Room number extracted from OCR (e.g., "203", "305A"). */
-    val roomNumber: String? = null
+    val roomNumber: String? = null,
+    /** How the object was localized: "hit_test" or "fallback". */
+    val localizationMethod: String? = null
 ) {
     fun isSimilarTo(other: SemanticObject, distanceThreshold: Float = 0.5f): Boolean {
         if (this.category != other.category) return false
