@@ -3,6 +3,7 @@ package com.ketan.slam
 import android.Manifest
 import android.content.pm.PackageManager
 import android.graphics.Color
+import android.graphics.drawable.GradientDrawable
 import android.graphics.ImageFormat
 import android.media.ImageReader
 import android.opengl.GLES20
@@ -52,8 +53,9 @@ import kotlin.math.sqrt
 class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
 
     companion object {
-        private const val CHANNEL     = "com.ketan.slam/ar"
-        private const val NAV_CHANNEL = "com.ketan.slam/nav"
+        private const val CHANNEL      = "com.ketan.slam/ar"
+        private const val NAV_CHANNEL  = "com.ketan.slam/nav"
+        private const val MAP_CHANNEL  = "com.ketan.slam/map"
         private const val TAG         = "SLAM"
         private const val CAM_PERM    = 1001
         private const val MIC_PERM    = 1002
@@ -129,6 +131,10 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     // ── Flutter ───────────────────────────────────────────────────────────────
     private var methodChannel: MethodChannel? = null
     private var navChannel: MethodChannel? = null
+    private var mapChannel: MethodChannel? = null
+    private lateinit var mapPersistence: MapPersistence
+    private var emergencyManager: EmergencyManager? = null
+    private var onboardingTutorial: OnboardingTutorial? = null
     private var lastHudMs = 0L; private var lastFlutterMs = 0L; private var lastMapMs = 0L
 
     // ── Navigation ────────────────────────────────────────────────────────────
@@ -145,6 +151,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
 
     // ── Hazard warning system ────────────────────────────────────────────────
     private var hazardWarningSystem: HazardWarningSystem? = null
+    private val spatialAudio = SpatialAudioEngine()
 
     // ─────────────────────────────────────────────────────────────────────────
     // Lifecycle
@@ -157,6 +164,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         FlutterEngineCache.getInstance().get("slam_engine")?.let {
             methodChannel = MethodChannel(it.dartExecutor.binaryMessenger, CHANNEL)
             navChannel    = MethodChannel(it.dartExecutor.binaryMessenger, NAV_CHANNEL)
+            mapChannel    = MethodChannel(it.dartExecutor.binaryMessenger, MAP_CHANNEL)
             navChannel?.setMethodCallHandler { call, result ->
                 when (call.method) {
                     "startVoiceNav"  -> {
@@ -166,6 +174,38 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
                     }
                     "stopNavigation" -> { navigationManager?.stopNavigation(); result.success(null) }
                     else             -> result.notImplemented()
+                }
+            }
+            mapChannel?.setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "saveMap" -> {
+                        val name = call.argument<String>("name") ?: "map_${System.currentTimeMillis()}"
+                        val path = mapPersistence.saveMap(name, mapBuilder, semanticMap,
+                            poseTracker.getBreadcrumbs())
+                        if (path != null) result.success(mapOf("path" to path, "name" to name))
+                        else result.error("SAVE_FAILED", "Failed to save map", null)
+                    }
+                    "loadMap" -> {
+                        val name = call.argument<String>("name")
+                        if (name == null) { result.error("NO_NAME", "Map name required", null); return@setMethodCallHandler }
+                        val bc = mapPersistence.loadMap(name, mapBuilder, semanticMap)
+                        if (bc != null) result.success(mapOf("loaded" to true, "breadcrumbs" to bc.size))
+                        else result.error("LOAD_FAILED", "Failed to load map: $name", null)
+                    }
+                    "listMaps" -> {
+                        result.success(mapPersistence.listSavedMaps())
+                    }
+                    "deleteMap" -> {
+                        val name = call.argument<String>("name") ?: ""
+                        result.success(mapPersistence.deleteMap(name))
+                    }
+                    "triggerEmergency" -> {
+                        val pos = poseTracker.getCurrentPosition()
+                        emergencyManager?.trigger(pos.x, pos.z, semanticMap, mapBuilder,
+                            poseTracker.getBreadcrumbs())
+                        result.success(true)
+                    }
+                    else -> result.notImplemented()
                 }
             }
         }
@@ -181,6 +221,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         localizationSmoother = LocalizationSmoother(RES)
         slamEngine  = SlamEngine()
         semanticMap = SemanticMapManager()
+        mapPersistence = MapPersistence(this)
 
         // Wire up stale-object cleanup → footprint clearing
         semanticMap.onObjectRemoved = { obj ->
@@ -200,6 +241,23 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             }},
             onPathUpdated = { _ -> /* path is included in the next buildMapPayload call */ }
         )
+        navigationManager?.breadcrumbProvider = { poseTracker.getBreadcrumbs() }
+
+        emergencyManager = EmergencyManager(this, announcer!!, mapPersistence)
+        navigationManager?.onEmergency = { userX, userZ ->
+            emergencyManager?.trigger(userX, userZ, semanticMap, mapBuilder,
+                poseTracker.getBreadcrumbs())
+        }
+
+        onboardingTutorial = OnboardingTutorial(this, announcer!!)
+        navigationManager?.onTutorial = { onboardingTutorial?.play() }
+
+        // Auto-play tutorial on first launch (delayed to let AR initialize)
+        if (onboardingTutorial?.shouldAutoPlay == true) {
+            android.os.Handler(mainLooper).postDelayed({
+                onboardingTutorial?.play()
+            }, 3000L)
+        }
 
         // Standalone TTS announcer for non-navigation alerts (tracking loss, hazards)
         announcer = NavigationGuide(this)
@@ -208,6 +266,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         @Suppress("DEPRECATION")
         val vibrator = getSystemService(VIBRATOR_SERVICE) as? Vibrator
         hazardWarningSystem = HazardWarningSystem(announcer!!, vibrator)
+        spatialAudio.start()
 
         try { yoloDetector = YoloDetector(this); println("$TAG: YOLO ready") }
         catch (e: Exception) { println("$TAG: YOLO init failed: ${e.message}") }
@@ -240,6 +299,8 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         super.onDestroy()
         try { yoloDetector.close() } catch (_: Exception) {}
         try { textRecognizer.close() } catch (_: Exception) {}
+        onboardingTutorial?.stop()
+        spatialAudio.stop()
         announcer?.shutdown(); announcer = null
         navigationManager?.destroy(); navigationManager = null
         poseTracker.destroy()
@@ -254,6 +315,8 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     // ─────────────────────────────────────────────────────────────────────────
 
     private fun buildLayout() {
+        val dp = resources.displayMetrics.density
+
         surfaceView = GLSurfaceView(this).apply {
             preserveEGLContextOnPause = true
             setEGLContextClientVersion(2)
@@ -262,41 +325,74 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             renderMode = GLSurfaceView.RENDERMODE_CONTINUOUSLY
         }
         overlayView = DetectionOverlayView(this).apply { setBackgroundColor(Color.TRANSPARENT) }
+
         hudView = TextView(this).apply {
             setTextColor(Color.WHITE)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
-            setBackgroundColor(0xCC000000.toInt())
-            setPadding(20, 14, 20, 14)
+            background = GradientDrawable().apply {
+                setColor(0xBB101020.toInt())
+                cornerRadius = 14f * dp
+            }
+            setPadding((14 * dp).toInt(), (10 * dp).toInt(), (14 * dp).toInt(), (10 * dp).toInt())
             text = "Initializing…"
+            contentDescription = "Status display. Initializing."
+            importantForAccessibility = android.view.View.IMPORTANT_FOR_ACCESSIBILITY_YES
         }
+
         navView = TextView(this).apply {
             setTextColor(Color.WHITE)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
-            setBackgroundColor(0xCC1D4ED8.toInt())
-            setPadding(24, 14, 24, 14)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+            typeface = android.graphics.Typeface.DEFAULT_BOLD
+            background = GradientDrawable().apply {
+                setColor(0xDD1D4ED8.toInt())
+                cornerRadius = 28f * dp
+            }
+            setPadding((24 * dp).toInt(), (14 * dp).toInt(), (24 * dp).toInt(), (14 * dp).toInt())
             gravity = Gravity.CENTER
             visibility = android.view.View.GONE
+            elevation = 8f * dp
+            contentDescription = "Navigation status"
+            importantForAccessibility = android.view.View.IMPORTANT_FOR_ACCESSIBILITY_YES
         }
+
+        val micSize = (60 * dp).toInt()
         micButton = TextView(this).apply {
             text = "🎤"
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 20f)
-            setBackgroundColor(0xCC2563EB.toInt())
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 22f)
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(0xFF2563EB.toInt())
+            }
             setTextColor(Color.WHITE)
-            setPadding(20, 14, 20, 14)
+            gravity = Gravity.CENTER
+            elevation = 12f * dp
             setOnClickListener { onMicTapped() }
+            contentDescription = "Tap to give a voice command. Say things like: take me to the nearest door."
+            importantForAccessibility = android.view.View.IMPORTANT_FOR_ACCESSIBILITY_YES
         }
+
+        // Mark camera views as not important for TalkBack (decorative/live content)
+        surfaceView.importantForAccessibility = android.view.View.IMPORTANT_FOR_ACCESSIBILITY_NO
+        overlayView.importantForAccessibility = android.view.View.IMPORTANT_FOR_ACCESSIBILITY_NO
+
         val root = FrameLayout(this)
         root.addView(surfaceView, mpmp())
         root.addView(overlayView, mpmp())
         root.addView(hudView, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT,
-            Gravity.TOP or Gravity.START).apply { setMargins(24, 48, 24, 0) })
+            Gravity.TOP or Gravity.START).apply {
+            setMargins((16 * dp).toInt(), (48 * dp).toInt(), (16 * dp).toInt(), 0)
+        })
         root.addView(navView, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT,
-            Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply { setMargins(16, 0, 16, 90) })
+            Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply {
+            setMargins((20 * dp).toInt(), 0, (20 * dp).toInt(), (96 * dp).toInt())
+        })
         root.addView(micButton, FrameLayout.LayoutParams(
-            FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT,
-            Gravity.BOTTOM or Gravity.END).apply { setMargins(0, 0, 24, 24) })
+            micSize, micSize,
+            Gravity.BOTTOM or Gravity.END).apply {
+            setMargins(0, 0, (20 * dp).toInt(), (20 * dp).toInt())
+        })
         setContentView(root)
     }
 
@@ -607,12 +703,10 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
                 poseTracker.markKeyframeCaptured(cx, cz, latestHeading)
             }
 
-            // --- Depth-hit wall extraction (every 300ms on GL thread) ---
-            // This runs on the GL thread so `frame` is always the current frame.
-            // It samples a 8×6 grid of screen points and hit-tests each one,
-            // marking floor hits as free and wall hits as occupied.
+            // --- Depth-hit wall extraction (every 200ms on GL thread) ---
+            // Denser sampling at higher frequency for better wall/free-space coverage.
             val depthNow = System.currentTimeMillis()
-            if (depthNow - lastDepthSampleMs >= 300L) {
+            if (depthNow - lastDepthSampleMs >= 200L) {
                 lastDepthSampleMs = depthNow
                 extractWallsFromDepth(frame, camera)
             }
@@ -635,6 +729,8 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
                     rebuildExecutor.execute {
                         try {
                             mapBuilder.rebuild(keyframes)
+                            // Re-anchor reference points at corrected positions after rebuild
+                            poseTracker.resetAnchorsAfterRebuild()
                         } catch (e: Exception) {
                             println("$TAG: rebuild: ${e.message}")
                         } finally {
@@ -669,24 +765,25 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
      * This is the primary source of wall data because:
      * 1. It runs on the GL thread with the CURRENT frame — no stale-frame problem.
      * 2. It works even when ARCore's vertical plane detection fails (common indoors).
-     * 3. It samples 48 points per call (8 cols × 6 rows) — dense enough for walls.
+     * 3. It samples 120 points per call (12 cols × 10 rows) for dense coverage.
      *
      * Height rules (relative to camera Y):
-     *   relY < -0.5m  → floor level  → mark as free
-     *   -0.5m ≤ relY ≤ 0.8m → torso/wall level → mark as occupied (wall)
-     *   relY > 0.8m   → ceiling/above head → ignore
+     *   relY < -1.0m  → floor level  → mark as free
+     *   -1.0m ≤ relY ≤ 1.2m → wall level → mark as occupied (wall)
+     *   relY > 1.2m   → ceiling → ignore
      */
     private fun extractWallsFromDepth(frame: Frame, camera: Camera) {
         if (camera.trackingState != TrackingState.TRACKING) return
         val cameraY = camera.pose.ty()
         val userX = camera.pose.tx()
         val userZ = camera.pose.tz()
-        val cols = 10; val rows = 8  // 80 sample points for denser coverage
+        val cols = 12; val rows = 10  // 120 sample points for denser wall coverage
         val stepX = surfaceWidth  / cols.toFloat()
         val stepY = surfaceHeight / rows.toFloat()
 
         // Collect depth hits for hazard warning system
         val depthHits = mutableListOf<HazardWarningSystem.DepthHit>()
+        val floorHits = mutableListOf<HazardWarningSystem.FloorHit>()
 
         for (col in 0 until cols) {
             for (row in 0 until rows) {
@@ -712,26 +809,78 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
 
                     val relY = hy - cameraY
                     when {
-                        relY < -0.5f           -> mapBuilder.markHitFree(hx, hz)
-                        relY in -0.5f..0.8f    -> {
+                        relY < -1.0f           -> {
+                            mapBuilder.markHitFree(hx, hz)
+                            // Collect floor hits for staircase/drop-off detection
+                            floorHits.add(HazardWarningSystem.FloorHit(hx, hy, hz))
+                        }
+                        relY in -1.0f..1.2f    -> {
                             mapBuilder.markHitOccupied(hx, hz)
                             // Collect wall-level hits for hazard detection
                             depthHits.add(HazardWarningSystem.DepthHit(hx, hz, dist))
                         }
-                        // above 0.8m = ceiling or tall furniture — ignore
+                        // above 1.2m from camera = ceiling — ignore
                     }
                 } catch (_: Exception) { /* hit-test can throw on degraded tracking */ }
             }
         }
 
         // Feed depth hits to hazard warning system
+        // Camera looks along -Z in local space, so negate to get actual look direction
+        val q = camera.pose.rotationQuaternion
+        val lookX = -(2f * (q[0] * q[2] + q[1] * q[3]))
+        val lookZ = -(1f - 2f * (q[0] * q[0] + q[1] * q[1]))
+        val isNavigating = navigationManager?.state == NavigationState.NAVIGATING
+
         if (depthHits.isNotEmpty()) {
-            val q = camera.pose.rotationQuaternion
-            val fwdX = 2f * (q[0] * q[2] + q[1] * q[3])
-            val fwdZ = 1f - 2f * (q[0] * q[0] + q[1] * q[1])
-            val isNavigating = navigationManager?.state == NavigationState.NAVIGATING
-            hazardWarningSystem?.processDepthHits(depthHits, userX, userZ, fwdX, fwdZ,
+            hazardWarningSystem?.processDepthHits(depthHits, userX, userZ, lookX, lookZ,
                 isNavigating == true)
+        }
+
+        // Check for staircase/drop-off using floor height discontinuities
+        if (floorHits.size >= 3) {
+            hazardWarningSystem?.checkFloorDropOff(
+                floorHits, userX, cameraY, userZ, lookX, lookZ, isNavigating == true)
+        }
+
+        // Also check YOLO-detected semantic objects for proximity alerts
+        hazardWarningSystem?.checkSemanticObjects(
+            semanticMap.getAllObjects(), userX, userZ, lookX, lookZ,
+            isNavigating == true
+        )
+
+        // Feed spatial audio engine with directional wall distances
+        if (depthHits.isNotEmpty()) {
+            val fLen = kotlin.math.sqrt(lookX * lookX + lookZ * lookZ).coerceAtLeast(0.001f)
+            val fnx = lookX / fLen; val fnz = lookZ / fLen
+            // Left normal: rotate forward 90° CCW
+            val lnx = fnz; val lnz = -fnx
+            // Right normal: rotate forward 90° CW
+            val rnx = -fnz; val rnz = fnx
+
+            var nearFwd = Float.MAX_VALUE
+            var nearLeft = Float.MAX_VALUE
+            var nearRight = Float.MAX_VALUE
+            var freeSum = 0f; var freeCount = 0
+
+            for (hit in depthHits) {
+                val dx = hit.worldX - userX; val dz = hit.worldZ - userZ
+                val d = kotlin.math.sqrt(dx * dx + dz * dz)
+                if (d < 0.1f) continue
+                val ndx = dx / d; val ndz = dz / d
+
+                val fwdDot = ndx * fnx + ndz * fnz
+                val leftDot = ndx * lnx + ndz * lnz
+                val rightDot = ndx * rnx + ndz * rnz
+
+                if (fwdDot > 0.5f && d < nearFwd) nearFwd = d
+                if (leftDot > 0.5f && d < nearLeft) nearLeft = d
+                if (rightDot > 0.5f && d < nearRight) nearRight = d
+                freeSum += d; freeCount++
+            }
+
+            val avgFree = if (freeCount > 0) freeSum / freeCount else 5f
+            spatialAudio.update(nearFwd, nearLeft, nearRight, avgFree)
         }
     }
 
@@ -939,7 +1088,10 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             val textObjs = semanticMap.getAllObjects().count { it.textContent != null }
             append("Text landmarks: $textObjs")
         }
-        runOnUiThread { hudView.text = text }
+        runOnUiThread {
+            hudView.text = text
+            hudView.contentDescription = "Status: $text"
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -1033,18 +1185,36 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
 
     private fun updateNavHud(state: NavigationState, message: String) {
         val (label, bgColor) = when (state) {
-            NavigationState.LISTENING  -> "🎤 $message" to 0xCC7C3AED.toInt()
-            NavigationState.PLANNING   -> "🔍 $message" to 0xCC2563EB.toInt()
-            NavigationState.NAVIGATING -> "🧭 $message" to 0xCC1D4ED8.toInt()
-            NavigationState.ARRIVED    -> "✅ $message"  to 0xCC16A34A.toInt()
-            NavigationState.ERROR      -> "⚠️ $message"  to 0xCCDC2626.toInt()
+            NavigationState.LISTENING  -> "🎤 $message" to 0xDD7C3AED.toInt()
+            NavigationState.PLANNING   -> "🔍 $message" to 0xDD2563EB.toInt()
+            NavigationState.NAVIGATING -> "🧭 $message" to 0xDD1D4ED8.toInt()
+            NavigationState.ARRIVED    -> "✅ $message"  to 0xDD16A34A.toInt()
+            NavigationState.ERROR      -> "⚠️ $message"  to 0xDDDC2626.toInt()
             NavigationState.IDLE       -> ""             to 0
         }
-        navView.setBackgroundColor(bgColor)
+        (navView.background as? GradientDrawable)?.setColor(bgColor)
         navView.text       = label
         navView.visibility = if (state == NavigationState.IDLE) android.view.View.GONE
         else android.view.View.VISIBLE
-        micButton.text     = if (state == NavigationState.NAVIGATING) "⏹" else "🎤"
+
+        // Update mic button style based on navigation state
+        val micBg = micButton.background as? GradientDrawable
+        if (state == NavigationState.NAVIGATING) {
+            micButton.text = "⏹"
+            micBg?.setColor(0xFFDC2626.toInt())
+        } else {
+            micButton.text = "🎤"
+            micBg?.setColor(0xFF2563EB.toInt())
+        }
+
+        // Accessibility: update content descriptions and announce state changes
+        navView.contentDescription = message
+        micButton.contentDescription = if (state == NavigationState.NAVIGATING)
+            "Tap to stop navigation" else "Tap to give a voice command"
+        if (state != NavigationState.IDLE) {
+            navView.announceForAccessibility(message)
+        }
+
         navChannel?.invokeMethod("navStateChange",
             mapOf("state" to state.name, "message" to message))
     }

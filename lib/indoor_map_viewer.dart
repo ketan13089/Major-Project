@@ -379,13 +379,18 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
               child: Row(mainAxisSize: MainAxisSize.min, children: [
                 AnimatedBuilder(
                   animation: _pulseCtrl,
-                  builder: (_, __) => Container(
-                    width: 7, height: 7,
-                    decoration: BoxDecoration(
-                      shape: BoxShape.circle,
-                      color: scanning ? _T.green : _T.textDim,
-                    ),
-                  ),
+                  builder: (_, __) {
+                    final t = _pulseCtrl.value;
+                    final pulse = t < 0.5 ? t * 2 : 2 - t * 2;
+                    return Container(
+                      width: 7, height: 7,
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        color: (scanning ? _T.green : _T.textDim)
+                            .withOpacity(scanning ? 0.4 + 0.6 * pulse : 1.0),
+                      ),
+                    );
+                  },
                 ),
                 const SizedBox(width: 6),
                 Text(
@@ -480,7 +485,11 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
           if (d.scale != 1.0) scale = (_scaleStart * d.scale).clamp(6.0, 300.0);
         }),
         child: Stack(children: [
-          AnimatedBuilder(
+          Semantics(
+            label: 'Indoor map showing ${objects.length} detected objects. '
+                'Pinch to zoom, drag to pan.',
+            excludeSemantics: true,
+            child: AnimatedBuilder(
             animation: _pulseCtrl,
             builder: (_, __) => CustomPaint(
               painter: _MapPainter(
@@ -494,6 +503,7 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
               ),
               child: const SizedBox.expand(),
             ),
+          ),
           ),
           // Empty state
           if (grid == null || gridW == 0)
@@ -591,21 +601,29 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
           Positioned(
             right: 12,
             bottom: _navInstruction.isNotEmpty ? 60 : 12,
-            child: GestureDetector(
-              onTap: _onNavButtonTap,
-              child: Container(
-                width: 48, height: 48,
-                decoration: BoxDecoration(
-                  color: _navState == 'NAVIGATING' ? _T.red : _T.blue,
-                  shape: BoxShape.circle,
-                  boxShadow: [BoxShadow(
-                      color: Colors.black.withOpacity(0.18),
-                      blurRadius: 8, offset: const Offset(0, 2))],
-                ),
-                child: Icon(
-                  _navState == 'LISTENING'  ? Icons.mic_none_rounded :
-                  _navState == 'NAVIGATING' ? Icons.stop_rounded     : Icons.mic_rounded,
-                  color: Colors.white, size: 22,
+            child: Semantics(
+              button: true,
+              label: _navState == 'NAVIGATING'
+                  ? 'Stop navigation'
+                  : _navState == 'LISTENING'
+                      ? 'Listening for voice command'
+                      : 'Start voice command. Say things like: take me to the nearest door.',
+              child: GestureDetector(
+                onTap: _onNavButtonTap,
+                child: Container(
+                  width: 48, height: 48,
+                  decoration: BoxDecoration(
+                    color: _navState == 'NAVIGATING' ? _T.red : _T.blue,
+                    shape: BoxShape.circle,
+                    boxShadow: [BoxShadow(
+                        color: Colors.black.withOpacity(0.18),
+                        blurRadius: 8, offset: const Offset(0, 2))],
+                  ),
+                  child: Icon(
+                    _navState == 'LISTENING'  ? Icons.mic_none_rounded :
+                    _navState == 'NAVIGATING' ? Icons.stop_rounded     : Icons.mic_rounded,
+                    color: Colors.white, size: 22,
+                  ),
                 ),
               ),
             ),
@@ -660,7 +678,10 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
               final o = objects[i];
               final col = _typeColor(o.type);
               final selected = _selObj == i;
-              return GestureDetector(
+              return Semantics(
+                button: true,
+                label: '${_displayLabel(o)}, ${(o.confidence * 100).toStringAsFixed(0)} percent confidence. Tap to show path.',
+                child: GestureDetector(
                 onTap: () => setState(() {
                   _selObj = selected ? null : i;
                   _cachedPathCells = _recomputePath(
@@ -688,7 +709,7 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
                         style: TextStyle(color: _T.textSec, fontSize: 11)),
                   ]),
                 ),
-              );
+              ));
             },
           ),
         ),
@@ -701,13 +722,20 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
     return Container(
       color: _T.surface,
       padding: const EdgeInsets.fromLTRB(16, 10, 16, 12),
-      child: GestureDetector(
+      child: Semantics(
+        button: true,
+        label: 'Open AR Camera for indoor navigation and scanning',
+        child: GestureDetector(
         onTap: _openAR,
         child: AnimatedContainer(
           duration: const Duration(milliseconds: 300),
           height: 50,
           decoration: BoxDecoration(
-            color: scanning ? _T.green : _T.blue,
+            gradient: LinearGradient(
+              colors: scanning
+                  ? [_T.green, const Color(0xFF15803D)]
+                  : [_T.blue, const Color(0xFF1D4ED8)],
+            ),
             borderRadius: BorderRadius.circular(12),
           ),
           child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [
@@ -725,6 +753,7 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
             ),
           ]),
         ),
+      ),
       ),
     );
   }

@@ -15,7 +15,13 @@ data class NavigationIntent(
     /** Room number for room-based navigation (e.g., "203", "305A"). */
     val roomNumber: String? = null,
     /** Free-text search term for text-landmark matching. */
-    val textQuery: String? = null
+    val textQuery: String? = null,
+    /** If true, retrace the walked path back to the starting point. */
+    val isRetrace: Boolean = false,
+    /** If true, trigger emergency SOS flow. */
+    val isEmergency: Boolean = false,
+    /** If true, replay the onboarding tutorial. */
+    val isTutorial: Boolean = false
 )
 
 enum class DestinationQualifier { NEAREST, FARTHEST, LEFT_MOST, RIGHT_MOST }
@@ -80,6 +86,36 @@ class VoiceCommandProcessor(
     private fun parseIntent(text: String): NavigationIntent? {
         val lower = text.lowercase().trim()
 
+        // ── Tutorial replay ─────────────────────────────────────────────────
+        if (TUTORIAL_TRIGGERS.any { lower.contains(it) }) {
+            return NavigationIntent(
+                destinationType = ObjectType.UNKNOWN,
+                qualifier = DestinationQualifier.NEAREST,
+                rawText = text,
+                isTutorial = true
+            )
+        }
+
+        // ── Emergency / SOS commands ───────────────────────────────────────
+        if (EMERGENCY_TRIGGERS.any { lower.contains(it) }) {
+            return NavigationIntent(
+                destinationType = ObjectType.UNKNOWN,
+                qualifier = DestinationQualifier.NEAREST,
+                rawText = text,
+                isEmergency = true
+            )
+        }
+
+        // ── Retrace / go-back commands ─────────────────────────────────────
+        if (RETRACE_TRIGGERS.any { lower.contains(it) }) {
+            return NavigationIntent(
+                destinationType = ObjectType.UNKNOWN,
+                qualifier = DestinationQualifier.NEAREST,
+                rawText = text,
+                isRetrace = true
+            )
+        }
+
         // Must contain a navigation trigger keyword OR a qualifier like "nearest"
         val isNavCommand = NAV_TRIGGERS.any { lower.contains(it) }
                 || QUALIFIERS_NEAREST.any { lower.contains(it) }
@@ -119,6 +155,19 @@ class VoiceCommandProcessor(
         private val NAV_TRIGGERS = listOf(
             "take me to", "go to", "navigate to", "find the", "find a",
             "where is", "guide me to", "bring me to", "show me the", "show me a"
+        )
+        private val TUTORIAL_TRIGGERS = listOf(
+            "tutorial", "help me use", "how to use", "instructions",
+            "how does this work", "teach me", "what can you do"
+        )
+        private val EMERGENCY_TRIGGERS = listOf(
+            "help me", "emergency", "sos", "i need help",
+            "call for help", "send help", "i'm lost", "i am lost"
+        )
+        private val RETRACE_TRIGGERS = listOf(
+            "take me back", "go back", "guide me back", "retrace",
+            "return to start", "go to start", "back to start",
+            "bring me back", "reverse path", "way back"
         )
         private val QUALIFIERS_NEAREST  = listOf("nearest", "closest", "nearby")
         private val QUALIFIERS_FARTHEST = listOf("farthest", "furthest", "far")

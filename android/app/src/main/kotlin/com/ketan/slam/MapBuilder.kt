@@ -62,7 +62,7 @@ import kotlin.math.sqrt
  *          before re-integrating, keeping only the decay-modified logOdds
  *          as a warm start (not the full old values).
  */
-class MapBuilder(private val res: Float) {
+class MapBuilder(val res: Float) {
 
     companion object {
         const val CELL_UNKNOWN  = 0
@@ -94,39 +94,19 @@ class MapBuilder(private val res: Float) {
         // but wall cells from planes are re-reinforced every rebuild anyway.
         private const val DECAY_PER_REBUILD = 0.12f
 
-        // Ray fan: cast 180° forward arc in 15° steps (13 rays) for wide coverage.
-        private val RAY_FAN_ANGLES = floatArrayOf(
-            Math.toRadians(-90.0).toFloat(),
-            Math.toRadians(-75.0).toFloat(),
-            Math.toRadians(-60.0).toFloat(),
-            Math.toRadians(-45.0).toFloat(),
-            Math.toRadians(-30.0).toFloat(),
-            Math.toRadians(-15.0).toFloat(),
-            0f,
-            Math.toRadians( 15.0).toFloat(),
-            Math.toRadians( 30.0).toFloat(),
-            Math.toRadians( 45.0).toFloat(),
-            Math.toRadians( 60.0).toFloat(),
-            Math.toRadians( 75.0).toFloat(),
-            Math.toRadians( 90.0).toFloat()
-        )
+        // Full 360° ray fan in 15° steps (24 rays) for omnidirectional coverage.
+        // Forward hemisphere uses full range; rear hemisphere uses shorter range.
+        private val RAY_FAN_ANGLES = FloatArray(24) { i ->
+            Math.toRadians((i * 15).toDouble()).toFloat()
+        }
 
-        // Backward rays: 5 rays ±30° from reverse direction, shorter range.
-        private val RAY_BACK_ANGLES = floatArrayOf(
-            Math.toRadians(-30.0).toFloat(),
-            Math.toRadians(-15.0).toFloat(),
-            0f,
-            Math.toRadians( 15.0).toFloat(),
-            Math.toRadians( 30.0).toFloat()
-        )
-        private const val RAY_BACK_MAX_DIST = 2.0f
-
-        // Rays stop at 3.5m — gives better free-space coverage in large rooms.
+        // Forward rays reach further; rear rays (>90° from forward) use shorter range.
         private const val RAY_MAX_DIST = 3.5f
+        private const val RAY_REAR_MAX_DIST = 2.5f
 
         // Minimum plane polygon area in m² to be rasterized.
-        // Rejects degenerate ARCore "invalid statistics" planes.
-        private const val MIN_PLANE_AREA_M2 = 0.25f
+        // Lowered to capture smaller valid planes in rooms.
+        private const val MIN_PLANE_AREA_M2 = 0.10f
 
         // Minimum forward vector magnitude to attempt ray casting.
         // Prevents garbage rays during ARCore initialization.
@@ -222,9 +202,10 @@ class MapBuilder(private val res: Float) {
         // Camera cell is always visited
         forceLogOdds(gx, gz, L_MIN, CELL_VISITED)
 
-        // 0.5m radius around camera = definitely free (camera fits here)
+        // 0.5m radius around camera = definitely free (user physically occupies this space).
+        // Use 2× free evidence — the camera being here is strong proof of walkability.
         for (dz in -2..2) for (dx in -2..2) {
-            if (dx * dx + dz * dz <= 4) updateLogOdds(gx + dx, gz + dz, L_FREE)
+            if (dx * dx + dz * dz <= 4) updateLogOdds(gx + dx, gz + dz, L_FREE * 2f)
         }
 
         // FIX 4: Guard against zero/near-zero forward vector
@@ -232,9 +213,6 @@ class MapBuilder(private val res: Float) {
         if (fwdLen < MIN_FORWARD_LEN) return
 
         castRayFan(poseX, poseZ, forwardX, forwardZ)
-
-        // Backward rays: cast behind the camera for better coverage
-        castBackwardRayFan(poseX, poseZ, forwardX, forwardZ)
     }
 
     /**
@@ -315,9 +293,10 @@ class MapBuilder(private val res: Float) {
 
         forceLogOdds(gx, gz, L_MIN, CELL_VISITED)
 
+        // 2× free evidence for walked path — strong proof of walkability
         for (dz in -2..2) for (dx in -2..2) {
             if (dx * dx + dz * dz <= 4) {
-                updateLogOdds(gx + dx, gz + dz, L_FREE)
+                updateLogOdds(gx + dx, gz + dz, L_FREE * 2f)
                 observedThisRebuild.add(GridCell(gx + dx, gz + dz))
             }
         }
@@ -494,6 +473,11 @@ class MapBuilder(private val res: Float) {
 
     // ── Ray casting ────────────────────────────────────────────────────────────
 
+    /**
+     * Cast a full 360° ray fan around the camera position.
+     * Forward hemisphere (within ±90° of forward) uses full range (3.5m);
+     * rear hemisphere uses shorter range (2.5m).
+     */
     private fun castRayFan(cx: Float, cz: Float, fwdX: Float, fwdZ: Float) {
         val len = sqrt(fwdX * fwdX + fwdZ * fwdZ).coerceAtLeast(0.001f)
         val nx = fwdX / len; val nz = fwdZ / len
@@ -502,26 +486,24 @@ class MapBuilder(private val res: Float) {
             val sinA = sin(angle.toDouble()).toFloat()
             val rx = nx * cosA - nz * sinA
             val rz = nx * sinA + nz * cosA
-            rayCastFree(cx, cz, rx, rz, RAY_MAX_DIST)
-        }
-    }
-
-    /** Cast backward rays (reverse direction) for coverage behind the user. */
-    private fun castBackwardRayFan(cx: Float, cz: Float, fwdX: Float, fwdZ: Float) {
-        val len = sqrt(fwdX * fwdX + fwdZ * fwdZ).coerceAtLeast(0.001f)
-        // Reverse direction
-        val nx = -fwdX / len; val nz = -fwdZ / len
-        for (angle in RAY_BACK_ANGLES) {
-            val cosA = cos(angle.toDouble()).toFloat()
-            val sinA = sin(angle.toDouble()).toFloat()
-            val rx = nx * cosA - nz * sinA
-            val rz = nx * sinA + nz * cosA
-            rayCastFree(cx, cz, rx, rz, RAY_BACK_MAX_DIST)
+            // Dot product with forward: positive = forward hemisphere
+            val dot = rx * nx + rz * nz
+            val maxDist = if (dot >= 0f) RAY_MAX_DIST else RAY_REAR_MAX_DIST
+            rayCastFree(cx, cz, rx, rz, maxDist)
         }
     }
 
     /** Thread-safe snapshot of observation counts for path safety scoring. */
     fun observationCountSnapshot(): Map<GridCell, Int> = HashMap(observationCounts)
+
+    /** Snapshot of wall cells for persistence. */
+    @Synchronized fun getWallCells(): Set<GridCell> = HashSet(wallCells)
+
+    /** Restore wall cells from a loaded map. */
+    @Synchronized fun restoreWallCells(cells: Set<GridCell>) {
+        wallCells.clear()
+        wallCells.addAll(cells)
+    }
 
     private fun rayCastFree(
         originX: Float, originZ: Float,
@@ -574,7 +556,7 @@ class MapBuilder(private val res: Float) {
         // FIX 3: Also reject degenerate vertical planes.
         // Use perimeter check instead of area (walls are thin, area ≈ 0).
         val perimeter = wallPerimeter(verts)
-        if (perimeter < 0.3f) return  // less than 30cm wall — likely noise
+        if (perimeter < 0.15f) return  // less than 15cm wall — likely noise
 
         for (i in verts.indices) {
             val a = verts[i]; val b = verts[(i + 1) % verts.size]

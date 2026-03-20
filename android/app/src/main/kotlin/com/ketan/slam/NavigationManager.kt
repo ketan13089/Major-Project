@@ -59,6 +59,15 @@ class NavigationManager(
     /** Cached observation counts from the latest tick(), used in resolveIntent/rePlan. */
     @Volatile private var cachedObservationCounts: Map<GridCell, Int>? = null
 
+    /** Breadcrumb provider — set by ArActivity, returns reversed breadcrumb trail. */
+    var breadcrumbProvider: (() -> List<Point3D>)? = null
+
+    /** Emergency handler — set by ArActivity to trigger SOS flow. */
+    var onEmergency: ((Float, Float) -> Unit)? = null
+
+    /** Tutorial handler — set by ArActivity to replay onboarding. */
+    var onTutorial: (() -> Unit)? = null
+
     /** True when this manager needs the occupancy grid snapshot in tick(). */
     val needsGrid: Boolean get() = state != NavigationState.IDLE || pendingIntent != null
 
@@ -152,8 +161,16 @@ class NavigationManager(
 
     /** Stores the intent and lets tick() resolve it on the next frame. */
     private fun queueIntent(intent: NavigationIntent) {
-        val label = intent.destinationType.name.lowercase().replace('_', ' ')
-        setState(NavigationState.PLANNING, "Finding $label…")
+        if (intent.isTutorial) {
+            // No planning state needed — handled immediately
+        } else if (intent.isEmergency) {
+            setState(NavigationState.PLANNING, "Emergency…")
+        } else if (intent.isRetrace) {
+            setState(NavigationState.PLANNING, "Planning return path…")
+        } else {
+            val label = intent.destinationType.name.lowercase().replace('_', ' ')
+            setState(NavigationState.PLANNING, "Finding $label…")
+        }
         pendingIntent = intent
     }
 
@@ -163,6 +180,23 @@ class NavigationManager(
         grid: Map<GridCell, Byte>,
         semanticMap: SemanticMapManager
     ) {
+        if (intent.isTutorial) {
+            onTutorial?.invoke()
+            setState(NavigationState.IDLE, "Playing tutorial")
+            return
+        }
+
+        if (intent.isEmergency) {
+            onEmergency?.invoke(userX, userZ)
+            setState(NavigationState.IDLE, "Emergency triggered")
+            return
+        }
+
+        if (intent.isRetrace) {
+            resolveRetrace(intent, userX, userZ, grid)
+            return
+        }
+
         val label = intent.destinationType.name.lowercase().replace('_', ' ')
 
         // ── Destination selection ─────────────────────────────────────────────
@@ -203,6 +237,93 @@ class NavigationManager(
             onInstruction(firstInstr)
             currentSession = currentSession!!.copy(lastInstruction = firstInstr)
         }
+    }
+
+    /**
+     * Retrace path: reverse the breadcrumb trail and navigate back to start.
+     * Uses Douglas-Peucker simplification to reduce waypoints.
+     */
+    private fun resolveRetrace(
+        intent: NavigationIntent,
+        userX: Float, userZ: Float,
+        grid: Map<GridCell, Byte>
+    ) {
+        val breadcrumbs = breadcrumbProvider?.invoke()
+        if (breadcrumbs == null || breadcrumbs.size < 2) {
+            setState(NavigationState.ERROR, "No path recorded yet")
+            guide.speak("No path recorded yet. Walk around first, then ask me to guide you back.")
+            return
+        }
+
+        // Reverse and simplify the breadcrumb trail
+        val reversed = breadcrumbs.reversed()
+        val simplified = douglasPeucker(reversed, 0.3f)  // 30cm tolerance
+
+        // Convert to NavWaypoints
+        val path = simplified.map { pt ->
+            NavWaypoint((pt.x / res).roundToInt(), (pt.z / res).roundToInt())
+        }
+
+        if (path.size < 2) {
+            setState(NavigationState.ERROR, "Already at starting point")
+            guide.speak("You are already near the starting point.")
+            return
+        }
+
+        // Create a virtual destination at the start point
+        val startPt = simplified.last()
+        val virtualDest = SemanticObject(
+            id = "retrace_start",
+            type = ObjectType.UNKNOWN,
+            category = "starting point",
+            position = startPt,
+            boundingBox = BoundingBox2D(0f, 0f, 0f, 0f),
+            confidence = 1f,
+            firstSeen = System.currentTimeMillis(),
+            lastSeen = System.currentTimeMillis()
+        )
+
+        currentSession = NavigationSession(intent, virtualDest, path)
+        setState(NavigationState.NAVIGATING, "Retracing path to start")
+        onPathUpdated(path)
+
+        val distM = dist(userX, userZ, startPt.x, startPt.z)
+        val distStr = distM.roundToInt().coerceAtLeast(1).let { if (it == 1) "1 metre" else "$it metres" }
+        guide.speak("Guiding you back to the starting point. Distance: $distStr.")
+
+        val firstInstr = guide.computeInstruction(userX, userZ, 0f, path, res)
+        if (firstInstr != null) {
+            guide.speak(firstInstr.text)
+            onInstruction(firstInstr)
+            currentSession = currentSession!!.copy(lastInstruction = firstInstr)
+        }
+    }
+
+    /** Douglas-Peucker line simplification on XZ plane. */
+    private fun douglasPeucker(points: List<Point3D>, epsilon: Float): List<Point3D> {
+        if (points.size <= 2) return points
+        var maxDist = 0f; var maxIdx = 0
+        val first = points.first(); val last = points.last()
+        for (i in 1 until points.size - 1) {
+            val d = perpendicularDist(points[i], first, last)
+            if (d > maxDist) { maxDist = d; maxIdx = i }
+        }
+        return if (maxDist > epsilon) {
+            val left  = douglasPeucker(points.subList(0, maxIdx + 1), epsilon)
+            val right = douglasPeucker(points.subList(maxIdx, points.size), epsilon)
+            left.dropLast(1) + right
+        } else {
+            listOf(first, last)
+        }
+    }
+
+    private fun perpendicularDist(pt: Point3D, lineA: Point3D, lineB: Point3D): Float {
+        val dx = lineB.x - lineA.x; val dz = lineB.z - lineA.z
+        val lenSq = dx * dx + dz * dz
+        if (lenSq < 0.0001f) return pt.distance(lineA)
+        val t = ((pt.x - lineA.x) * dx + (pt.z - lineA.z) * dz) / lenSq
+        val projX = lineA.x + t * dx; val projZ = lineA.z + t * dz
+        return sqrt((pt.x - projX) * (pt.x - projX) + (pt.z - projZ) * (pt.z - projZ))
     }
 
     /**
