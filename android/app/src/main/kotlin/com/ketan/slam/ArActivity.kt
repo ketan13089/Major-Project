@@ -296,6 +296,13 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         session?.pause()
         overlayView.clearDetections()
         teardownCamera()
+        // Auto-save map on every pause (leaving AR)
+        try {
+            if (mapBuilder.grid.isNotEmpty()) {
+                mapPersistence.saveMap("last_session", mapBuilder, semanticMap,
+                    poseTracker.getBreadcrumbs())
+            }
+        } catch (e: Exception) { println("$TAG: auto-save: ${e.message}") }
     }
 
     override fun onDestroy() {

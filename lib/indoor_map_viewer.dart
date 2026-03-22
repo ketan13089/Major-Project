@@ -141,6 +141,7 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
     with TickerProviderStateMixin {
   static const _ch    = MethodChannel('com.ketan.slam/ar');
   static const _navCh = MethodChannel('com.ketan.slam/nav');
+  static const _mapStoreCh = MethodChannel('com.ketan.slam/map_store');
 
   // ── Data ──────────────────────────────────────────────────────────────────
   Uint8List? grid;
@@ -152,6 +153,7 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
   double posX = 0, posZ = 0, heading = 0;
   int totalObjects = 0;
   bool scanning = false;
+  String? _lastSavedMap;
 
   // ── View ──────────────────────────────────────────────────────────────────
   double scale = 28.0;
@@ -184,6 +186,22 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
     _pulseCtrl = AnimationController(
         vsync: this, duration: const Duration(seconds: 2))
       ..repeat();
+    _loadLastMap();
+  }
+
+  Future<void> _loadLastMap() async {
+    try {
+      final maps = await _mapStoreCh.invokeMethod('listMaps') as List?;
+      if (maps == null || maps.isEmpty) return;
+      // Prefer 'last_session' if it exists, otherwise take the most recent
+      final name = maps.contains('last_session') ? 'last_session' : maps.first as String;
+      final payload = await _mapStoreCh.invokeMethod('loadMapPayload', {'name': name});
+      if (payload is Map && mounted) {
+        _handleMap(payload);
+        _lastSavedMap = name;
+        debugPrint('Loaded saved map: $name');
+      }
+    } catch (e) { debugPrint('Load map: $e'); }
   }
 
   @override
@@ -274,6 +292,7 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
         _cachedPathRobotGZ = newRGZ;
         _cachedPathCells = _recomputePath(ng, newW, newH, newRGX, newRGZ, _selObj, newObjs);
       });
+
     } catch (e, st) { debugPrint('map error: $e\n$st'); }
   }
 
@@ -585,7 +604,7 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
           // Nav instruction banner
           if (_navInstruction.isNotEmpty)
             Positioned(
-              bottom: 60, left: 12, right: 64,
+              bottom: 110, left: 12, right: 64,
               child: Container(
                 padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
                 decoration: BoxDecoration(
@@ -606,10 +625,10 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
                 ]),
               ),
             ),
-          // Voice nav button
+          // Voice nav button — above the compass rose
           Positioned(
             right: 12,
-            bottom: _navInstruction.isNotEmpty ? 60 : 12,
+            bottom: _navInstruction.isNotEmpty ? 110 : 80,
             child: Semantics(
               button: true,
               label: _navState == 'NAVIGATING'
