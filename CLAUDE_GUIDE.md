@@ -1,4 +1,4 @@
-# Using Claude Code with SLAM Project
+stop# Using Claude Code with SLAM Project
 
 This project uses a unique architecture where most of the complex logic (SLAM, Computer Vision, AR) resides in the Android/Kotlin layer, while Flutter serves primarily as the UI.
 

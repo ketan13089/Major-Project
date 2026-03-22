@@ -243,6 +243,9 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         )
         navigationManager?.breadcrumbProvider = { poseTracker.getBreadcrumbs() }
 
+        // Standalone TTS announcer for non-navigation alerts (tracking loss, hazards)
+        announcer = NavigationGuide(this)
+
         emergencyManager = EmergencyManager(this, announcer!!, mapPersistence)
         navigationManager?.onEmergency = { userX, userZ ->
             emergencyManager?.trigger(userX, userZ, semanticMap, mapBuilder,
@@ -258,9 +261,6 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
                 onboardingTutorial?.play()
             }, 3000L)
         }
-
-        // Standalone TTS announcer for non-navigation alerts (tracking loss, hazards)
-        announcer = NavigationGuide(this)
 
         // Hazard warning system
         @Suppress("DEPRECATION")
