@@ -40,6 +40,10 @@ import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
+import kotlin.math.abs
+import kotlin.math.cos
+import kotlin.math.roundToInt
+import kotlin.math.sin
 import kotlin.math.sqrt
 
 /**
@@ -129,6 +133,12 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     private var lastRebuildMs = 0L
     @Volatile private var lastRebuildVersion = 0L
     private var lastDepthSampleMs = 0L          // throttle depth-hit sampling
+    private var lastDepthImageMs = 0L           // throttle depth image analysis
+    private var lastWallInferMs  = 0L           // throttle motion-based wall inference
+
+    // Pre-allocated buffers for depth image processing (Strategy 1)
+    private val depthWorldPts = FloatArray(240 * 180 * 3) // worst-case depth image size
+    private var depthPtCount = 0
 
     // ── Flutter ───────────────────────────────────────────────────────────────
     private var methodChannel: MethodChannel? = null
@@ -737,12 +747,23 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
                 poseTracker.markKeyframeCaptured(cx, cz, latestHeading)
             }
 
-            // --- Depth-hit wall extraction (every 200ms on GL thread) ---
-            // Denser sampling at higher frequency for better wall/free-space coverage.
+            // --- Depth-hit wall extraction (every 500ms on GL thread) ---
             val depthNow = System.currentTimeMillis()
             if (depthNow - lastDepthSampleMs >= 500L) {
                 lastDepthSampleMs = depthNow
-                extractWallsFromDepth(frame, camera)
+                extractWallsFromDepth(frame, camera)       // Strategies 2 + 4 integrated
+            }
+
+            // --- Strategy 1: Depth image analysis (every 1s) ---
+            if (depthNow - lastDepthImageMs >= 1000L) {
+                lastDepthImageMs = depthNow
+                extractWallsFromDepthImage(frame, camera)
+            }
+
+            // --- Strategy 3: Motion-based wall inference (every 2s) ---
+            if (depthNow - lastWallInferMs >= 2000L) {
+                lastWallInferMs = depthNow
+                try { inferWallsFromMotionContext() } catch (_: Exception) {}
             }
 
             // --- Reference anchor management (drift detection) ---
@@ -815,18 +836,28 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     private fun extractWallsFromDepth(frame: Frame, camera: Camera) {
         if (camera.trackingState != TrackingState.TRACKING) return
         val cameraY = camera.pose.ty()
-        val userX = camera.pose.tx()
-        val userZ = camera.pose.tz()
-        // Reduced grid: 8×6 = 48 points. Fewer points = fewer wasted hit-tests,
-        // and the successful ones still provide good coverage.
         val cols = 8; val rows = 6
         val stepX = surfaceWidth  / cols.toFloat()
         val stepY = surfaceHeight / rows.toFloat()
+
+        // ── Strategy 2: Track per-column floor/miss pattern ──────────────
+        // For each column, record the furthest floor hit (screen-space row)
+        // and whether upper rows were all misses. If so, the floor-wall
+        // junction is at that last floor hit.
+        data class ColHit(val wx: Float, val wz: Float, val row: Int)
+        val lastFloorPerCol = arrayOfNulls<ColHit>(cols) // deepest floor hit per col
+        val wallHitsPerCol  = IntArray(cols)
+        val totalHitsPerCol = IntArray(cols)
+
+        // Collect wall hit screen positions for Strategy 4 (adaptive density)
+        val wallHitScreenPts = mutableListOf<Pair<Float, Float>>()
+        var totalAttempts = 0; var totalSuccesses = 0
 
         for (col in 0 until cols) {
             for (row in 0 until rows) {
                 val sx = col * stepX + stepX / 2f
                 val sy = row * stepY + stepY / 2f
+                totalAttempts++
                 try {
                     val hits = frame.hitTest(sx, sy)
                     val hit = hits.firstOrNull { h ->
@@ -836,30 +867,258 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
                                 t is com.google.ar.core.InstantPlacementPoint
                     } ?: continue
 
+                    totalSuccesses++
                     val hp  = hit.hitPose
-                    val hx  = hp.tx()
-                    val hz  = hp.tz()
-                    val hy  = hp.ty()
-
-                    // Ignore hits that are too far away — unreliable depth
+                    val hx  = hp.tx(); val hz = hp.tz(); val hy = hp.ty()
                     if (hit.distance > 4.0f) continue
 
                     val relY = hy - cameraY
-                    // Check if hit landed on a tracked vertical plane (structural wall)
                     val isVerticalPlane = (hit.trackable as? Plane)?.type == Plane.Type.VERTICAL
 
                     when {
-                        // Floor: well below camera
-                        relY < -1.2f -> mapBuilder.markHitFree(hx, hz)
-                        // True wall band: near camera height OR confirmed vertical plane
-                        isVerticalPlane || relY in -0.5f..0.6f ->
+                        relY < -1.2f -> {
+                            mapBuilder.markHitFree(hx, hz)
+                            // Strategy 2: record floor hit for this column
+                            totalHitsPerCol[col]++
+                            if (lastFloorPerCol[col] == null || row < lastFloorPerCol[col]!!.row) {
+                                lastFloorPerCol[col] = ColHit(hx, hz, row)
+                            }
+                        }
+                        isVerticalPlane || relY in -0.5f..0.6f -> {
                             mapBuilder.markHitOccupied(hx, hz)
-                        // Furniture/obstacle band: between floor and wall level
+                            wallHitsPerCol[col]++
+                            wallHitScreenPts.add(sx to sy)
+                        }
                         relY in -1.2f..-0.5f ->
                             mapBuilder.markHitObstacle(hx, hz)
-                        // Above 0.6m from camera = ceiling/shelf — ignore
                     }
-                } catch (_: Exception) { /* hit-test can throw on degraded tracking */ }
+                } catch (_: Exception) {}
+            }
+        }
+
+        // ── Strategy 2: Infer walls at floor boundaries ──────────────────
+        // For columns where we got floor hits in lower rows but nothing in
+        // upper rows (and no explicit wall hit), the floor→void transition
+        // is likely a white wall base.
+        val pose = camera.pose
+        val q = pose.rotationQuaternion
+        val fwdX = 2f * (q[0] * q[2] + q[1] * q[3])
+        val fwdZ = 1f - 2f * (q[0] * q[0] + q[1] * q[1])
+        val fLen = sqrt(fwdX * fwdX + fwdZ * fwdZ).coerceAtLeast(0.001f)
+        val fnx = fwdX / fLen; val fnz = fwdZ / fLen
+
+        for (col in 0 until cols) {
+            val floor = lastFloorPerCol[col] ?: continue
+            if (wallHitsPerCol[col] > 0) continue  // column already has explicit wall
+            if (totalHitsPerCol[col] < 1) continue
+            // Floor hit exists but upper rows had no hits → likely wall above
+            // Mark 1 cell step beyond the floor hit along forward direction
+            val wallX = floor.wx + fnx * 0.25f  // 25cm beyond floor hit
+            val wallZ = floor.wz + fnz * 0.25f
+            mapBuilder.markInferredWall(wallX, wallZ)
+        }
+
+        // ── Strategy 4: Adaptive density near wall hits ──────────────────
+        // If hit rate is low, do focused sampling around successful wall hits
+        val hitRate = if (totalAttempts > 0) totalSuccesses.toFloat() / totalAttempts else 0f
+        if (hitRate < 0.30f && wallHitScreenPts.isNotEmpty()) {
+            val offsets = floatArrayOf(-20f, 0f, 20f)
+            for ((sx, sy) in wallHitScreenPts) {
+                for (dx in offsets) for (dy in offsets) {
+                    if (dx == 0f && dy == 0f) continue
+                    val nsx = (sx + dx).coerceIn(0f, surfaceWidth.toFloat())
+                    val nsy = (sy + dy).coerceIn(0f, surfaceHeight.toFloat())
+                    try {
+                        val hits = frame.hitTest(nsx, nsy)
+                        val hit = hits.firstOrNull { h ->
+                            val t = h.trackable
+                            (t is Plane && t.trackingState == TrackingState.TRACKING) ||
+                                    t is com.google.ar.core.DepthPoint
+                        } ?: continue
+                        val hp = hit.hitPose
+                        if (hit.distance > 4.0f) continue
+                        val relY = hp.ty() - cameraY
+                        val isVert = (hit.trackable as? Plane)?.type == Plane.Type.VERTICAL
+                        if (isVert || relY in -0.5f..0.6f) {
+                            mapBuilder.markHitOccupied(hp.tx(), hp.tz())
+                        }
+                    } catch (_: Exception) {}
+                }
+            }
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Strategy 1: Depth Image Edge Detection
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Read ARCore's raw depth image and extract wall surfaces that hit-tests miss.
+     * Even on textureless white walls, the ToF/stereo sensor often returns some
+     * depth values — just not enough for ARCore to build a Plane.
+     *
+     * Approach:
+     *  1. Acquire DEPTH16 image (values in mm).
+     *  2. Sample every 15px in a coarse grid.
+     *  3. Unproject (u, v, depth) → world XYZ using camera intrinsics + pose.
+     *  4. Points at wall height (-0.5 to 0.6m relY) → markDepthImageWall().
+     *  5. Columns of consistent depth → wall surface cluster.
+     */
+    private fun extractWallsFromDepthImage(frame: Frame, camera: Camera) {
+        if (camera.trackingState != TrackingState.TRACKING) return
+        val depthImage = try { frame.acquireDepthImage() } catch (_: Exception) { return }
+        try {
+            val w = depthImage.width   // typically 160 or 240
+            val h = depthImage.height  // typically 120 or 180
+            val plane = depthImage.planes[0]
+            val buffer = plane.buffer
+            val rowStride = plane.rowStride
+
+            // Camera intrinsics for unprojection
+            val intrinsics = camera.textureIntrinsics
+            val focalLen = intrinsics.focalLength
+            val principal = intrinsics.principalPoint
+            val fx = focalLen[0]; val fy = focalLen[1]
+            val cx = principal[0]; val cy = principal[1]
+            // Scale intrinsics from camera image resolution to depth image resolution
+            val dims = intrinsics.imageDimensions
+            val imageW = dims[0].toFloat()
+            val imageH = dims[1].toFloat()
+            val sx = w.toFloat() / imageW
+            val sy = h.toFloat() / imageH
+            val dfx = fx * sx; val dfy = fy * sy
+            val dcx = cx * sx; val dcy = cy * sy
+
+            val pose = camera.pose
+            val cameraY = pose.ty()
+            val step = 15 // sample every 15 pixels
+            depthPtCount = 0
+
+            // Collect wall-height points and their grid-column depth
+            // For cluster detection: group by quantized depth (10cm bins)
+            val depthBins = HashMap<Int, Int>() // depthBin → count
+
+            for (v in step / 2 until h step step) {
+                for (u in step / 2 until w step step) {
+                    val offset = v * rowStride + u * 2
+                    if (offset + 1 >= buffer.capacity()) continue
+                    val depthMm = (buffer.getShort(offset).toInt() and 0xFFFF)
+                    if (depthMm == 0 || depthMm > 5000) continue // 0 = no data, >5m = unreliable
+
+                    val depthM = depthMm / 1000f
+
+                    // Unproject to camera-local 3D
+                    val localX = ((u - dcx) * depthM) / dfx
+                    val localY = ((v - dcy) * depthM) / dfy
+                    val localZ = depthM
+
+                    // Transform to world space via camera pose
+                    val world = pose.transformPoint(floatArrayOf(localX, localY, -localZ))
+                    val relY = world[1] - cameraY
+
+                    // Wall band: near camera height
+                    if (relY in -0.5f..0.6f) {
+                        mapBuilder.markDepthImageWall(world[0], world[2])
+                        // Track depth bin for cluster analysis
+                        val bin = (depthM * 10f).roundToInt() // 10cm bins
+                        depthBins[bin] = (depthBins[bin] ?: 0) + 1
+                    } else if (relY < -1.2f) {
+                        // Floor — also useful
+                        mapBuilder.markHitFree(world[0], world[2])
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            println("$TAG: depthImage: ${e.message}")
+        } finally {
+            depthImage.close()
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Strategy 3: Motion-Based Wall Proximity Inference
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Analyze the occupancy grid around the user's recent path.
+     * If one side of the path has a continuous line of CELL_UNKNOWN cells
+     * (no floor or wall detected) while the other side has floor, those
+     * unknown cells are likely a white wall.
+     *
+     * Runs every ~2s, lightweight (grid-level only, no ARCore API calls).
+     */
+    private fun inferWallsFromMotionContext() {
+        val breadcrumbs = poseTracker.getBreadcrumbs()
+        if (breadcrumbs.size < 10) return // need at least 2m of path (10 × 0.2m)
+
+        // Use the last 15 breadcrumbs (~3m of path)
+        val recent = breadcrumbs.takeLast(15)
+
+        // Compute average heading direction from path
+        val dx = recent.last().x - recent.first().x
+        val dz = recent.last().z - recent.first().z
+        val pathLen = sqrt(dx * dx + dz * dz)
+        if (pathLen < 1.0f) return // user hasn't moved enough
+
+        val pathNx = dx / pathLen; val pathNz = dz / pathLen
+        // Perpendicular (left normal): rotate 90° CCW
+        val perpX = pathNz; val perpZ = -pathNx
+
+        // Check grid cells perpendicular to the path, on both sides
+        val grid = mapBuilder.grid
+        var leftUnknown = 0; var leftKnown = 0
+        var rightUnknown = 0; var rightKnown = 0
+        val inferredCells = mutableListOf<Pair<Float, Float>>()
+
+        for (pt in recent) {
+            val gx = mapBuilder.worldToGrid(pt.x)
+            val gz = mapBuilder.worldToGrid(pt.z)
+
+            // Check 2-4 cells to the left and right of path
+            for (dist in 2..4) {
+                // Left side
+                val lx = gx + (perpX * dist).roundToInt()
+                val lz = gz + (perpZ * dist).roundToInt()
+                val lCell = grid[GridCell(lx, lz)]?.toInt()
+                if (lCell == null || lCell == MapBuilder.CELL_UNKNOWN) {
+                    leftUnknown++
+                    if (dist == 2) inferredCells.add(
+                        mapBuilder.gridToWorld(lx).toFloat() to mapBuilder.gridToWorld(lz).toFloat())
+                } else leftKnown++
+
+                // Right side
+                val rx = gx + (-perpX * dist).roundToInt()
+                val rz = gz + (-perpZ * dist).roundToInt()
+                val rCell = grid[GridCell(rx, rz)]?.toInt()
+                if (rCell == null || rCell == MapBuilder.CELL_UNKNOWN) {
+                    rightUnknown++
+                    if (dist == 2) inferredCells.add(
+                        mapBuilder.gridToWorld(rx).toFloat() to mapBuilder.gridToWorld(rz).toFloat())
+                } else rightKnown++
+            }
+        }
+
+        // If one side is >70% unknown while the other is >50% known,
+        // the unknown side likely has a white wall.
+        val leftTotal = leftUnknown + leftKnown
+        val rightTotal = rightUnknown + rightKnown
+        if (leftTotal < 10 || rightTotal < 10) return
+
+        val leftUnkRatio = leftUnknown.toFloat() / leftTotal
+        val rightUnkRatio = rightUnknown.toFloat() / rightTotal
+        val leftKnownRatio = leftKnown.toFloat() / leftTotal
+        val rightKnownRatio = rightKnown.toFloat() / rightTotal
+
+        if (leftUnkRatio > 0.70f && rightKnownRatio > 0.50f) {
+            // Left side is likely a white wall
+            for ((wx, wz) in inferredCells.take(inferredCells.size / 2)) {
+                mapBuilder.markInferredWall(wx, wz)
+            }
+        }
+        if (rightUnkRatio > 0.70f && leftKnownRatio > 0.50f) {
+            // Right side is likely a white wall
+            for ((wx, wz) in inferredCells.drop(inferredCells.size / 2)) {
+                mapBuilder.markInferredWall(wx, wz)
             }
         }
     }

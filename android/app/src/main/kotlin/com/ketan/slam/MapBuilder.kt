@@ -291,6 +291,27 @@ class MapBuilder(val res: Float) {
         updateLogOdds(gx, gz, L_OCCUPIED, wallHint = false)
     }
 
+    /**
+     * Mark a depth-image-derived wall point. Slightly less confident than
+     * a direct hit-test wall (L_OCCUPIED * 1.0f vs 1.5f).
+     */
+    fun markDepthImageWall(wx: Float, wz: Float) {
+        val gx = worldToGrid(wx)
+        val gz = worldToGrid(wz)
+        updateLogOdds(gx, gz, L_OCCUPIED, wallHint = true)
+    }
+
+    /**
+     * Mark an inferred wall (from floor-boundary or motion analysis).
+     * Weak signal (L_OCCUPIED * 0.6f) — needs several confirming observations
+     * across frames to cross the occupied threshold.
+     */
+    fun markInferredWall(wx: Float, wz: Float) {
+        val gx = worldToGrid(wx)
+        val gz = worldToGrid(wz)
+        updateLogOdds(gx, gz, L_OCCUPIED * 0.6f, wallHint = true)
+    }
+
     // ── Private integration ────────────────────────────────────────────────────
 
     private fun integrateKeyframe(kf: Keyframe) {

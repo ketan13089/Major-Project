@@ -1,5 +1,4 @@
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 import 'indoor_map_viewer.dart';
 
 void main() {
@@ -36,16 +35,7 @@ class MyApp extends StatelessWidget {
 }
 
 class HomePage extends StatelessWidget {
-  static const platform = MethodChannel('com.ketan.slam/ar');
   const HomePage({super.key});
-
-  Future<void> _openARCamera() async {
-    try {
-      await platform.invokeMethod("openAR");
-    } on PlatformException catch (e) {
-      debugPrint("Failed to open AR: '${e.message}'.");
-    }
-  }
 
   void _openMapViewer(BuildContext context) {
     Navigator.pushNamed(context, '/map');
@@ -140,22 +130,6 @@ class HomePage extends StatelessWidget {
               const SizedBox(height: 24),
 
               // ── Action Cards ──
-              Semantics(
-                button: true,
-                label: 'Start AR Scan. Open camera for indoor navigation and obstacle detection.',
-                child: _ActionCard(
-                  title: 'Start AR Scan',
-                  subtitle: 'Camera tracking & obstacle detection',
-                  icon: Icons.camera_alt_rounded,
-                  gradientColors: const [Color(0xFF7C3AED), Color(0xFF6D28D9)],
-                  surface: surface, textPri: textPri,
-                  textSec: textSec, border: border,
-                  onTap: _openARCamera,
-                ),
-              ),
-
-              const SizedBox(height: 12),
-
               Semantics(
                 button: true,
                 label: 'View Indoor Map. Explore the map built from your scan.',
