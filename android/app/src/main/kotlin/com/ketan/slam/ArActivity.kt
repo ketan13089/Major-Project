@@ -35,7 +35,7 @@ import com.google.ar.core.exceptions.UnavailableSdkTooOldException
 import com.google.ar.core.exceptions.UnavailableUserDeclinedInstallationException
 import io.flutter.embedding.engine.FlutterEngineCache
 import io.flutter.plugin.common.MethodChannel
-import android.os.Vibrator
+// import android.os.Vibrator  // FROZEN — hazard vibration disabled
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import javax.microedition.khronos.egl.EGLConfig
@@ -265,11 +265,11 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             }, 3000L)
         }
 
-        // Hazard warning system
-        @Suppress("DEPRECATION")
-        val vibrator = getSystemService(VIBRATOR_SERVICE) as? Vibrator
-        hazardWarningSystem = HazardWarningSystem(announcer!!, vibrator)
-        spatialAudio.start()
+        // Hazard warning + spatial audio — FROZEN (disabled for now)
+        // @Suppress("DEPRECATION")
+        // val vibrator = getSystemService(VIBRATOR_SERVICE) as? Vibrator
+        // hazardWarningSystem = HazardWarningSystem(announcer!!, vibrator)
+        // spatialAudio.start()
 
         try { yoloDetector = YoloDetector(this); println("$TAG: YOLO ready") }
         catch (e: Exception) { println("$TAG: YOLO init failed: ${e.message}") }
@@ -302,13 +302,17 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         destroyed = true
         // Stop GL callbacks before tearing down resources they depend on
         try { surfaceView.onPause() } catch (_: Exception) {}
+        // Clear channel handlers so stale callbacks don't fire on destroyed activity
+        try { navChannel?.setMethodCallHandler(null) } catch (_: Exception) {}
+        try { mapChannel?.setMethodCallHandler(null) } catch (_: Exception) {}
         methodChannel = null
         navChannel = null
         mapChannel = null
         try { yoloDetector.close() } catch (_: Exception) {}
         try { textRecognizer.close() } catch (_: Exception) {}
         onboardingTutorial?.stop()
-        spatialAudio.stop()
+        // spatialAudio.stop()  // FROZEN
+        hazardWarningSystem = null
         announcer?.shutdown(); announcer = null
         navigationManager?.destroy(); navigationManager = null
         poseTracker.destroy()
@@ -791,10 +795,6 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         val stepX = surfaceWidth  / cols.toFloat()
         val stepY = surfaceHeight / rows.toFloat()
 
-        // Collect depth hits for hazard warning system
-        val depthHits = mutableListOf<HazardWarningSystem.DepthHit>()
-        val floorHits = mutableListOf<HazardWarningSystem.FloorHit>()
-
         for (col in 0 until cols) {
             for (row in 0 until rows) {
                 val sx = col * stepX + stepX / 2f
@@ -812,93 +812,20 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
                     val hx  = hp.tx()
                     val hz  = hp.tz()
                     val hy  = hp.ty()
-                    val dist = hit.distance
 
                     // Ignore hits that are too far away — unreliable depth
-                    if (dist > 5.0f) continue
-
-                    // Check if this hit is on a vertical plane (structural wall)
-                    val isVerticalPlane = (hit.trackable as? Plane)?.type == Plane.Type.VERTICAL
+                    if (hit.distance > 5.0f) continue
 
                     val relY = hy - cameraY
                     when {
-                        relY < -1.0f           -> {
-                            mapBuilder.markHitFree(hx, hz)
-                            // Collect floor hits for staircase/drop-off detection
-                            floorHits.add(HazardWarningSystem.FloorHit(hx, hy, hz))
-                        }
-                        relY in -1.0f..1.2f    -> {
-                            mapBuilder.markHitOccupied(hx, hz)
-                            // Only feed freestanding obstacles to hazard system,
-                            // not structural walls (vertical planes) or full-height hits.
-                            // Obstacle height: knee-to-chest level (−1.0m to −0.3m relative to camera)
-                            if (!isVerticalPlane && relY in -1.0f..-0.3f) {
-                                depthHits.add(HazardWarningSystem.DepthHit(hx, hz, dist))
-                            }
-                        }
+                        relY < -1.0f           -> mapBuilder.markHitFree(hx, hz)
+                        relY in -1.0f..1.2f    -> mapBuilder.markHitOccupied(hx, hz)
                         // above 1.2m from camera = ceiling — ignore
                     }
                 } catch (_: Exception) { /* hit-test can throw on degraded tracking */ }
             }
         }
-
-        // Feed depth hits to hazard warning system
-        // Camera looks along -Z in local space, so negate to get actual look direction
-        val q = camera.pose.rotationQuaternion
-        val lookX = -(2f * (q[0] * q[2] + q[1] * q[3]))
-        val lookZ = -(1f - 2f * (q[0] * q[0] + q[1] * q[1]))
-        val isNavigating = navigationManager?.state == NavigationState.NAVIGATING
-
-        if (depthHits.isNotEmpty()) {
-            hazardWarningSystem?.processDepthHits(depthHits, userX, userZ, lookX, lookZ,
-                isNavigating == true)
-        }
-
-        // Check for staircase/drop-off using floor height discontinuities
-        if (floorHits.size >= 3) {
-            hazardWarningSystem?.checkFloorDropOff(
-                floorHits, userX, cameraY, userZ, lookX, lookZ, isNavigating == true)
-        }
-
-        // Also check YOLO-detected semantic objects for proximity alerts
-        hazardWarningSystem?.checkSemanticObjects(
-            semanticMap.getAllObjects(), userX, userZ, lookX, lookZ,
-            isNavigating == true
-        )
-
-        // Feed spatial audio engine with directional wall distances
-        if (depthHits.isNotEmpty()) {
-            val fLen = kotlin.math.sqrt(lookX * lookX + lookZ * lookZ).coerceAtLeast(0.001f)
-            val fnx = lookX / fLen; val fnz = lookZ / fLen
-            // Left normal: rotate forward 90° CCW
-            val lnx = fnz; val lnz = -fnx
-            // Right normal: rotate forward 90° CW
-            val rnx = -fnz; val rnz = fnx
-
-            var nearFwd = Float.MAX_VALUE
-            var nearLeft = Float.MAX_VALUE
-            var nearRight = Float.MAX_VALUE
-            var freeSum = 0f; var freeCount = 0
-
-            for (hit in depthHits) {
-                val dx = hit.worldX - userX; val dz = hit.worldZ - userZ
-                val d = kotlin.math.sqrt(dx * dx + dz * dz)
-                if (d < 0.1f) continue
-                val ndx = dx / d; val ndz = dz / d
-
-                val fwdDot = ndx * fnx + ndz * fnz
-                val leftDot = ndx * lnx + ndz * lnz
-                val rightDot = ndx * rnx + ndz * rnz
-
-                if (fwdDot > 0.5f && d < nearFwd) nearFwd = d
-                if (leftDot > 0.5f && d < nearLeft) nearLeft = d
-                if (rightDot > 0.5f && d < nearRight) nearRight = d
-                freeSum += d; freeCount++
-            }
-
-            val avgFree = if (freeCount > 0) freeSum / freeCount else 5f
-            spatialAudio.update(nearFwd, nearLeft, nearRight, avgFree)
-        }
+        // NOTE: Hazard warnings & spatial audio FROZEN — vibration/audio feedback disabled.
     }
 
     /**

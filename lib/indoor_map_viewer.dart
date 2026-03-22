@@ -187,25 +187,32 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
   }
 
   @override
-  void dispose() { _pulseCtrl.dispose(); super.dispose(); }
+  void dispose() {
+    _ch.setMethodCallHandler(null);
+    _navCh.setMethodCallHandler(null);
+    _pulseCtrl.dispose();
+    super.dispose();
+  }
 
   Future<void> _onCall(MethodCall call) async {
-    switch (call.method) {
-      case 'onUpdate':
-        final a = call.arguments as Map;
-        if (!mounted) return;
-        setState(() {
-          posX         = (a['position_x'] as num?)?.toDouble() ?? posX;
-          posZ         = (a['position_z'] as num?)?.toDouble() ?? posZ;
-          heading      = (a['heading']    as num?)?.toDouble() ?? heading;
-          totalObjects = (a['total_objects'] as num?)?.toInt() ?? totalObjects;
-          scanning     = true;
-        });
-        break;
-      case 'updateMap':
-        _handleMap(call.arguments as Map);
-        break;
-    }
+    if (!mounted) return;
+    try {
+      switch (call.method) {
+        case 'onUpdate':
+          final a = call.arguments as Map;
+          setState(() {
+            posX         = (a['position_x'] as num?)?.toDouble() ?? posX;
+            posZ         = (a['position_z'] as num?)?.toDouble() ?? posZ;
+            heading      = (a['heading']    as num?)?.toDouble() ?? heading;
+            totalObjects = (a['total_objects'] as num?)?.toInt() ?? totalObjects;
+            scanning     = true;
+          });
+          break;
+        case 'updateMap':
+          _handleMap(call.arguments as Map);
+          break;
+      }
+    } catch (e) { debugPrint('onCall error: $e'); }
   }
 
   void _handleMap(Map args) {
@@ -301,22 +308,24 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
 
   Future<void> _onNavCall(MethodCall call) async {
     if (!mounted) return;
-    switch (call.method) {
-      case 'navStateChange':
-        final a = call.arguments as Map;
-        setState(() {
-          _navState   = a['state']   as String? ?? _navState;
-          _navMessage = a['message'] as String? ?? _navMessage;
-          if (_navState == 'IDLE' || _navState == 'ARRIVED') _navInstruction = '';
-        });
-        break;
-      case 'navInstruction':
-        final a = call.arguments as Map;
-        setState(() {
-          _navInstruction = a['text'] as String? ?? _navInstruction;
-        });
-        break;
-    }
+    try {
+      switch (call.method) {
+        case 'navStateChange':
+          final a = call.arguments as Map;
+          setState(() {
+            _navState   = a['state']   as String? ?? _navState;
+            _navMessage = a['message'] as String? ?? _navMessage;
+            if (_navState == 'IDLE' || _navState == 'ARRIVED') _navInstruction = '';
+          });
+          break;
+        case 'navInstruction':
+          final a = call.arguments as Map;
+          setState(() {
+            _navInstruction = a['text'] as String? ?? _navInstruction;
+          });
+          break;
+      }
+    } catch (e) { debugPrint('onNavCall error: $e'); }
   }
 
   Future<void> _onNavButtonTap() async {
