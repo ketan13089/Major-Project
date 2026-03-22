@@ -895,6 +895,7 @@ class _MapPainter extends CustomPainter {
     _drawWalls(canvas, origin);       // walls on top = crisp architectural lines
     _drawObjects(canvas, origin);
     _drawRobot(canvas, origin);
+    _drawCompass(canvas, size);
   }
 
   void _drawGrid(Canvas canvas, Size size, Offset origin) {
@@ -1090,6 +1091,76 @@ class _MapPainter extends CustomPainter {
           ..color = Colors.white
           ..style = PaintingStyle.stroke
           ..strokeWidth = 2);
+  }
+
+  /// Draw a compass rose in the bottom-right corner of the map.
+  /// The compass rotates based on the user's heading so that N always
+  /// points toward the ARCore world -Z direction (the initial forward).
+  void _drawCompass(Canvas canvas, Size size) {
+    final cx = size.width - 48;
+    final cy = size.height - 48;
+    final center = Offset(cx, cy);
+    const radius = 30.0;
+
+    // Background circle
+    canvas.drawCircle(center, radius + 4,
+        Paint()..color = const Color(0xFFF8F8FC).withOpacity(0.92));
+    canvas.drawCircle(center, radius + 4,
+        Paint()
+          ..color = const Color(0xFFD1D5DB)
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 1);
+
+    // Rotate so N points toward ARCore -Z (initial forward direction).
+    // The heading value is the user's yaw from ARCore. When heading=0,
+    // user faces -Z (north in map space). We negate so the compass rose
+    // rotates opposite to the user's heading — N stays fixed.
+    canvas.save();
+    canvas.translate(cx, cy);
+    canvas.rotate(-heading);
+
+    // North needle (red)
+    final northPath = Path()
+      ..moveTo(0, -radius + 4)
+      ..lineTo(-6, 4)
+      ..lineTo(0, -2)
+      ..lineTo(6, 4)
+      ..close();
+    canvas.drawPath(northPath, Paint()..color = const Color(0xFFDC2626));
+
+    // South needle (gray)
+    final southPath = Path()
+      ..moveTo(0, radius - 4)
+      ..lineTo(-6, -4)
+      ..lineTo(0, 2)
+      ..lineTo(6, -4)
+      ..close();
+    canvas.drawPath(southPath, Paint()..color = const Color(0xFF9CA3AF));
+
+    // Direction labels
+    _compassLabel(canvas, 'N', Offset(0, -radius + 10), const Color(0xFFDC2626));
+    _compassLabel(canvas, 'S', Offset(0, radius - 10), const Color(0xFF6B7280));
+    _compassLabel(canvas, 'E', Offset(radius - 10, 0), const Color(0xFF6B7280));
+    _compassLabel(canvas, 'W', Offset(-radius + 10, 0), const Color(0xFF6B7280));
+
+    canvas.restore();
+
+    // Center dot
+    canvas.drawCircle(center, 3, Paint()..color = const Color(0xFF374151));
+  }
+
+  void _compassLabel(Canvas canvas, String label, Offset pos, Color color) {
+    final tp = TextPainter(
+      text: TextSpan(
+        text: label,
+        style: TextStyle(
+          color: color, fontSize: 9, fontWeight: FontWeight.w700,
+          letterSpacing: 0.5,
+        ),
+      ),
+      textDirection: TextDirection.ltr,
+    )..layout();
+    tp.paint(canvas, pos - Offset(tp.width / 2, tp.height / 2));
   }
 
   void _txt(Canvas canvas, String text, Offset pos, double fs, Color col) {
