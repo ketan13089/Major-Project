@@ -720,7 +720,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             // --- Depth-hit wall extraction (every 200ms on GL thread) ---
             // Denser sampling at higher frequency for better wall/free-space coverage.
             val depthNow = System.currentTimeMillis()
-            if (depthNow - lastDepthSampleMs >= 200L) {
+            if (depthNow - lastDepthSampleMs >= 500L) {
                 lastDepthSampleMs = depthNow
                 extractWallsFromDepth(frame, camera)
             }
@@ -781,17 +781,25 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
      * 2. It works even when ARCore's vertical plane detection fails (common indoors).
      * 3. It samples 120 points per call (12 cols × 10 rows) for dense coverage.
      *
-     * Height rules (relative to camera Y):
-     *   relY < -1.0m  → floor level  → mark as free
-     *   -1.0m ≤ relY ≤ 1.2m → wall level → mark as occupied (wall)
-     *   relY > 1.2m   → ceiling → ignore
+     * Height rules (relative to camera Y, assuming ~1.5m camera height):
+     *   relY < -1.2m  → floor level  → mark as free
+     *   -0.5m ≤ relY ≤ 0.6m → true wall level (close to camera height) → mark as wall
+     *   -1.2m ≤ relY < -0.5m → furniture/obstacle level → mark as obstacle (not wall)
+     *   relY > 0.6m   → ceiling/shelf → ignore
+     *
+     * This separation ensures:
+     *   - Beds, tables (low) → obstacle (brown), not wall (dark)
+     *   - Actual walls (camera height) → wall (dark)
+     *   - Floor → free (white)
      */
     private fun extractWallsFromDepth(frame: Frame, camera: Camera) {
         if (camera.trackingState != TrackingState.TRACKING) return
         val cameraY = camera.pose.ty()
         val userX = camera.pose.tx()
         val userZ = camera.pose.tz()
-        val cols = 12; val rows = 10  // 120 sample points for denser wall coverage
+        // Reduced grid: 8×6 = 48 points. Fewer points = fewer wasted hit-tests,
+        // and the successful ones still provide good coverage.
+        val cols = 8; val rows = 6
         val stepX = surfaceWidth  / cols.toFloat()
         val stepY = surfaceHeight / rows.toFloat()
 
@@ -814,18 +822,26 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
                     val hy  = hp.ty()
 
                     // Ignore hits that are too far away — unreliable depth
-                    if (hit.distance > 5.0f) continue
+                    if (hit.distance > 4.0f) continue
 
                     val relY = hy - cameraY
+                    // Check if hit landed on a tracked vertical plane (structural wall)
+                    val isVerticalPlane = (hit.trackable as? Plane)?.type == Plane.Type.VERTICAL
+
                     when {
-                        relY < -1.0f           -> mapBuilder.markHitFree(hx, hz)
-                        relY in -1.0f..1.2f    -> mapBuilder.markHitOccupied(hx, hz)
-                        // above 1.2m from camera = ceiling — ignore
+                        // Floor: well below camera
+                        relY < -1.2f -> mapBuilder.markHitFree(hx, hz)
+                        // True wall band: near camera height OR confirmed vertical plane
+                        isVerticalPlane || relY in -0.5f..0.6f ->
+                            mapBuilder.markHitOccupied(hx, hz)
+                        // Furniture/obstacle band: between floor and wall level
+                        relY in -1.2f..-0.5f ->
+                            mapBuilder.markHitObstacle(hx, hz)
+                        // Above 0.6m from camera = ceiling/shelf — ignore
                     }
                 } catch (_: Exception) { /* hit-test can throw on degraded tracking */ }
             }
         }
-        // NOTE: Hazard warnings & spatial audio FROZEN — vibration/audio feedback disabled.
     }
 
     /**

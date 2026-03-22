@@ -87,22 +87,23 @@ class MapBuilder(val res: Float) {
         // Thresholds for classification.
         // Free: at least 2 free observations with no occupied counter-evidence.
         private const val LO_THRESH_FREE = -0.6f
-        // Occupied: at least 2 wall/obstacle observations.
-        private const val LO_THRESH_OCC  =  1.2f  // lowered from 1.8f: hit-based evidence appears faster
+        // Occupied: needs ~2 confirming observations to classify.
+        private const val LO_THRESH_OCC  =  1.5f
 
         // Temporal decay per full rebuild — faster for obstacle (object) cells,
         // but wall cells from planes are re-reinforced every rebuild anyway.
         private const val DECAY_PER_REBUILD = 0.12f
 
-        // Full 360° ray fan in 15° steps (24 rays) for omnidirectional coverage.
-        // Forward hemisphere uses full range; rear hemisphere uses shorter range.
-        private val RAY_FAN_ANGLES = FloatArray(24) { i ->
-            Math.toRadians((i * 15).toDouble()).toFloat()
+        // 360° ray fan in 30° steps (12 rays). Fewer rays = less aggressive
+        // free-space carving, which is better for small/cluttered rooms.
+        private val RAY_FAN_ANGLES = FloatArray(12) { i ->
+            Math.toRadians((i * 30).toDouble()).toFloat()
         }
 
-        // Forward rays reach further; rear rays (>90° from forward) use shorter range.
-        private const val RAY_MAX_DIST = 3.5f
-        private const val RAY_REAR_MAX_DIST = 2.5f
+        // Shorter range to avoid carving through obstacles in small rooms.
+        // Forward rays: 2m; rear rays: 1.5m.
+        private const val RAY_MAX_DIST = 2.0f
+        private const val RAY_REAR_MAX_DIST = 1.5f
 
         // Minimum plane polygon area in m² to be rasterized.
         // Lowered to capture smaller valid planes in rooms.
@@ -202,10 +203,10 @@ class MapBuilder(val res: Float) {
         // Camera cell is always visited
         forceLogOdds(gx, gz, L_MIN, CELL_VISITED)
 
-        // 0.5m radius around camera = definitely free (user physically occupies this space).
-        // Use 2× free evidence — the camera being here is strong proof of walkability.
-        for (dz in -2..2) for (dx in -2..2) {
-            if (dx * dx + dz * dz <= 4) updateLogOdds(gx + dx, gz + dz, L_FREE * 2f)
+        // ~0.3m radius around camera = definitely free (user physically occupies this space).
+        for (dz in -1..1) for (dx in -1..1) {
+            if (dx == 0 && dz == 0) continue
+            updateLogOdds(gx + dx, gz + dz, L_FREE)
         }
 
         // FIX 4: Guard against zero/near-zero forward vector
@@ -258,31 +259,36 @@ class MapBuilder(val res: Float) {
 
     /**
      * Mark a confirmed floor-level hit point as free space.
-     * Called when a hit-test returns a point at floor level (below camera by >0.5m).
-     * Uses 3× the normal free evidence weight since this is a confirmed physical point.
+     * Called when a hit-test returns a point at floor level (below camera by >1.2m).
+     * Uses moderate free evidence — enough to establish walkability but not so
+     * strong that it overwhelms nearby obstacle/wall evidence.
      */
     fun markHitFree(wx: Float, wz: Float) {
         val gx = worldToGrid(wx)
         val gz = worldToGrid(wz)
-        // Strong free evidence at the hit point
-        updateLogOdds(gx, gz, L_FREE * 3f)
-        // Smaller free evidence in immediate neighbourhood (0.2m radius = 1 cell)
-        for (dz in -1..1) for (dx in -1..1) {
-            if (dx == 0 && dz == 0) continue
-            updateLogOdds(gx + dx, gz + dz, L_FREE)
-        }
+        updateLogOdds(gx, gz, L_FREE * 2f)
     }
 
     /**
-     * Mark a confirmed wall/obstacle hit point as occupied.
-     * Called when a hit-test returns a point at torso/wall level (±0.8m of camera).
-     * Adds to wallCells so it renders as CELL_WALL (dark) not CELL_OBSTACLE (brown).
+     * Mark a confirmed wall hit point as occupied WALL.
+     * Called when a hit-test returns a point near camera height or on a vertical plane.
+     * Adds to wallCells so it renders as CELL_WALL (dark).
      */
     fun markHitOccupied(wx: Float, wz: Float) {
         val gx = worldToGrid(wx)
         val gz = worldToGrid(wz)
-        // Double occupied evidence — confirmed physical wall point
-        updateLogOdds(gx, gz, L_OCCUPIED * 2f, wallHint = true)
+        updateLogOdds(gx, gz, L_OCCUPIED * 1.5f, wallHint = true)
+    }
+
+    /**
+     * Mark a confirmed obstacle (furniture) hit point as occupied OBSTACLE.
+     * Called when a hit-test returns a point at furniture level (between floor and wall).
+     * Does NOT add to wallCells — renders as CELL_OBSTACLE (brown), not wall (dark).
+     */
+    fun markHitObstacle(wx: Float, wz: Float) {
+        val gx = worldToGrid(wx)
+        val gz = worldToGrid(wz)
+        updateLogOdds(gx, gz, L_OCCUPIED, wallHint = false)
     }
 
     // ── Private integration ────────────────────────────────────────────────────
@@ -293,12 +299,11 @@ class MapBuilder(val res: Float) {
 
         forceLogOdds(gx, gz, L_MIN, CELL_VISITED)
 
-        // 2× free evidence for walked path — strong proof of walkability
-        for (dz in -2..2) for (dx in -2..2) {
-            if (dx * dx + dz * dz <= 4) {
-                updateLogOdds(gx + dx, gz + dz, L_FREE * 2f)
-                observedThisRebuild.add(GridCell(gx + dx, gz + dz))
-            }
+        // ~0.3m radius around keyframe pose = free (user was here)
+        for (dz in -1..1) for (dx in -1..1) {
+            if (dx == 0 && dz == 0) continue
+            updateLogOdds(gx + dx, gz + dz, L_FREE)
+            observedThisRebuild.add(GridCell(gx + dx, gz + dz))
         }
 
         // FIX 4: Guard zero forward vector
@@ -352,30 +357,9 @@ class MapBuilder(val res: Float) {
             logOdds[cell] = (cur + 0.3f).coerceAtMost(L_MAX)
         }
 
-        // Pass 3: Dilate walls by 1 cell to ensure they render as 1-cell-thick
-        // lines even at low resolution. This gives the clean architectural look.
-        // We only dilate INTO unknown cells — never overwrite free/visited cells.
-        val toDilate = mutableListOf<GridCell>()
-        for (cell in wallCells) {
-            val lo = logOdds.getOrDefault(cell, 0f)
-            if (lo < LO_THRESH_OCC) continue // skip cells that were just reset
-            for (dz in -1..1) for (dx in -1..1) {
-                if (dx == 0 && dz == 0) continue
-                val neighbor = GridCell(cell.x + dx, cell.z + dz)
-                val nlo = logOdds.getOrDefault(neighbor, 0f)
-                // Only dilate into unknown space — don't overwrite free/visited
-                if (nlo > LO_THRESH_FREE) continue
-                toDilate.add(neighbor)
-            }
-        }
-        for (cell in toDilate) {
-            // Set to exactly threshold — weaker than a directly-observed wall,
-            // so a strong free observation can still override it.
-            if (logOdds.getOrDefault(cell, 0f) <= LO_THRESH_FREE) {
-                logOdds[cell] = LO_THRESH_OCC
-                wallCells.add(cell)
-            }
-        }
+        // Wall dilation disabled — was causing walls to appear overly thick
+        // and creating blobs in small rooms. The walls from depth hits and
+        // plane detection are already multi-cell thick due to sensor noise.
     }
 
     private fun countOccupiedNeighbors(cell: GridCell): Int {
