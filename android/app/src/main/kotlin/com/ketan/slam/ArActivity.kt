@@ -86,6 +86,8 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     private var installRequested = false
     private var displayRotationHelper: DisplayRotationHelper? = null
     private lateinit var backgroundRenderer: BackgroundRenderer
+    private lateinit var meshRenderer: MeshRenderer
+    @Volatile var meshOverlayEnabled = true
 
     // Surface dimensions — needed for hit-test coordinate mapping
     @Volatile private var surfaceWidth  = CAM_W
@@ -176,6 +178,10 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
                         result.success(null)
                     }
                     "stopNavigation" -> { navigationManager?.stopNavigation(); result.success(null) }
+                    "toggleMesh"     -> {
+                        meshOverlayEnabled = !meshOverlayEnabled
+                        result.success(meshOverlayEnabled)
+                    }
                     else             -> result.notImplemented()
                 }
             }
@@ -598,6 +604,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
         GLES20.glClearColor(0f, 0f, 0f, 1f)
         backgroundRenderer = BackgroundRenderer().also { it.createOnGlThread() }
+        meshRenderer = MeshRenderer().also { it.createOnGlThread() }
         println("$TAG: GL surface created, textureId=${backgroundRenderer.textureId}")
     }
 
@@ -622,6 +629,12 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             backgroundRenderer.draw(frame)
             val camera = frame.camera
             val currentTrackingState = camera.trackingState
+
+            // ── AR Mesh overlay ─────────────────────────────────────────────
+            if (meshOverlayEnabled && ::meshRenderer.isInitialized
+                && currentTrackingState == TrackingState.TRACKING) {
+                drawMeshOverlays(sess, frame, camera)
+            }
 
             // ── Tracking loss detection & recovery ─────────────────────────
             if (lastTrackingState == TrackingState.TRACKING && currentTrackingState != TrackingState.TRACKING) {
@@ -848,6 +861,34 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
                     }
                 } catch (_: Exception) { /* hit-test can throw on degraded tracking */ }
             }
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // AR Mesh Overlays
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private val projMatrix = FloatArray(16)
+    private val viewMatrix = FloatArray(16)
+
+    private fun drawMeshOverlays(sess: Session, frame: Frame, camera: Camera) {
+        camera.getProjectionMatrix(projMatrix, 0, 0.1f, 100.0f)
+        camera.getViewMatrix(viewMatrix, 0)
+
+        // Draw all tracked planes
+        for (plane in sess.getAllTrackables(Plane::class.java)) {
+            if (plane.trackingState != TrackingState.TRACKING) continue
+            if (plane.subsumedBy != null) continue
+            val type = meshRenderer.classifyPlane(plane, camera.pose)
+            meshRenderer.drawPlane(plane, type, projMatrix, viewMatrix)
+        }
+
+        // Draw ground-plane footprints under confirmed YOLO objects
+        val floorY = camera.pose.ty() - 1.5f  // approximate floor
+        for (obj in semanticMap.getAllObjects()) {
+            val half = ObjectLocalizer.footprintHalfMetres(obj.category)
+            meshRenderer.drawObjectFootprint(obj.position, half, floorY,
+                projMatrix, viewMatrix)
         }
     }
 
