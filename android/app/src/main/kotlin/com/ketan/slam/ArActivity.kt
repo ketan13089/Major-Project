@@ -140,6 +140,9 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     // ── Navigation ────────────────────────────────────────────────────────────
     private var navigationManager: NavigationManager? = null
 
+    // ── Activity lifecycle flag ───────────────────────────────────────────────
+    @Volatile private var destroyed = false
+
     // ── Tracking loss recovery ───────────────────────────────────────────────
     private var lastTrackingState: TrackingState = TrackingState.STOPPED
     @Volatile private var frozenPose: com.google.ar.core.Pose? = null
@@ -296,7 +299,12 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     }
 
     override fun onDestroy() {
-        super.onDestroy()
+        destroyed = true
+        // Stop GL callbacks before tearing down resources they depend on
+        try { surfaceView.onPause() } catch (_: Exception) {}
+        methodChannel = null
+        navChannel = null
+        mapChannel = null
         try { yoloDetector.close() } catch (_: Exception) {}
         try { textRecognizer.close() } catch (_: Exception) {}
         onboardingTutorial?.stop()
@@ -308,6 +316,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         rebuildExecutor.shutdownNow()
         teardownCamera()
         session?.close(); session = null
+        super.onDestroy()
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -590,6 +599,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
 
     override fun onDrawFrame(gl: GL10?) {
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT or GLES20.GL_DEPTH_BUFFER_BIT)
+        if (destroyed) return
         if (!::backgroundRenderer.isInitialized) return
         val sess = session ?: return
         try {
@@ -807,6 +817,9 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
                     // Ignore hits that are too far away — unreliable depth
                     if (dist > 5.0f) continue
 
+                    // Check if this hit is on a vertical plane (structural wall)
+                    val isVerticalPlane = (hit.trackable as? Plane)?.type == Plane.Type.VERTICAL
+
                     val relY = hy - cameraY
                     when {
                         relY < -1.0f           -> {
@@ -816,8 +829,12 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
                         }
                         relY in -1.0f..1.2f    -> {
                             mapBuilder.markHitOccupied(hx, hz)
-                            // Collect wall-level hits for hazard detection
-                            depthHits.add(HazardWarningSystem.DepthHit(hx, hz, dist))
+                            // Only feed freestanding obstacles to hazard system,
+                            // not structural walls (vertical planes) or full-height hits.
+                            // Obstacle height: knee-to-chest level (−1.0m to −0.3m relative to camera)
+                            if (!isVerticalPlane && relY in -1.0f..-0.3f) {
+                                depthHits.add(HazardWarningSystem.DepthHit(hx, hz, dist))
+                            }
                         }
                         // above 1.2m from camera = ceiling — ignore
                     }
@@ -1068,6 +1085,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     // ─────────────────────────────────────────────────────────────────────────
 
     private fun updateHud(camera: Camera) {
+        if (destroyed) return
         val now = System.currentTimeMillis()
         if (now - lastHudMs < 300L) return; lastHudMs = now
         val s   = slamEngine.getStatistics()
@@ -1099,6 +1117,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     // ─────────────────────────────────────────────────────────────────────────
 
     private fun sendToFlutter() {
+        if (destroyed) return
         val ch  = methodChannel ?: return
         val s   = slamEngine.getStatistics()
         val sem = semanticMap.getStatistics()
@@ -1111,6 +1130,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         } else 0f
 
         runOnUiThread {
+            if (destroyed) return@runOnUiThread
             ch.invokeMethod("onUpdate", mapOf(
                 "position_x" to s.currentPosition.x, "position_y" to s.currentPosition.y,
                 "position_z" to s.currentPosition.z, "heading"    to heading,
@@ -1184,6 +1204,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     // ── Navigation UI helpers ─────────────────────────────────────────────────
 
     private fun updateNavHud(state: NavigationState, message: String) {
+        if (destroyed) return
         val (label, bgColor) = when (state) {
             NavigationState.LISTENING  -> "🎤 $message" to 0xDD7C3AED.toInt()
             NavigationState.PLANNING   -> "🔍 $message" to 0xDD2563EB.toInt()
