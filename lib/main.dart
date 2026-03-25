@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'indoor_map_viewer.dart';
+import 'saved_maps_screen.dart';
 
 void main() {
   runApp(const MyApp());
@@ -26,9 +27,20 @@ class MyApp extends StatelessWidget {
       ),
       themeMode: ThemeMode.system,
       initialRoute: '/',
-      routes: {
-        '/': (context) => const HomePage(),
-        '/map': (context) => const IndoorMapViewer(),
+      onGenerateRoute: (settings) {
+        switch (settings.name) {
+          case '/':
+            return MaterialPageRoute(builder: (_) => const HomePage());
+          case '/map':
+            final savedMapName = settings.arguments as String?;
+            return MaterialPageRoute(
+              builder: (_) => IndoorMapViewer(savedMapName: savedMapName),
+            );
+          case '/saved-maps':
+            return MaterialPageRoute(builder: (_) => const SavedMapsScreen());
+          default:
+            return MaterialPageRoute(builder: (_) => const HomePage());
+        }
       },
     );
   }
@@ -141,6 +153,22 @@ class HomePage extends StatelessWidget {
                   surface: surface, textPri: textPri,
                   textSec: textSec, border: border,
                   onTap: () => _openMapViewer(context),
+                ),
+              ),
+
+              const SizedBox(height: 12),
+
+              Semantics(
+                button: true,
+                label: 'Saved Maps. View and manage your scanned maps.',
+                child: _ActionCard(
+                  title: 'Saved Maps',
+                  subtitle: 'View and manage your scanned maps',
+                  icon: Icons.folder_rounded,
+                  gradientColors: const [Color(0xFF059669), Color(0xFF047857)],
+                  surface: surface, textPri: textPri,
+                  textSec: textSec, border: border,
+                  onTap: () => Navigator.pushNamed(context, '/saved-maps'),
                 ),
               ),
 

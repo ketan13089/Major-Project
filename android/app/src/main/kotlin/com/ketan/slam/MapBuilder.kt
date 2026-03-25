@@ -94,6 +94,18 @@ class MapBuilder(val res: Float) {
         // but wall cells from planes are re-reinforced every rebuild anyway.
         private const val DECAY_PER_REBUILD = 0.12f
 
+        // Maximum cells before eviction triggers — prevents unbounded growth
+        // that causes all grid iterations to get progressively slower.
+        private const val MAX_CELLS = 25_000
+
+        // Distance (grid cells) beyond which cells become eviction candidates.
+        // 100 cells × 0.20m = 20m from user.
+        private const val EVICT_RADIUS_CELLS = 100
+
+        // Max keyframes to re-project during a full drift rebuild.
+        // Caps the O(keyframes × rays) cost of rebuild().
+        private const val MAX_REBUILD_KEYFRAMES = 400
+
         // 360° ray fan in 30° steps (12 rays). Fewer rays = less aggressive
         // free-space carving, which is better for small/cluttered rooms.
         private val RAY_FAN_ANGLES = FloatArray(12) { i ->
@@ -142,15 +154,9 @@ class MapBuilder(val res: Float) {
     // ── Full Rebuild ───────────────────────────────────────────────────────────
 
     /**
-     * Full grid rebuild from all stored keyframes.
-     *
-     * Called from a background coroutine every ~2 seconds, or immediately
-     * when drift is detected. On each rebuild:
-     *   1. Apply temporal decay to occupied cells.
-     *   2. Clear wallCells and observedThisRebuild for fresh re-projection.
-     *   3. Re-integrate all keyframes from scratch.
-     *   4. Run consistency enforcement.
-     *   5. Derive the final byte grid.
+     * Full grid rebuild — used ONLY for drift correction (rare).
+     * Caps keyframe re-projection at [MAX_REBUILD_KEYFRAMES] to bound cost.
+     * For periodic rebuilds, use [lightRebuild] instead.
      */
     @Synchronized
     fun rebuild(keyframes: List<Keyframe>) {
@@ -174,8 +180,12 @@ class MapBuilder(val res: Float) {
             }
         }
 
-        // Re-project all keyframe observations
-        for (kf in keyframes) {
+        // Re-project only recent keyframes (cap to bound cost).
+        // Older keyframes' contributions survive through logOdds decay.
+        val recentKfs = if (keyframes.size > MAX_REBUILD_KEYFRAMES)
+            keyframes.subList(keyframes.size - MAX_REBUILD_KEYFRAMES, keyframes.size)
+        else keyframes
+        for (kf in recentKfs) {
             integrateKeyframe(kf)
         }
 
@@ -184,6 +194,103 @@ class MapBuilder(val res: Float) {
 
         // Derive byte grid from logOdds + wallCells
         deriveGrid()
+    }
+
+    // ── Light Rebuild (periodic, no re-projection) ────────────────────────────
+
+    /**
+     * Lightweight periodic rebuild: decay stale cells, enforce consistency,
+     * derive the output grid. Does NOT re-project keyframes.
+     *
+     * Cost: O(cells) — constant-time per grid size, no keyframe dependence.
+     * Use this for the regular 2-second rebuild cycle. Reserve [rebuild] for
+     * drift correction only (rare).
+     *
+     * Also evicts distant cells when the grid exceeds [MAX_CELLS] to prevent
+     * unbounded memory and iteration cost growth over long sessions.
+     */
+    @Synchronized
+    fun lightRebuild(userGX: Int, userGZ: Int) {
+        // Phase 1: Decay all cells, collect zeroed-out ones for removal
+        val toRemove = mutableListOf<GridCell>()
+        for ((cell, lo) in logOdds) {
+            if (lo > 0f) {
+                val obs = observationCounts.getOrDefault(cell, 0)
+                val decay = when {
+                    obs >= 10 -> 0.04f
+                    obs >= 5  -> 0.08f
+                    else      -> 0.15f
+                }
+                val newLo = (lo - decay).coerceAtLeast(0f)
+                if (newLo == 0f) {
+                    toRemove.add(cell)
+                } else {
+                    logOdds[cell] = newLo
+                }
+            } else if (lo < 0f) {
+                logOdds[cell] = (lo + DECAY_PER_REBUILD * 0.5f).coerceAtMost(0f)
+            }
+        }
+
+        // Remove zeroed cells — they contribute nothing and waste iteration time
+        for (cell in toRemove) {
+            logOdds.remove(cell)
+            grid.remove(cell)
+            observationCounts.remove(cell)
+            wallCells.remove(cell)
+        }
+
+        // Phase 2: Evict distant cells if over capacity
+        if (logOdds.size > MAX_CELLS) {
+            evictDistantCells(userGX, userGZ)
+        }
+
+        // Phase 3: Consistency enforcement + derive output grid
+        enforceConsistency()
+        deriveGrid()
+    }
+
+    /**
+     * Evict cells far from the user to keep memory bounded.
+     * Only removes cells beyond [EVICT_RADIUS_CELLS] from the user.
+     * Prioritizes removing UNKNOWN > FREE > OBSTACLE > WALL.
+     */
+    private fun evictDistantCells(userGX: Int, userGZ: Int) {
+        val excess = logOdds.size - MAX_CELLS
+        if (excess <= 0) return
+
+        val radiusSq = EVICT_RADIUS_CELLS * EVICT_RADIUS_CELLS
+        data class Candidate(val cell: GridCell, val distSq: Int, val priority: Int)
+        val candidates = mutableListOf<Candidate>()
+
+        for ((cell, _) in logOdds) {
+            val dx = cell.x - userGX
+            val dz = cell.z - userGZ
+            val distSq = dx * dx + dz * dz
+            if (distSq < radiusSq) continue  // keep cells near user
+
+            val cellType = grid[cell]?.toInt() ?: CELL_UNKNOWN
+            val priority = when (cellType) {
+                CELL_UNKNOWN  -> 0   // evict first
+                CELL_FREE     -> 1
+                CELL_OBSTACLE -> 2
+                CELL_WALL     -> 3   // evict last (walls are expensive to re-detect)
+                CELL_VISITED  -> 4   // prefer to keep (user path)
+                else          -> 1
+            }
+            candidates.add(Candidate(cell, distSq, priority))
+        }
+
+        candidates.sortWith(compareBy<Candidate> { it.priority }.thenByDescending { it.distSq })
+
+        val evictCount = excess.coerceAtMost(candidates.size)
+        for (i in 0 until evictCount) {
+            val c = candidates[i]
+            logOdds.remove(c.cell)
+            grid.remove(c.cell)
+            observationCounts.remove(c.cell)
+            wallCells.remove(c.cell)
+        }
     }
 
     // ── Incremental Update ────────────────────────────────────────────────────

@@ -148,6 +148,18 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     private var emergencyManager: EmergencyManager? = null
     private var onboardingTutorial: OnboardingTutorial? = null
     private var lastHudMs = 0L; private var lastFlutterMs = 0L; private var lastMapMs = 0L
+    private var sessionStartMs = 0L
+
+    // ── Performance throttles ────────────────────────────────────────────────
+    // Navigation tick: reuse cached grid snapshot instead of copying every frame
+    private var lastNavTickMs = 0L
+    @Volatile private var cachedNavGrid: HashMap<GridCell, Byte>? = null
+    @Volatile private var cachedObsCounts: Map<GridCell, Int>? = null
+    // Stale object removal: every 5s, not every frame
+    private var lastStaleCheckMs = 0L
+    // Drift check cache: avoid redundant anchor iteration
+    @Volatile private var cachedDrift = 0f
+    private var lastDriftCheckMs = 0L
 
     // ── Navigation ────────────────────────────────────────────────────────────
     private var navigationManager: NavigationManager? = null
@@ -303,6 +315,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         try { session?.resume() } catch (e: CameraNotAvailableException) { session = null; return }
         surfaceView.onResume()
         displayRotationHelper?.onResume()
+        if (sessionStartMs == 0L) sessionStartMs = System.currentTimeMillis()
     }
 
     override fun onPause() {
@@ -315,8 +328,13 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         // Auto-save map on every pause (leaving AR)
         try {
             if (mapBuilder.grid.isNotEmpty()) {
-                mapPersistence.saveMap("last_session", mapBuilder, semanticMap,
-                    poseTracker.getBreadcrumbs())
+                val bc = poseTracker.getBreadcrumbs()
+                // Always save as last_session for quick resume
+                mapPersistence.saveMap("last_session", mapBuilder, semanticMap, bc, sessionStartMs)
+                // Also save a timestamped session copy
+                val sdf = java.text.SimpleDateFormat("yyyy-MM-dd_HH-mm", java.util.Locale.US)
+                val sessionName = "Session_${sdf.format(java.util.Date())}"
+                mapPersistence.saveMap(sessionName, mapBuilder, semanticMap, bc, sessionStartMs)
             }
         } catch (e: Exception) { println("$TAG: auto-save: ${e.message}") }
     }
@@ -747,9 +765,9 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
                 poseTracker.markKeyframeCaptured(cx, cz, latestHeading)
             }
 
-            // --- Depth-hit wall extraction (every 500ms on GL thread) ---
+            // --- Depth-hit wall extraction (every 750ms on GL thread) ---
             val depthNow = System.currentTimeMillis()
-            if (depthNow - lastDepthSampleMs >= 500L) {
+            if (depthNow - lastDepthSampleMs >= 750L) {
                 lastDepthSampleMs = depthNow
                 extractWallsFromDepth(frame, camera)       // Strategies 2 + 4 integrated
             }
@@ -769,41 +787,78 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             // --- Reference anchor management (drift detection) ---
             poseTracker.maybeCreateAnchor(session, frame)
 
-            // --- Periodic grid rebuild from observation store ---
+            // --- Drift check (cached, not every frame) ---
             val now = System.currentTimeMillis()
-            val shouldRebuild = (now - lastRebuildMs >= REBUILD_INTERVAL_MS) ||
-                    poseTracker.hasDriftExceededThreshold()
+            if (now - lastDriftCheckMs >= 1000L) {
+                lastDriftCheckMs = now
+                cachedDrift = poseTracker.checkDrift()
+            }
+            val driftTriggered = cachedDrift > 0.04f
+
+            // --- Periodic grid rebuild from observation store ---
+            val shouldRebuild = (now - lastRebuildMs >= REBUILD_INTERVAL_MS)
 
             if (shouldRebuild && !rebuilding.get()) {
                 val currentVersion = observationStore.version
-                if (currentVersion != lastRebuildVersion) {
+                if (currentVersion != lastRebuildVersion || driftTriggered) {
                     lastRebuildMs = now
                     lastRebuildVersion = currentVersion
-                    val keyframes = observationStore.snapshot()
                     rebuilding.set(true)
-                    rebuildExecutor.execute {
-                        try {
-                            mapBuilder.rebuild(keyframes)
-                            // Re-anchor reference points at corrected positions after rebuild
-                            poseTracker.resetAnchorsAfterRebuild()
-                        } catch (e: Exception) {
-                            println("$TAG: rebuild: ${e.message}")
-                        } finally {
-                            rebuilding.set(false)
+
+                    if (driftTriggered) {
+                        // Full rebuild only on drift — re-projects recent keyframes
+                        val keyframes = observationStore.snapshot()
+                        rebuildExecutor.execute {
+                            try {
+                                mapBuilder.rebuild(keyframes)
+                                poseTracker.resetAnchorsAfterRebuild()
+                                cachedDrift = 0f
+                            } catch (e: Exception) {
+                                println("$TAG: rebuild: ${e.message}")
+                            } finally {
+                                rebuilding.set(false)
+                            }
+                        }
+                    } else {
+                        // Light rebuild — decay + enforce + derive, no re-projection
+                        val userGX = mapBuilder.worldToGrid(cx)
+                        val userGZ = mapBuilder.worldToGrid(cz)
+                        rebuildExecutor.execute {
+                            try {
+                                mapBuilder.lightRebuild(userGX, userGZ)
+                            } catch (e: Exception) {
+                                println("$TAG: lightRebuild: ${e.message}")
+                            } finally {
+                                rebuilding.set(false)
+                            }
                         }
                     }
                 }
             }
 
-            semanticMap.removeStaleObjects()
-            localizationSmoother.removeStale(5000L)
+            // Stale object removal — every 5s, not every frame
+            if (now - lastStaleCheckMs >= 5000L) {
+                lastStaleCheckMs = now
+                semanticMap.removeStaleObjects()
+                localizationSmoother.removeStale(5000L)
+            }
+            // Batched relation graph rebuild (only if dirty, max every 3s)
+            semanticMap.maybeRebuildGraph()
 
-            // Navigation tick
+            // Navigation tick — throttled to 500ms with cached grid snapshot
             val nm = navigationManager
             if (nm != null && nm.needsGrid) {
-                nm.tick(cx, cz, latestHeading, HashMap(mapBuilder.grid), semanticMap,
-                    isTracking = lastTrackingState == TrackingState.TRACKING,
-                    observationCounts = mapBuilder.observationCountSnapshot())
+                if (now - lastNavTickMs >= 500L) {
+                    lastNavTickMs = now
+                    cachedNavGrid = HashMap(mapBuilder.grid)
+                    cachedObsCounts = mapBuilder.observationCountSnapshot()
+                }
+                val gridSnap = cachedNavGrid
+                if (gridSnap != null) {
+                    nm.tick(cx, cz, latestHeading, gridSnap, semanticMap,
+                        isTracking = lastTrackingState == TrackingState.TRACKING,
+                        observationCounts = cachedObsCounts ?: emptyMap())
+                }
             }
         } catch (e: Exception) { println("$TAG: slam: ${e.message}") }
     }
@@ -919,12 +974,17 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         }
 
         // ── Strategy 4: Adaptive density near wall hits ──────────────────
-        // If hit rate is low, do focused sampling around successful wall hits
+        // If hit rate is low, do focused sampling around successful wall hits.
+        // Capped at 16 extra hits to protect frame budget.
         val hitRate = if (totalAttempts > 0) totalSuccesses.toFloat() / totalAttempts else 0f
         if (hitRate < 0.30f && wallHitScreenPts.isNotEmpty()) {
             val offsets = floatArrayOf(-20f, 0f, 20f)
+            var extraHits = 0
+            val maxExtraHits = 16
             for ((sx, sy) in wallHitScreenPts) {
+                if (extraHits >= maxExtraHits) break
                 for (dx in offsets) for (dy in offsets) {
+                    if (extraHits >= maxExtraHits) break
                     if (dx == 0f && dy == 0f) continue
                     val nsx = (sx + dx).coerceIn(0f, surfaceWidth.toFloat())
                     val nsy = (sy + dy).coerceIn(0f, surfaceHeight.toFloat())
@@ -941,6 +1001,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
                         val isVert = (hit.trackable as? Plane)?.type == Plane.Type.VERTICAL
                         if (isVert || relY in -0.5f..0.6f) {
                             mapBuilder.markHitOccupied(hp.tx(), hp.tz())
+                            extraHits++
                         }
                     } catch (_: Exception) {}
                 }
@@ -1340,18 +1401,16 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         if (now - lastHudMs < 300L) return; lastHudMs = now
         val s   = slamEngine.getStatistics()
         val sem = semanticMap.getStatistics()
-        val grid = mapBuilder.grid
-        val drift = poseTracker.checkDrift()
+        val gridSize = mapBuilder.grid.size
         val text = buildString {
             if (camera.trackingState != TrackingState.TRACKING) {
                 appendLine("⚠ TRACKING LOST ⚠")
             }
             appendLine("AR: ${camera.trackingState}")
             appendLine("Pos x=${s.currentPosition.x.f2} z=${s.currentPosition.z.f2}")
-            appendLine("Cells free=${grid.count { it.value.toInt() == MapBuilder.CELL_FREE || it.value.toInt() == MapBuilder.CELL_VISITED }} " +
-                    "obstacle=${grid.count { it.value.toInt() == MapBuilder.CELL_OBSTACLE }}")
+            appendLine("Cells total=$gridSize")
             appendLine("Objects confirmed=${sem.totalObjects}")
-            appendLine("KFs=${observationStore.size()} drift=${"%.3f".format(drift)}m")
+            appendLine("KFs=${observationStore.size()} drift=${"%.3f".format(cachedDrift)}m")
             appendLine("YOLO ${lastInferenceMs}ms  OCR ${lastOcrInferenceMs}ms")
             val textObjs = semanticMap.getAllObjects().count { it.textContent != null }
             append("Text landmarks: $textObjs")

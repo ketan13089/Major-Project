@@ -132,7 +132,8 @@ Set<int> _bfsPath(Uint8List grid, int w, int h, int sx, int sz, int gx, int gz) 
 // Root widget
 // ─────────────────────────────────────────────────────────────────────────────
 class IndoorMapViewer extends StatefulWidget {
-  const IndoorMapViewer({Key? key}) : super(key: key);
+  final String? savedMapName;
+  const IndoorMapViewer({Key? key, this.savedMapName}) : super(key: key);
   @override
   State<IndoorMapViewer> createState() => _IndoorMapViewerState();
 }
@@ -178,15 +179,23 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
   // ── Animations ────────────────────────────────────────────────────────────
   late AnimationController _pulseCtrl;
 
+  bool get _isReadOnly => widget.savedMapName != null;
+
   @override
   void initState() {
     super.initState();
-    _ch.setMethodCallHandler(_onCall);
-    _navCh.setMethodCallHandler(_onNavCall);
+    if (!_isReadOnly) {
+      _ch.setMethodCallHandler(_onCall);
+      _navCh.setMethodCallHandler(_onNavCall);
+    }
     _pulseCtrl = AnimationController(
         vsync: this, duration: const Duration(seconds: 2))
       ..repeat();
-    _loadLastMap();
+    if (_isReadOnly) {
+      _loadSavedMap(widget.savedMapName!);
+    } else {
+      _loadLastMap();
+    }
   }
 
   Future<void> _loadLastMap() async {
@@ -204,10 +213,22 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
     } catch (e) { debugPrint('Load map: $e'); }
   }
 
+  Future<void> _loadSavedMap(String name) async {
+    try {
+      final payload = await _mapStoreCh.invokeMethod('loadMapPayload', {'name': name});
+      if (payload is Map && mounted) {
+        _handleMap(payload);
+        debugPrint('Loaded saved map: $name');
+      }
+    } catch (e) { debugPrint('Load saved map: $e'); }
+  }
+
   @override
   void dispose() {
-    _ch.setMethodCallHandler(null);
-    _navCh.setMethodCallHandler(null);
+    if (!_isReadOnly) {
+      _ch.setMethodCallHandler(null);
+      _navCh.setMethodCallHandler(null);
+    }
     _pulseCtrl.dispose();
     super.dispose();
   }
@@ -381,7 +402,7 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
             _topBar(),
             Expanded(child: _mapArea()),
             if (objects.isNotEmpty) _objectRail(),
-            _bottomBar(),
+            if (!_isReadOnly) _bottomBar(),
           ]),
           if (_showLegend) _legendSheet(),
         ]),
@@ -395,6 +416,39 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
       color: _T.surface,
       padding: const EdgeInsets.fromLTRB(16, 0, 12, 0),
       child: Column(children: [
+        if (_isReadOnly)
+          SizedBox(
+            height: 52,
+            child: Row(children: [
+              GestureDetector(
+                onTap: () => Navigator.pop(context),
+                child: const Icon(Icons.arrow_back_rounded, size: 22, color: _T.textPri),
+              ),
+              const SizedBox(width: 10),
+              Expanded(child: Text(
+                widget.savedMapName!.replaceAll('_', ' '),
+                style: const TextStyle(color: _T.textPri, fontSize: 14,
+                    fontWeight: FontWeight.w600),
+                overflow: TextOverflow.ellipsis,
+              )),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                decoration: BoxDecoration(
+                  color: _T.amberSoft,
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: const Text('Saved', style: TextStyle(
+                    color: _T.amber, fontSize: 11, fontWeight: FontWeight.w600)),
+              ),
+              const SizedBox(width: 8),
+              _tinyBtn(Icons.info_outline_rounded,
+                  () => setState(() => _showLegend = !_showLegend),
+                  active: _showLegend),
+              _tinyBtn(Icons.crop_free_rounded,
+                  () => setState(() { pan = Offset.zero; scale = 28; })),
+            ]),
+          ),
+        if (!_isReadOnly)
         SizedBox(
           height: 52,
           child: Row(children: [
@@ -449,7 +503,7 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
           ]),
         ),
         Divider(height: 1, color: _T.border),
-        if (_navState != 'IDLE')
+        if (!_isReadOnly && _navState != 'IDLE')
           Container(
             width: double.infinity,
             padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
@@ -602,7 +656,7 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
               ),
             ),
           // Nav instruction banner
-          if (_navInstruction.isNotEmpty)
+          if (!_isReadOnly && _navInstruction.isNotEmpty)
             Positioned(
               bottom: 110, left: 12, right: 64,
               child: Container(
@@ -625,8 +679,8 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
                 ]),
               ),
             ),
-          // Voice nav button — above the compass rose
-          Positioned(
+          // Voice nav button — above the compass rose (hidden in read-only mode)
+          if (!_isReadOnly) Positioned(
             right: 12,
             bottom: _navInstruction.isNotEmpty ? 110 : 80,
             child: Semantics(

@@ -51,13 +51,29 @@ class MapPersistence(private val context: Context) {
         name: String,
         mapBuilder: MapBuilder,
         semanticMap: SemanticMapManager,
-        breadcrumbs: List<Point3D>
+        breadcrumbs: List<Point3D>,
+        sessionStartMs: Long = 0L
     ): String? {
         return try {
             val json = JSONObject()
             json.put("version", FORMAT_VERSION)
-            json.put("timestamp", System.currentTimeMillis())
+            val now = System.currentTimeMillis()
+            json.put("timestamp", now)
             json.put("resolution", mapBuilder.res)
+
+            // Session metadata
+            val durationSec = if (sessionStartMs > 0) ((now - sessionStartMs) / 1000).toInt() else 0
+            val objectCount = semanticMap.getAllObjects().size
+            var freeCount = 0
+            for ((_, v) in mapBuilder.grid) {
+                val vi = v.toInt()
+                if (vi == MapBuilder.CELL_FREE || vi == MapBuilder.CELL_VISITED) freeCount++
+            }
+            val areaSqM = freeCount * mapBuilder.res * mapBuilder.res
+            json.put("durationSec", durationSec)
+            json.put("objectCount", objectCount)
+            json.put("areaM2", areaSqM.toDouble())
+            json.put("wallCount", mapBuilder.getWallCells().size)
 
             // Bounds
             val bounds = JSONObject()
@@ -222,6 +238,34 @@ class MapPersistence(private val context: Context) {
         val sanitized = name.replace(Regex("[^a-zA-Z0-9_-]"), "_")
         val file = File(mapsDir(), "${sanitized}.json")
         return file.delete()
+    }
+
+    // ── Metadata (header-only read) ──────────────────────────────────────────
+
+    /**
+     * Read only the metadata fields from a saved map without full deserialization.
+     * Returns null if the file doesn't exist or can't be read.
+     */
+    fun getMapMetadata(name: String): Map<String, Any>? {
+        return try {
+            val sanitized = name.replace(Regex("[^a-zA-Z0-9_-]"), "_")
+            val file = File(mapsDir(), "${sanitized}.json")
+            if (!file.exists()) return null
+
+            val json = JSONObject(file.readText())
+            mapOf(
+                "name" to name,
+                "timestamp" to json.optLong("timestamp", 0L),
+                "areaM2" to json.optDouble("areaM2", 0.0),
+                "objectCount" to json.optInt("objectCount", 0),
+                "durationSec" to json.optInt("durationSec", 0),
+                "wallCount" to json.optInt("wallCount", 0),
+                "resolution" to json.optDouble("resolution", 0.20)
+            )
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to read metadata for $name: ${e.message}")
+            null
+        }
     }
 
     // ── Serialization helpers ────────────────────────────────────────────────

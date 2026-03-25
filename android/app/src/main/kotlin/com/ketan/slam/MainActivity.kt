@@ -36,11 +36,41 @@ class MainActivity : FlutterActivity() {
         }
 
         // Map persistence channel — always available (survives ArActivity lifecycle)
+        val persistence = MapPersistence(this)
         MethodChannel(
             flutterEngine.dartExecutor.binaryMessenger,
             MAP_STORE_CHANNEL
         ).setMethodCallHandler { call, result ->
             when (call.method) {
+                "listSavedMaps" -> {
+                    // Return list of metadata maps for all saved sessions
+                    val names = persistence.listSavedMaps()
+                    val metadataList = mutableListOf<Map<String, Any>>()
+                    for (name in names) {
+                        if (name == "last_session") continue // skip the auto-resume copy
+                        val meta = persistence.getMapMetadata(name)
+                        if (meta != null) metadataList.add(meta)
+                    }
+                    result.success(metadataList)
+                }
+                "loadMapPayload" -> {
+                    val name = call.argument<String>("name") ?: "last_session"
+                    val payload = loadMapAsFlutterPayload(name)
+                    if (payload != null) result.success(payload)
+                    else result.error("NOT_FOUND", "No saved map: $name", null)
+                }
+                "deleteMap" -> {
+                    val name = call.argument<String>("name") ?: ""
+                    val ok = persistence.deleteMap(name)
+                    result.success(mapOf("success" to ok))
+                }
+                "getMapMetadata" -> {
+                    val name = call.argument<String>("name") ?: ""
+                    val meta = persistence.getMapMetadata(name)
+                    if (meta != null) result.success(meta)
+                    else result.error("NOT_FOUND", "No saved map: $name", null)
+                }
+                // Legacy: keep listMaps for backward compat with IndoorMapViewer
                 "listMaps" -> {
                     val dir = File(filesDir, "saved_maps")
                     val maps = dir.listFiles { f -> f.extension == "json" }
@@ -48,12 +78,6 @@ class MainActivity : FlutterActivity() {
                         ?.sortedDescending()
                         ?: emptyList()
                     result.success(maps)
-                }
-                "loadMapPayload" -> {
-                    val name = call.argument<String>("name") ?: "last_session"
-                    val payload = loadMapAsFlutterPayload(name)
-                    if (payload != null) result.success(payload)
-                    else result.error("NOT_FOUND", "No saved map: $name", null)
                 }
                 else -> result.notImplemented()
             }

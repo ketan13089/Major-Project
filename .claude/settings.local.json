@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep -r NavigationSession /c/Users/ketan/StudioProjects/slam/android/app/src/main/kotlin/com/ketan/slam/*.kt)",
+      "Bash(grep:*)",
+      "Bash(./gradlew assembleDebug)",
+      "Bash(GRADLE_OPTS=\"-Xmx4g\" ./gradlew compileDebugKotlin)",
+      "Bash(GRADLE_OPTS=\"-Xmx2g\" ./gradlew compileDebugKotlin)",
+      "Bash(flutter build:*)"
+    ]
+  }
+}
