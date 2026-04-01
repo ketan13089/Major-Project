@@ -1,6 +1,7 @@
 package com.ketan.slam
 
 import android.content.Intent
+import android.view.KeyEvent
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.embedding.engine.FlutterEngineCache
@@ -13,9 +14,29 @@ class MainActivity : FlutterActivity() {
 
     private val CHANNEL = "com.ketan.slam/ar"
     private val MAP_STORE_CHANNEL = "com.ketan.slam/map_store"
+    private val TTS_CHANNEL = "com.ketan.slam/tts"
+    private val VOLUME_CHANNEL = "com.ketan.slam/volume_buttons"
+
+    private lateinit var accessibilityHandler: AccessibilityHandler
+    private var volumeNavEnabled = true
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+
+        // Initialize accessibility handler
+        accessibilityHandler = AccessibilityHandler(this)
+        accessibilityHandler.initialize()
+
+        // Set up TTS and volume button channels
+        val ttsChannel = MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            TTS_CHANNEL
+        )
+        val volumeChannel = MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            VOLUME_CHANNEL
+        )
+        accessibilityHandler.setChannels(ttsChannel, volumeChannel)
 
         // Cache the Flutter engine so ArActivity can access it
         FlutterEngineCache
@@ -158,5 +179,28 @@ class MainActivity : FlutterActivity() {
             println("MainActivity: loadMapPayload: ${e.message}")
             null
         }
+    }
+
+    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
+        if (volumeNavEnabled && event != null) {
+            if (accessibilityHandler.handleKeyEvent(keyCode, event)) {
+                return true
+            }
+        }
+        return super.onKeyDown(keyCode, event)
+    }
+
+    override fun onKeyUp(keyCode: Int, event: KeyEvent?): Boolean {
+        if (volumeNavEnabled && event != null) {
+            if (accessibilityHandler.handleKeyEvent(keyCode, event)) {
+                return true
+            }
+        }
+        return super.onKeyUp(keyCode, event)
+    }
+
+    override fun onDestroy() {
+        accessibilityHandler.shutdown()
+        super.onDestroy()
     }
 }

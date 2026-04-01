@@ -1,8 +1,12 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'indoor_map_viewer.dart';
 import 'saved_maps_screen.dart';
+import 'performance_dashboard.dart';
+import 'accessibility_service.dart';
 
 void main() {
+  WidgetsFlutterBinding.ensureInitialized();
   runApp(const MyApp());
 }
 
@@ -38,6 +42,8 @@ class MyApp extends StatelessWidget {
             );
           case '/saved-maps':
             return MaterialPageRoute(builder: (_) => const SavedMapsScreen());
+          case '/performance':
+            return MaterialPageRoute(builder: (_) => const PerformanceDashboard());
           default:
             return MaterialPageRoute(builder: (_) => const HomePage());
         }
@@ -46,10 +52,68 @@ class MyApp extends StatelessWidget {
   }
 }
 
-class HomePage extends StatelessWidget {
+class HomePage extends StatefulWidget {
   const HomePage({super.key});
 
+  @override
+  State<HomePage> createState() => _HomePageState();
+}
+
+class _HomePageState extends State<HomePage> with VolumeButtonNavigationMixin {
+  final _accessibility = AccessibilityService();
+
+  @override
+  void initState() {
+    super.initState();
+    // Register focusable elements for this screen
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _registerFocusables();
+      _accessibility.announceScreen('Home');
+    });
+  }
+
+  void _registerFocusables() {
+    _accessibility.registerFocusables([
+      FocusableElement(
+        id: 'view_map',
+        label: 'View Indoor Map',
+        hint: 'Opens the map viewer to see your scanned floor plan',
+        onActivate: () => _openMapViewer(context),
+      ),
+      FocusableElement(
+        id: 'saved_maps',
+        label: 'Saved Maps',
+        hint: 'View and manage your previously saved maps',
+        onActivate: () => Navigator.pushNamed(context, '/saved-maps'),
+      ),
+      FocusableElement(
+        id: 'performance',
+        label: 'Performance Metrics',
+        hint: 'View real-time benchmarks and export reports',
+        onActivate: () => Navigator.pushNamed(context, '/performance'),
+      ),
+      FocusableElement(
+        id: 'accessibility_toggle',
+        label: _accessibility.enabled ? 'Disable Accessibility Mode' : 'Enable Accessibility Mode',
+        hint: 'Toggle voice announcements and volume button navigation',
+        onActivate: () {
+          _accessibility.toggle();
+          setState(() {});
+          _registerFocusables(); // Re-register to update label
+        },
+        type: FocusableElementType.toggle,
+      ),
+    ], onFocusChanged: () => setState(() {}));
+  }
+
+  @override
+  void dispose() {
+    _accessibility.clearFocusables();
+    super.dispose();
+  }
+
   void _openMapViewer(BuildContext context) {
+    _accessibility.speak('Opening map viewer');
     Navigator.pushNamed(context, '/map');
   }
 
@@ -142,33 +206,91 @@ class HomePage extends StatelessWidget {
               const SizedBox(height: 24),
 
               // ── Action Cards ──
-              Semantics(
-                button: true,
-                label: 'View Indoor Map. Explore the map built from your scan.',
-                child: _ActionCard(
-                  title: 'View Indoor Map',
-                  subtitle: 'Explore your scanned floor plan',
-                  icon: Icons.map_rounded,
-                  gradientColors: const [Color(0xFF2563EB), Color(0xFF1D4ED8)],
-                  surface: surface, textPri: textPri,
-                  textSec: textSec, border: border,
-                  onTap: () => _openMapViewer(context),
+              AccessibleFocusable(
+                index: 0,
+                borderRadius: BorderRadius.circular(16),
+                child: Semantics(
+                  button: true,
+                  label: 'View Indoor Map. Explore the map built from your scan.',
+                  child: _ActionCard(
+                    title: 'View Indoor Map',
+                    subtitle: 'Explore your scanned floor plan',
+                    icon: Icons.map_rounded,
+                    gradientColors: const [Color(0xFF2563EB), Color(0xFF1D4ED8)],
+                    surface: surface, textPri: textPri,
+                    textSec: textSec, border: border,
+                    onTap: () => _openMapViewer(context),
+                  ),
                 ),
               ),
 
               const SizedBox(height: 12),
 
-              Semantics(
-                button: true,
-                label: 'Saved Maps. View and manage your scanned maps.',
-                child: _ActionCard(
-                  title: 'Saved Maps',
-                  subtitle: 'View and manage your scanned maps',
-                  icon: Icons.folder_rounded,
-                  gradientColors: const [Color(0xFF059669), Color(0xFF047857)],
-                  surface: surface, textPri: textPri,
-                  textSec: textSec, border: border,
-                  onTap: () => Navigator.pushNamed(context, '/saved-maps'),
+              AccessibleFocusable(
+                index: 1,
+                borderRadius: BorderRadius.circular(16),
+                child: Semantics(
+                  button: true,
+                  label: 'Saved Maps. View and manage your scanned maps.',
+                  child: _ActionCard(
+                    title: 'Saved Maps',
+                    subtitle: 'View and manage your scanned maps',
+                    icon: Icons.folder_rounded,
+                    gradientColors: const [Color(0xFF059669), Color(0xFF047857)],
+                    surface: surface, textPri: textPri,
+                    textSec: textSec, border: border,
+                    onTap: () => Navigator.pushNamed(context, '/saved-maps'),
+                  ),
+                ),
+              ),
+
+              const SizedBox(height: 12),
+
+              AccessibleFocusable(
+                index: 2,
+                borderRadius: BorderRadius.circular(16),
+                child: Semantics(
+                  button: true,
+                  label: 'Performance Metrics. View real-time benchmarks and export reports.',
+                  child: _ActionCard(
+                    title: 'Performance Metrics',
+                    subtitle: 'Real-time benchmarks & export reports',
+                    icon: Icons.analytics_rounded,
+                    gradientColors: const [Color(0xFFD97706), Color(0xFFB45309)],
+                    surface: surface, textPri: textPri,
+                    textSec: textSec, border: border,
+                    onTap: () => Navigator.pushNamed(context, '/performance'),
+                  ),
+                ),
+              ),
+
+              const SizedBox(height: 12),
+
+              // ── Accessibility Toggle ──
+              AccessibleFocusable(
+                index: 3,
+                borderRadius: BorderRadius.circular(16),
+                child: Semantics(
+                  button: true,
+                  toggled: _accessibility.enabled,
+                  label: _accessibility.enabled 
+                      ? 'Accessibility mode is on. Tap to disable.'
+                      : 'Accessibility mode is off. Tap to enable.',
+                  child: _ActionCard(
+                    title: _accessibility.enabled ? 'Accessibility: ON' : 'Accessibility: OFF',
+                    subtitle: 'Volume buttons navigate, long-press to toggle',
+                    icon: Icons.accessibility_new_rounded,
+                    gradientColors: _accessibility.enabled
+                        ? const [Color(0xFF7C3AED), Color(0xFF6D28D9)]
+                        : [Colors.grey.shade600, Colors.grey.shade700],
+                    surface: surface, textPri: textPri,
+                    textSec: textSec, border: border,
+                    onTap: () {
+                      _accessibility.toggle();
+                      setState(() {});
+                      _registerFocusables();
+                    },
+                  ),
                 ),
               ),
 

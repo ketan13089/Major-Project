@@ -2,6 +2,7 @@ import 'dart:math' as math;
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'accessibility_service.dart';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Cell constants — must match MapBuilder.kt
@@ -139,10 +140,12 @@ class IndoorMapViewer extends StatefulWidget {
 }
 
 class _IndoorMapViewerState extends State<IndoorMapViewer>
-    with TickerProviderStateMixin {
+    with TickerProviderStateMixin, VolumeButtonNavigationMixin {
   static const _ch    = MethodChannel('com.ketan.slam/ar');
   static const _navCh = MethodChannel('com.ketan.slam/nav');
   static const _mapStoreCh = MethodChannel('com.ketan.slam/map_store');
+
+  final _accessibility = AccessibilityService();
 
   // ── Data ──────────────────────────────────────────────────────────────────
   Uint8List? grid;
@@ -196,6 +199,78 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
     } else {
       _loadLastMap();
     }
+
+    // Register accessibility focusables after first frame
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _registerFocusables();
+      _accessibility.announceScreen('Map Viewer');
+    });
+  }
+
+  void _registerFocusables() {
+    final focusables = <FocusableElement>[
+      FocusableElement(
+        id: 'back',
+        label: 'Go back',
+        hint: 'Return to home screen',
+        onActivate: () => Navigator.pop(context),
+      ),
+      if (!_isReadOnly) FocusableElement(
+        id: 'start_scan',
+        label: scanning ? 'Scanning in progress' : 'Start AR Scan',
+        hint: scanning ? 'AR camera is currently scanning' : 'Open AR camera to scan the environment',
+        onActivate: _openAR,
+      ),
+      if (!_isReadOnly) FocusableElement(
+        id: 'voice_nav',
+        label: _navState == 'NAVIGATING' ? 'Stop navigation' : 'Start voice navigation',
+        hint: _navState == 'NAVIGATING' 
+            ? 'Tap to stop current navigation'
+            : 'Say where you want to go, like: take me to the nearest door',
+        onActivate: _onNavButtonTap,
+      ),
+      FocusableElement(
+        id: 'position_info',
+        label: 'Current position: ${posX.toStringAsFixed(1)} by ${posZ.toStringAsFixed(1)} meters. Area mapped: ${_areaSqM.toStringAsFixed(1)} square meters.',
+        hint: 'Your current location in the scanned space',
+        type: FocusableElementType.header,
+      ),
+    ];
+
+    // Add detected objects as focusables
+    for (int i = 0; i < objects.length; i++) {
+      final o = objects[i];
+      focusables.add(FocusableElement(
+        id: 'object_$i',
+        label: '${_displayLabel(o)}, ${(o.confidence * 100).toStringAsFixed(0)} percent confidence',
+        hint: 'Tap to show path to this object',
+        onActivate: () => _selectObject(i),
+      ));
+    }
+
+    if (_navInstruction.isNotEmpty) {
+      focusables.insert(3, FocusableElement(
+        id: 'nav_instruction',
+        label: 'Navigation: $_navInstruction',
+        hint: 'Current navigation instruction',
+        type: FocusableElementType.header,
+      ));
+    }
+
+    _accessibility.registerFocusables(focusables, onFocusChanged: () => setState(() {}));
+  }
+
+  void _selectObject(int index) {
+    setState(() {
+      _selObj = _selObj == index ? null : index;
+      _cachedPathCells = _recomputePath(grid, gridW, gridH, robotGX, robotGZ, _selObj, objects);
+    });
+    if (_selObj != null && _selObj! < objects.length) {
+      final o = objects[_selObj!];
+      _accessibility.speak('Selected ${_displayLabel(o)}. Showing path.');
+    } else {
+      _accessibility.speak('Selection cleared.');
+    }
   }
 
   Future<void> _loadLastMap() async {
@@ -229,6 +304,7 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
       _ch.setMethodCallHandler(null);
       _navCh.setMethodCallHandler(null);
     }
+    _accessibility.clearFocusables();
     _pulseCtrl.dispose();
     super.dispose();
   }
@@ -249,6 +325,14 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
           break;
         case 'updateMap':
           _handleMap(call.arguments as Map);
+          break;
+        case 'onARClosed':
+          // AR activity closed, resume Flutter accessibility
+          _accessibility.resume();
+          if (mounted) {
+            setState(() => scanning = false);
+            _accessibility.speak('AR camera closed. Returned to map viewer.');
+          }
           break;
       }
     } catch (e) { debugPrint('onCall error: $e'); }
@@ -314,6 +398,9 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
         _cachedPathCells = _recomputePath(ng, newW, newH, newRGX, newRGZ, _selObj, newObjs);
       });
 
+      // Update focusables when objects change
+      _registerFocusables();
+
     } catch (e, st) { debugPrint('map error: $e\n$st'); }
   }
 
@@ -341,6 +428,9 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
 
   Future<void> _openAR() async {
     try {
+      _accessibility.speak('Opening AR camera for scanning');
+      // Pause Flutter accessibility - AR has its own TTS
+      _accessibility.pause();
       await _ch.invokeMethod('openAR');
       if (mounted) setState(() => scanning = true);
     } catch (_) {}
@@ -352,27 +442,67 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
       switch (call.method) {
         case 'navStateChange':
           final a = call.arguments as Map;
+          final newState = a['state'] as String? ?? _navState;
+          final newMessage = a['message'] as String? ?? _navMessage;
+          
+          // Announce state changes
+          if (newState != _navState) {
+            _announceNavState(newState, newMessage);
+          }
+          
           setState(() {
-            _navState   = a['state']   as String? ?? _navState;
-            _navMessage = a['message'] as String? ?? _navMessage;
+            _navState   = newState;
+            _navMessage = newMessage;
             if (_navState == 'IDLE' || _navState == 'ARRIVED') _navInstruction = '';
           });
+          _registerFocusables(); // Update focusables with new nav state
           break;
         case 'navInstruction':
           final a = call.arguments as Map;
+          final text = a['text'] as String? ?? _navInstruction;
           setState(() {
-            _navInstruction = a['text'] as String? ?? _navInstruction;
+            _navInstruction = text;
           });
+          // Navigation instructions are already spoken by native TTS, no need to duplicate
           break;
       }
     } catch (e) { debugPrint('onNavCall error: $e'); }
   }
 
+  void _announceNavState(String state, String message) {
+    switch (state) {
+      case 'LISTENING':
+        _accessibility.speak('Listening for your command. Say where you want to go.');
+        break;
+      case 'PLANNING':
+        _accessibility.speak('Planning route. $message');
+        break;
+      case 'NAVIGATING':
+        _accessibility.speak('Navigation started. $message');
+        break;
+      case 'ARRIVED':
+        _accessibility.speak('You have arrived at your destination.');
+        _accessibility.hapticConfirm();
+        break;
+      case 'ERROR':
+        _accessibility.speak('Navigation error. $message');
+        _accessibility.hapticError();
+        break;
+      case 'IDLE':
+        if (_navState == 'NAVIGATING') {
+          _accessibility.speak('Navigation stopped.');
+        }
+        break;
+    }
+  }
+
   Future<void> _onNavButtonTap() async {
     try {
       if (_navState == 'NAVIGATING') {
+        _accessibility.speak('Stopping navigation');
         await _navCh.invokeMethod('stopNavigation');
       } else {
+        _accessibility.speak('Starting voice navigation');
         await _navCh.invokeMethod('startVoiceNav');
       }
     } catch (_) {}

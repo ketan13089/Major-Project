@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'accessibility_service.dart';
 
 class SavedMapInfo {
   final String name;
@@ -60,8 +61,9 @@ class SavedMapsScreen extends StatefulWidget {
   State<SavedMapsScreen> createState() => _SavedMapsScreenState();
 }
 
-class _SavedMapsScreenState extends State<SavedMapsScreen> {
+class _SavedMapsScreenState extends State<SavedMapsScreen> with VolumeButtonNavigationMixin {
   static const _ch = MethodChannel('com.ketan.slam/map_store');
+  final _accessibility = AccessibilityService();
 
   List<SavedMapInfo>? _maps;
   bool _loading = true;
@@ -71,6 +73,56 @@ class _SavedMapsScreenState extends State<SavedMapsScreen> {
   void initState() {
     super.initState();
     _loadMaps();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _accessibility.announceScreen('Saved Maps');
+    });
+  }
+
+  void _registerFocusables() {
+    if (_maps == null || _maps!.isEmpty) {
+      _accessibility.registerFocusables([
+        FocusableElement(
+          id: 'back',
+          label: 'Go back',
+          hint: 'Return to home screen',
+          onActivate: () => Navigator.pop(context),
+        ),
+        FocusableElement(
+          id: 'empty',
+          label: 'No saved maps yet',
+          hint: 'Start an AR scan to create your first map',
+          type: FocusableElementType.header,
+        ),
+      ], onFocusChanged: () => setState(() {}));
+      return;
+    }
+
+    final focusables = <FocusableElement>[
+      FocusableElement(
+        id: 'back',
+        label: 'Go back',
+        hint: 'Return to home screen',
+        onActivate: () => Navigator.pop(context),
+      ),
+    ];
+
+    for (int i = 0; i < _maps!.length; i++) {
+      final map = _maps![i];
+      focusables.add(FocusableElement(
+        id: 'map_$i',
+        label: '${map.name.replaceAll('_', ' ')}. ${map.formattedTimestamp}',
+        hint: 'Area ${map.areaM2.toStringAsFixed(0)} square meters, ${map.objectCount} objects. Double tap to open, long press to delete.',
+        onActivate: () => _openMap(map),
+      ));
+    }
+
+    _accessibility.registerFocusables(focusables, onFocusChanged: () => setState(() {}));
+  }
+
+  @override
+  void dispose() {
+    _accessibility.clearFocusables();
+    super.dispose();
   }
 
   Future<void> _loadMaps() async {
@@ -84,9 +136,14 @@ class _SavedMapsScreenState extends State<SavedMapsScreen> {
             .toList();
         maps.sort((a, b) => b.timestamp.compareTo(a.timestamp));
         setState(() { _maps = maps; _loading = false; });
+        _registerFocusables();
+        _accessibility.speak('${maps.length} saved maps found.');
       }
     } catch (e) {
-      if (mounted) setState(() { _error = e.toString(); _loading = false; });
+      if (mounted) {
+        setState(() { _error = e.toString(); _loading = false; });
+        _accessibility.speak('Failed to load maps.');
+      }
     }
   }
 

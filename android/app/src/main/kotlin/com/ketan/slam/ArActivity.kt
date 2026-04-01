@@ -147,7 +147,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     private lateinit var mapPersistence: MapPersistence
     private var emergencyManager: EmergencyManager? = null
     private var onboardingTutorial: OnboardingTutorial? = null
-    private var lastHudMs = 0L; private var lastFlutterMs = 0L; private var lastMapMs = 0L
+    private var lastHudMs = 0L; private var lastFlutterMs = 0L; private var lastMapMs = 0L; private var lastPerfPushMs = 0L
     private var sessionStartMs = 0L
 
     // ── Performance throttles ────────────────────────────────────────────────
@@ -236,6 +236,14 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
                             poseTracker.getBreadcrumbs())
                         result.success(true)
                     }
+                    "getPerformanceMetrics" -> {
+                        result.success(PerformanceTracker.snapshot().toFlatMap())
+                    }
+                    "exportPerformanceReport" -> {
+                        val path = PerformanceTracker.exportJson(this@ArActivity)
+                        if (path != null) result.success(mapOf("path" to path))
+                        else result.error("EXPORT_FAILED", "Failed to export report", null)
+                    }
                     else -> result.notImplemented()
                 }
             }
@@ -293,6 +301,10 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             }, 3000L)
         }
 
+        // Performance tracking
+        PerformanceTracker.reset()
+        PerformanceTracker.markSessionStart()
+
         // Hazard warning + spatial audio — FROZEN (disabled for now)
         // @Suppress("DEPRECATION")
         // val vibrator = getSystemService(VIBRATOR_SERVICE) as? Vibrator
@@ -341,6 +353,13 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
 
     override fun onDestroy() {
         destroyed = true
+        // Notify Flutter that AR is closing so it can resume its accessibility
+        try {
+            val engine = FlutterEngineCache.getInstance().get("slam_engine")
+            engine?.dartExecutor?.binaryMessenger?.let { messenger ->
+                MethodChannel(messenger, "com.ketan.slam/ar").invokeMethod("onARClosed", null)
+            }
+        } catch (_: Exception) {}
         // Stop GL callbacks before tearing down resources they depend on
         try { surfaceView.onPause() } catch (_: Exception) {}
         // Clear channel handlers so stale callbacks don't fire on destroyed activity
@@ -560,6 +579,9 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
                             val raw = yoloDetector.detectFromYuv(yB, uB, vB, yStride, uvStride, uvPix, CAM_W, CAM_H)
                             val confirmed = confirmationGate.feed(raw)
                             lastInferenceMs = System.currentTimeMillis() - t0
+                            PerformanceTracker.recordYoloInference(
+                                lastInferenceMs, confirmed.size,
+                                confirmed.map { it.confidence })
 
                             overlayView.updateDetections(raw, CAM_W, CAM_H)
 
@@ -594,6 +616,8 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
                                 val textDetections = textRecognizer.detectText(
                                     yB, uB, vB, yStride, uvStride, uvPix, CAM_W, CAM_H)
                                 lastOcrInferenceMs = System.currentTimeMillis() - ocrT0
+                                PerformanceTracker.recordOcrInference(
+                                    lastOcrInferenceMs, textDetections.size)
 
                                 if (textDetections.isNotEmpty()) {
                                     println("$TAG: OCR found ${textDetections.size}: " +
@@ -647,6 +671,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT or GLES20.GL_DEPTH_BUFFER_BIT)
         if (destroyed) return
         if (!::backgroundRenderer.isInitialized) return
+        PerformanceTracker.tickFrame()
         val sess = session ?: return
         try {
             sess.setCameraTextureName(backgroundRenderer.textureId)
@@ -763,6 +788,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
                 )
                 observationStore.append(keyframe)
                 poseTracker.markKeyframeCaptured(cx, cz, latestHeading)
+                PerformanceTracker.recordKeyframe()
             }
 
             // --- Depth-hit wall extraction (every 750ms on GL thread) ---
@@ -809,10 +835,13 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
                         // Full rebuild only on drift — re-projects recent keyframes
                         val keyframes = observationStore.snapshot()
                         rebuildExecutor.execute {
+                            val rbT0 = System.currentTimeMillis()
                             try {
                                 mapBuilder.rebuild(keyframes)
                                 poseTracker.resetAnchorsAfterRebuild()
                                 cachedDrift = 0f
+                                PerformanceTracker.recordRebuild(System.currentTimeMillis() - rbT0)
+                                PerformanceTracker.recordDriftRebuild()
                             } catch (e: Exception) {
                                 println("$TAG: rebuild: ${e.message}")
                             } finally {
@@ -824,8 +853,10 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
                         val userGX = mapBuilder.worldToGrid(cx)
                         val userGZ = mapBuilder.worldToGrid(cz)
                         rebuildExecutor.execute {
+                            val lrT0 = System.currentTimeMillis()
                             try {
                                 mapBuilder.lightRebuild(userGX, userGZ)
+                                PerformanceTracker.recordLightRebuild(System.currentTimeMillis() - lrT0)
                             } catch (e: Exception) {
                                 println("$TAG: lightRebuild: ${e.message}")
                             } finally {
@@ -1430,6 +1461,17 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         val ch  = methodChannel ?: return
         val s   = slamEngine.getStatistics()
         val sem = semanticMap.getStatistics()
+
+        // Record performance metrics on each Flutter update cycle
+        PerformanceTracker.recordDrift(cachedDrift)
+        PerformanceTracker.recordObjectCount(sem.totalObjects)
+        PerformanceTracker.recordMemoryUsage()
+        val localGrid = mapBuilder.grid
+        var free = 0; var walls = 0; var obs = 0; var visited = 0
+        for ((_, v) in localGrid) {
+            when (v.toInt()) { 1 -> free++; 3 -> walls++; 2 -> obs++; 4 -> visited++ }
+        }
+        PerformanceTracker.recordGridStats(localGrid.size, free, walls, obs, visited)
         val pose = latestPose
         val heading = if (pose != null) {
             val q = pose.rotationQuaternion
@@ -1459,6 +1501,11 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             if (now - lastMapMs >= 800L) {
                 lastMapMs = now
                 ch.invokeMethod("updateMap", buildMapPayload(s.currentPosition))
+            }
+            // Push live performance snapshot every 2s
+            if (now - lastPerfPushMs >= 2000L) {
+                lastPerfPushMs = now
+                ch.invokeMethod("perfUpdate", PerformanceTracker.snapshot().toFlatMap())
             }
         }
     }

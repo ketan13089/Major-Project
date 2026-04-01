@@ -59,6 +59,10 @@ class NavigationManager(
     /** Cached observation counts from the latest tick(), used in resolveIntent/rePlan. */
     @Volatile private var cachedObservationCounts: Map<GridCell, Int>? = null
 
+    // Performance tracking
+    private var navStartMs = 0L
+    private var navReplans = 0
+
     /** Breadcrumb provider — set by ArActivity, returns reversed breadcrumb trail. */
     var breadcrumbProvider: (() -> List<Point3D>)? = null
 
@@ -117,6 +121,10 @@ class NavigationManager(
         if (guide.isArrived(userX, userZ, goalX, goalZ)) {
             val label = session.intent.destinationType.name
                 .lowercase().replace('_', ' ')
+            if (navStartMs > 0L) {
+                PerformanceTracker.recordNavArrival(
+                    (System.currentTimeMillis() - navStartMs) / 1000f, navReplans)
+            }
             currentSession = null
             setState(NavigationState.ARRIVED, "Arrived at $label")
             onPathUpdated(emptyList())
@@ -213,15 +221,21 @@ class NavigationManager(
         val goalGX  = (dest.position.x / res).roundToInt()
         val goalGZ  = (dest.position.z / res).roundToInt()
 
+        val ppT0 = System.currentTimeMillis()
         val path = planner.planPath(grid, startGX, startGZ, goalGX, goalGZ,
             semanticObjects = semanticMap.getAllObjects(),
             observationCounts = cachedObservationCounts)
+        PerformanceTracker.recordPathPlan(
+            System.currentTimeMillis() - ppT0, path.size, path.isNotEmpty())
         if (path.isEmpty()) {
             setState(NavigationState.ERROR, "No clear path — route may be blocked")
             guide.speak("Cannot find a clear path to the $label. Try scanning more of the area.")
             return
         }
 
+        PerformanceTracker.recordNavStart()
+        navStartMs = System.currentTimeMillis()
+        navReplans = 0
         currentSession = NavigationSession(intent, dest, path)
         setState(NavigationState.NAVIGATING, "Navigating to $label")
         onPathUpdated(path)
@@ -417,9 +431,13 @@ class NavigationManager(
         val goalGX  = (session.destination.position.x / res).roundToInt()
         val goalGZ  = (session.destination.position.z / res).roundToInt()
 
+        val rpT0 = System.currentTimeMillis()
         val newPath = planner.planPath(grid, startGX, startGZ, goalGX, goalGZ,
             semanticObjects = semanticMap.getAllObjects(),
             observationCounts = cachedObservationCounts)
+        PerformanceTracker.recordPathPlan(
+            System.currentTimeMillis() - rpT0, newPath.size, newPath.isNotEmpty())
+        navReplans++
         if (newPath.isEmpty()) {
             currentSession = null
             setState(NavigationState.ERROR, "Re-routing failed — path blocked")

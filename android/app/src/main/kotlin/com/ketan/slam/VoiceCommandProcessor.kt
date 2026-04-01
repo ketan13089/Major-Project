@@ -83,7 +83,7 @@ class VoiceCommandProcessor(
 
     // ── Rule-based NLP ────────────────────────────────────────────────────────
 
-    private fun parseIntent(text: String): NavigationIntent? {
+    internal fun parseIntent(text: String): NavigationIntent? {
         val lower = text.lowercase().trim()
 
         // ── Tutorial replay ─────────────────────────────────────────────────

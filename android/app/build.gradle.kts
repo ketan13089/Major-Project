@@ -68,4 +68,8 @@ dependencies {
 
     // ML Kit Text Recognition for OCR
     implementation("com.google.mlkit:text-recognition:16.0.1")
+
+    // Testing
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.jetbrains.kotlin:kotlin-test-junit:1.9.20")
 }

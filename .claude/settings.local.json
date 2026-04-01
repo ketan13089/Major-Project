@@ -6,7 +6,18 @@
       "Bash(./gradlew assembleDebug)",
       "Bash(GRADLE_OPTS=\"-Xmx4g\" ./gradlew compileDebugKotlin)",
       "Bash(GRADLE_OPTS=\"-Xmx2g\" ./gradlew compileDebugKotlin)",
-      "Bash(flutter build:*)"
+      "Bash(flutter build:*)",
+      "Bash(find /c/Users/ketan/StudioProjects/slam/test -type f -name *.dart)",
+      "Bash(flutter analyze:*)",
+      "Bash(./gradlew -p android compileDebugKotlin)",
+      "Bash(./gradlew compileDebugKotlin)",
+      "Bash(./gradlew testDebugUnitTest)",
+      "Bash(./gradlew testDebugUnitTest --tests \"com.ketan.slam.MapBuilderTest.multiple incremental updates grow the map\")",
+      "Bash(./gradlew testDebugUnitTest --tests \"com.ketan.slam.MapBuilderTest.multiple incremental updates grow the map\" --info)",
+      "Bash(./gradlew testDebugUnitTest --tests \"com.ketan.slam.MapBuilderTest.rebuild clears stale cells\" --info)",
+      "Bash(./gradlew testDebugUnitTest --tests \"com.ketan.slam.PathPlannerTest.goal on obstacle cell is still reachable\" --info)",
+      "Bash(./gradlew testDebugUnitTest --tests \"com.ketan.slam.PerformanceTrackerTest.snapshot toJson contains all sections\" --info)",
+      "Bash(./gradlew testDebugUnitTest --info)"
     ]
   }
 }
