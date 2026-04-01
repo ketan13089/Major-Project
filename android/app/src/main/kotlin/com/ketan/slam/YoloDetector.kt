@@ -92,6 +92,9 @@ class YoloDetector(context: Context) {
     }
 
     private var interpreter: Interpreter? = null
+    // Pre-allocated input buffer — reused across inferences to avoid GC pressure
+    private val inputBuffer: ByteBuffer = ByteBuffer.allocateDirect(4 * INPUT_SIZE * INPUT_SIZE * 3)
+        .order(ByteOrder.nativeOrder())
     private val allLabels = arrayOf(
         "chair", "door", "fire_extinguisher", "lift_gate",
         "notice_board", "trash_can", "water_purifier", "window"
@@ -139,7 +142,8 @@ class YoloDetector(context: Context) {
         yRowStride: Int, uvRowStride: Int, uvPixStride: Int,
         srcWidth: Int, srcHeight: Int
     ): ByteBuffer {
-        val buf = ByteBuffer.allocateDirect(4 * INPUT_SIZE * INPUT_SIZE * 3).order(ByteOrder.nativeOrder())
+        val buf = inputBuffer
+        buf.clear()
         val rotW = srcHeight
         val padX = (INPUT_SIZE - rotW) / 2
         for (py in 0 until INPUT_SIZE) {
@@ -219,7 +223,7 @@ class YoloDetector(context: Context) {
     private fun loadModel(context: Context) {
         try {
             val model = FileUtil.loadMappedFile(context, MODEL_FILE)
-            interpreter = Interpreter(model, Interpreter.Options().apply { numThreads = 6; useNNAPI = true })
+            interpreter = Interpreter(model, Interpreter.Options().apply { numThreads = 4; useNNAPI = true })
             val outShape = interpreter!!.getOutputTensor(0).shape()
             println("$TAG: in=${interpreter!!.getInputTensor(0).shape().toList()} out=${outShape.toList()}")
             numClasses = if (outShape.size >= 3) maxOf(minOf(outShape[1], outShape[2]) - 4, 1) else allLabels.size

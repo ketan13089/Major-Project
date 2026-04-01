@@ -17,7 +17,11 @@
       "Bash(./gradlew testDebugUnitTest --tests \"com.ketan.slam.MapBuilderTest.rebuild clears stale cells\" --info)",
       "Bash(./gradlew testDebugUnitTest --tests \"com.ketan.slam.PathPlannerTest.goal on obstacle cell is still reachable\" --info)",
       "Bash(./gradlew testDebugUnitTest --tests \"com.ketan.slam.PerformanceTrackerTest.snapshot toJson contains all sections\" --info)",
-      "Bash(./gradlew testDebugUnitTest --info)"
+      "Bash(./gradlew testDebugUnitTest --info)",
+      "Bash(wc -l \"/Users/omvarma/Desktop/ketan/Major-Project/android/app/src/main/kotlin/com/ketan/slam\"/*.kt)",
+      "Bash(wc -l \"/Users/omvarma/Desktop/ketan/Major-Project/lib\"/*.dart)",
+      "Read(//Users/omvarma/flutter/bin/**)",
+      "Read(//usr/local/bin/**)"
     ]
   }
 }

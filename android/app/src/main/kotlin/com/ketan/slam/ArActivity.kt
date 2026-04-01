@@ -139,6 +139,8 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     // Pre-allocated buffers for depth image processing (Strategy 1)
     private val depthWorldPts = FloatArray(240 * 180 * 3) // worst-case depth image size
     private var depthPtCount = 0
+    // Reusable HashMap for depth bin analysis — cleared each call instead of re-allocated
+    private val depthBins = HashMap<Int, Int>(64)
 
     // ── Flutter ───────────────────────────────────────────────────────────────
     private var methodChannel: MethodChannel? = null
@@ -155,6 +157,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     private var lastNavTickMs = 0L
     @Volatile private var cachedNavGrid: HashMap<GridCell, Byte>? = null
     @Volatile private var cachedObsCounts: Map<GridCell, Int>? = null
+    @Volatile private var cachedNavGridVersion = -1L   // track rebuild version to avoid redundant copies
     // Stale object removal: every 5s, not every frame
     private var lastStaleCheckMs = 0L
     // Drift check cache: avoid redundant anchor iteration
@@ -728,7 +731,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             if (currentTrackingState == TrackingState.TRACKING) {
                 updateSlam(frame, camera, sess)
                 val now = System.currentTimeMillis()
-                if (now - lastFlutterMs >= 300L) { lastFlutterMs = now; sendToFlutter() }
+                if (now - lastFlutterMs >= 500L) { lastFlutterMs = now; sendToFlutter() }
             }
         } catch (e: Exception) { println("$TAG: draw: ${e.message}") }
     }
@@ -876,13 +879,17 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             // Batched relation graph rebuild (only if dirty, max every 3s)
             semanticMap.maybeRebuildGraph()
 
-            // Navigation tick — throttled to 500ms with cached grid snapshot
+            // Navigation tick — throttled to 500ms; only copy grid when rebuild version changes
             val nm = navigationManager
             if (nm != null && nm.needsGrid) {
                 if (now - lastNavTickMs >= 500L) {
                     lastNavTickMs = now
-                    cachedNavGrid = HashMap(mapBuilder.grid)
-                    cachedObsCounts = mapBuilder.observationCountSnapshot()
+                    val currentVersion = observationStore.version
+                    if (currentVersion != cachedNavGridVersion) {
+                        cachedNavGridVersion = currentVersion
+                        cachedNavGrid = HashMap(mapBuilder.grid)
+                        cachedObsCounts = mapBuilder.observationCountSnapshot()
+                    }
                 }
                 val gridSnap = cachedNavGrid
                 if (gridSnap != null) {
@@ -1088,7 +1095,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
 
             // Collect wall-height points and their grid-column depth
             // For cluster detection: group by quantized depth (10cm bins)
-            val depthBins = HashMap<Int, Int>() // depthBin → count
+            depthBins.clear()
 
             for (v in step / 2 until h step step) {
                 for (u in step / 2 until w step step) {
@@ -1456,22 +1463,34 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     // Flutter bridge
     // ─────────────────────────────────────────────────────────────────────────
 
+    // Cached grid stats — avoid iterating entire grid every 300ms
+    private var cachedGridFree = 0; private var cachedGridWalls = 0
+    private var cachedGridObs = 0; private var cachedGridVisited = 0
+    private var cachedGridTotal = 0; private var lastGridStatsMs = 0L
+
     private fun sendToFlutter() {
         if (destroyed) return
         val ch  = methodChannel ?: return
         val s   = slamEngine.getStatistics()
         val sem = semanticMap.getStatistics()
 
-        // Record performance metrics on each Flutter update cycle
+        // Record performance metrics — grid stats only every 2s (expensive iteration)
         PerformanceTracker.recordDrift(cachedDrift)
         PerformanceTracker.recordObjectCount(sem.totalObjects)
-        PerformanceTracker.recordMemoryUsage()
-        val localGrid = mapBuilder.grid
-        var free = 0; var walls = 0; var obs = 0; var visited = 0
-        for ((_, v) in localGrid) {
-            when (v.toInt()) { 1 -> free++; 3 -> walls++; 2 -> obs++; 4 -> visited++ }
+        val now = System.currentTimeMillis()
+        if (now - lastGridStatsMs >= 2000L) {
+            lastGridStatsMs = now
+            PerformanceTracker.recordMemoryUsage()
+            val localGrid = mapBuilder.grid
+            var free = 0; var walls = 0; var obs = 0; var visited = 0
+            for ((_, v) in localGrid) {
+                when (v.toInt()) { 1 -> free++; 3 -> walls++; 2 -> obs++; 4 -> visited++ }
+            }
+            cachedGridFree = free; cachedGridWalls = walls
+            cachedGridObs = obs; cachedGridVisited = visited
+            cachedGridTotal = localGrid.size
         }
-        PerformanceTracker.recordGridStats(localGrid.size, free, walls, obs, visited)
+        PerformanceTracker.recordGridStats(cachedGridTotal, cachedGridFree, cachedGridWalls, cachedGridObs, cachedGridVisited)
         val pose = latestPose
         val heading = if (pose != null) {
             val q = pose.rotationQuaternion
@@ -1498,7 +1517,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             ))
 
             val now = System.currentTimeMillis()
-            if (now - lastMapMs >= 800L) {
+            if (now - lastMapMs >= 1000L) {
                 lastMapMs = now
                 ch.invokeMethod("updateMap", buildMapPayload(s.currentPosition))
             }

@@ -192,8 +192,7 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
       _navCh.setMethodCallHandler(_onNavCall);
     }
     _pulseCtrl = AnimationController(
-        vsync: this, duration: const Duration(seconds: 2))
-      ..repeat();
+        vsync: this, duration: const Duration(seconds: 2));
     if (_isReadOnly) {
       _loadSavedMap(widget.savedMapName!);
     } else {
@@ -320,7 +319,10 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
             posZ         = (a['position_z'] as num?)?.toDouble() ?? posZ;
             heading      = (a['heading']    as num?)?.toDouble() ?? heading;
             totalObjects = (a['total_objects'] as num?)?.toInt() ?? totalObjects;
-            scanning     = true;
+            if (!scanning) {
+              scanning = true;
+              _pulseCtrl.repeat();
+            }
           });
           break;
         case 'updateMap':
@@ -330,7 +332,11 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
           // AR activity closed, resume Flutter accessibility
           _accessibility.resume();
           if (mounted) {
-            setState(() => scanning = false);
+            setState(() {
+              scanning = false;
+              _pulseCtrl.stop();
+              _pulseCtrl.reset();
+            });
             _accessibility.speak('AR camera closed. Returned to map viewer.');
           }
           break;
@@ -385,6 +391,11 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
         area = free * newRes * newRes;
       }
 
+      // Only recompute BFS when robot moved or selection changed
+      final robotMoved = (newRGX - _cachedPathRobotGX).abs() > 1 ||
+                         (newRGZ - _cachedPathRobotGZ).abs() > 1;
+      final needBfs = robotMoved || _cachedPathSelObj != _selObj;
+
       setState(() {
         grid = ng; gridW = newW; gridH = newH; gridRes = newRes;
         originX = newOX; originZ = newOZ;
@@ -392,10 +403,12 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
         objects = newObjs; totalObjects = newObjs.length;
         _navPathCells = _parseNavPath(args['navPath'], newW, newH);
         _cachedAreaSqM = area;
-        // Invalidate path cache when map or robot position changes
-        _cachedPathRobotGX = newRGX;
-        _cachedPathRobotGZ = newRGZ;
-        _cachedPathCells = _recomputePath(ng, newW, newH, newRGX, newRGZ, _selObj, newObjs);
+        if (needBfs) {
+          _cachedPathRobotGX = newRGX;
+          _cachedPathRobotGZ = newRGZ;
+          _cachedPathSelObj = _selObj;
+          _cachedPathCells = _recomputePath(ng, newW, newH, newRGX, newRGZ, _selObj, newObjs);
+        }
       });
 
       // Update focusables when objects change
@@ -432,7 +445,10 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
       // Pause Flutter accessibility - AR has its own TTS
       _accessibility.pause();
       await _ch.invokeMethod('openAR');
-      if (mounted) setState(() => scanning = true);
+      if (mounted) setState(() {
+        scanning = true;
+        _pulseCtrl.repeat();
+      });
     } catch (_) {}
   }
 
@@ -701,21 +717,20 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
             label: 'Indoor map showing ${objects.length} detected objects. '
                 'Pinch to zoom, drag to pan.',
             excludeSemantics: true,
-            child: AnimatedBuilder(
-            animation: _pulseCtrl,
-            builder: (_, __) => CustomPaint(
-              painter: _MapPainter(
-                grid: grid, gridW: gridW, gridH: gridH, gridRes: gridRes,
-                objects: objects, pathCells: pathCells,
-                navPathCells: _navPathCells,
-                selectedObj: _selObj,
-                robotGX: robotGX, robotGZ: robotGZ, heading: heading,
-                scale: scale, pan: pan,
-                pulse: _pulseCtrl.value,
+            child: RepaintBoundary(
+              child: CustomPaint(
+                painter: _MapPainter(
+                  grid: grid, gridW: gridW, gridH: gridH, gridRes: gridRes,
+                  objects: objects, pathCells: pathCells,
+                  navPathCells: _navPathCells,
+                  selectedObj: _selObj,
+                  robotGX: robotGX, robotGZ: robotGZ, heading: heading,
+                  scale: scale, pan: pan,
+                  scanning: scanning,
+                ),
+                child: const SizedBox.expand(),
               ),
-              child: const SizedBox.expand(),
             ),
-          ),
           ),
           // Empty state
           if (grid == null || gridW == 0)
@@ -1055,7 +1070,8 @@ class _MapPainter extends CustomPainter {
   final Set<int> navPathCells;
   final int? selectedObj;
   final int robotGX, robotGZ;
-  final double heading, scale, pulse;
+  final double heading, scale;
+  final bool scanning;
   final Offset pan;
 
   const _MapPainter({
@@ -1065,7 +1081,7 @@ class _MapPainter extends CustomPainter {
     required this.selectedObj,
     required this.robotGX, required this.robotGZ,
     required this.heading, required this.scale, required this.pan,
-    required this.pulse,
+    required this.scanning,
   });
 
   @override
@@ -1090,19 +1106,26 @@ class _MapPainter extends CustomPainter {
     canvas.drawRect(Rect.fromLTWH(0, 0, size.width, size.height),
         Paint()..color = _T.mapBg);
 
+    // Viewport culling — compute visible cell range to skip off-screen cells
+    final int visCXMin = ((0 - origin.dx) / scale).floor().clamp(0, gridW - 1);
+    final int visCXMax = ((size.width - origin.dx) / scale).ceil().clamp(0, gridW - 1);
+    final int visCZMin = ((0 - origin.dy) / scale).floor().clamp(0, gridH - 1);
+    final int visCZMax = ((size.height - origin.dy) / scale).ceil().clamp(0, gridH - 1);
+
     _drawGrid(canvas, size, origin);
-    _drawFloorAndVisited(canvas, origin);
+    _drawFloorAndVisited(canvas, origin, visCXMin, visCXMax, visCZMin, visCZMax);
     _drawNavPath(canvas, origin);
     _drawBfsPath(canvas, origin);
-    _drawObstacles(canvas, origin);
-    _drawWalls(canvas, origin);       // walls on top = crisp architectural lines
+    _drawObstacles(canvas, origin, visCXMin, visCXMax, visCZMin, visCZMax);
+    _drawWalls(canvas, origin, visCXMin, visCXMax, visCZMin, visCZMax);
     _drawObjects(canvas, origin);
     _drawRobot(canvas, origin);
     _drawCompass(canvas, size);
   }
 
   void _drawGrid(Canvas canvas, Size size, Offset origin) {
-    if (scale < 2) return;
+    // Skip grid lines at low zoom (too many lines) and very low zoom (invisible)
+    if (scale < 8) return;
     final paint = Paint()..color = _T.mapGrid..strokeWidth = 0.4;
     final step  = scale;
     for (double x = origin.dx % step; x < size.width;  x += step)
@@ -1115,7 +1138,8 @@ class _MapPainter extends CustomPainter {
   /// KEY CHANGE: floor is pure WHITE (architectural style), visited is very
   /// light blue. Previously both used similar blue shades making floor/visited
   /// indistinguishable from walls at a glance.
-  void _drawFloorAndVisited(Canvas canvas, Offset origin) {
+  void _drawFloorAndVisited(Canvas canvas, Offset origin,
+      int cxMin, int cxMax, int czMin, int czMax) {
     final g = grid;
     if (g == null || gridW == 0) return;
     final cp = scale;
@@ -1123,8 +1147,8 @@ class _MapPainter extends CustomPainter {
     final pFloor   = Paint()..color = _T.mapFloor;
     final pVisited = Paint()..color = _T.mapVisited;
 
-    for (int cz = 0; cz < gridH; cz++) {
-      for (int cx = 0; cx < gridW; cx++) {
+    for (int cz = czMin; cz <= czMax; cz++) {
+      for (int cx = cxMin; cx <= cxMax; cx++) {
         final idx = cz * gridW + cx;
         if (idx >= g.length) continue;
         final v = g[idx];
@@ -1141,31 +1165,29 @@ class _MapPainter extends CustomPainter {
   /// KEY CHANGE: walls are now visually dominant (dark/black) drawn AFTER
   /// floor so they clearly delineate room boundaries. Cell size = full scale
   /// with no gap, so adjacent wall cells form solid continuous lines.
-  void _drawWalls(Canvas canvas, Offset origin) {
+  void _drawWalls(Canvas canvas, Offset origin,
+      int cxMin, int cxMax, int czMin, int czMax) {
     final g = grid;
     if (g == null || gridW == 0) return;
     final cp = scale;
 
-    // Wall paint: solid near-black. No anti-aliasing — sharp edges.
     final pWall = Paint()
       ..color = _T.mapWall
       ..style = PaintingStyle.fill;
 
-    // At low zoom, use a slightly lighter shade so thin walls are still visible
     final pWallThin = Paint()
       ..color = const Color(0xFF444444)
       ..style = PaintingStyle.fill;
 
     final useLight = scale < 12;
 
-    for (int cz = 0; cz < gridH; cz++) {
-      for (int cx = 0; cx < gridW; cx++) {
+    for (int cz = czMin; cz <= czMax; cz++) {
+      for (int cx = cxMin; cx <= cxMax; cx++) {
         final idx = cz * gridW + cx;
         if (idx >= g.length) continue;
         if (g[idx] != cellWall) continue;
         final sx = origin.dx + cx * cp;
         final sz = origin.dy + cz * cp;
-        // Draw wall cell at full cell size — no gap between adjacent walls
         canvas.drawRect(Rect.fromLTWH(sx, sz, cp, cp),
             useLight ? pWallThin : pWall);
       }
@@ -1173,14 +1195,15 @@ class _MapPainter extends CustomPainter {
   }
 
   /// Draw obstacle footprints (object bounding boxes) as muted brown.
-  void _drawObstacles(Canvas canvas, Offset origin) {
+  void _drawObstacles(Canvas canvas, Offset origin,
+      int cxMin, int cxMax, int czMin, int czMax) {
     final g = grid;
     if (g == null || gridW == 0) return;
     final cp = scale;
     final pObs = Paint()..color = _T.mapObstacle.withOpacity(0.5);
 
-    for (int cz = 0; cz < gridH; cz++) {
-      for (int cx = 0; cx < gridW; cx++) {
+    for (int cz = czMin; cz <= czMax; cz++) {
+      for (int cx = cxMin; cx <= cxMax; cx++) {
         final idx = cz * gridW + cx;
         if (idx >= g.length) continue;
         if (g[idx] != cellObstacle) continue;
@@ -1205,8 +1228,7 @@ class _MapPainter extends CustomPainter {
 
   void _drawBfsPath(Canvas canvas, Offset origin) {
     if (pathCells.isEmpty || gridW == 0) return;
-    final opacity = 0.30 + 0.15 * math.sin(pulse * math.pi * 2);
-    final paint = Paint()..color = _T.mapPath.withOpacity(opacity);
+    final paint = Paint()..color = _T.mapPath.withOpacity(0.40);
     final cp = scale;
     for (final id in pathCells) {
       final cx = id % gridW; final cz = id ~/ gridW;
@@ -1236,7 +1258,7 @@ class _MapPainter extends CustomPainter {
 
       // Colour ring — thicker when selected
       if (isSelected) {
-        canvas.drawCircle(pos, 13 + 2 * math.sin(pulse * math.pi * 2),
+        canvas.drawCircle(pos, 15,
             Paint()
               ..color = col.withOpacity(0.35)
               ..style = PaintingStyle.stroke
@@ -1264,8 +1286,8 @@ class _MapPainter extends CustomPainter {
     final rz = origin.dy + robotGZ * scale + scale / 2;
     final pos = Offset(rx, rz);
 
-    // Accuracy ring (pulsing)
-    final r = 20.0 + 4 * math.sin(pulse * math.pi * 2);
+    // Accuracy ring (static — no pulse animation to save GPU)
+    final r = scanning ? 22.0 : 20.0;
     canvas.drawCircle(pos, r, Paint()..color = _T.mapRobot.withOpacity(0.08));
     canvas.drawCircle(pos, r,
         Paint()
@@ -1381,7 +1403,7 @@ class _MapPainter extends CustomPainter {
           navPathCells != o.navPathCells ||
           robotGX != o.robotGX || robotGZ != o.robotGZ ||
           heading != o.heading || scale != o.scale ||
-          pan != o.pan || pulse != o.pulse || selectedObj != o.selectedObj;
+          pan != o.pan || scanning != o.scanning || selectedObj != o.selectedObj;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
