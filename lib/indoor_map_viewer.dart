@@ -155,6 +155,7 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
   int robotGX = 0, robotGZ = 0;
   List<MapObject> objects = [];
   double posX = 0, posZ = 0, heading = 0;
+  double compassBearing = 0;   // true-north bearing in degrees from device sensors
   int totalObjects = 0;
   bool scanning = false;
   String? _lastSavedMap;
@@ -230,8 +231,8 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
       ),
       FocusableElement(
         id: 'position_info',
-        label: 'Current position: ${posX.toStringAsFixed(1)} by ${posZ.toStringAsFixed(1)} meters. Area mapped: ${_areaSqM.toStringAsFixed(1)} square meters.',
-        hint: 'Your current location in the scanned space',
+        label: 'Current position: ${posX.toStringAsFixed(1)} by ${posZ.toStringAsFixed(1)} meters. Facing ${_compassDirection()}. Area mapped: ${_areaSqM.toStringAsFixed(1)} square meters.',
+        hint: 'Your current location and compass direction',
         type: FocusableElementType.header,
       ),
     ];
@@ -315,10 +316,11 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
         case 'onUpdate':
           final a = call.arguments as Map;
           setState(() {
-            posX         = (a['position_x'] as num?)?.toDouble() ?? posX;
-            posZ         = (a['position_z'] as num?)?.toDouble() ?? posZ;
-            heading      = (a['heading']    as num?)?.toDouble() ?? heading;
-            totalObjects = (a['total_objects'] as num?)?.toInt() ?? totalObjects;
+            posX            = (a['position_x']      as num?)?.toDouble() ?? posX;
+            posZ            = (a['position_z']      as num?)?.toDouble() ?? posZ;
+            heading         = (a['heading']         as num?)?.toDouble() ?? heading;
+            compassBearing  = (a['compass_bearing'] as num?)?.toDouble() ?? compassBearing;
+            totalObjects    = (a['total_objects']    as num?)?.toInt()    ?? totalObjects;
             if (!scanning) {
               scanning = true;
               _pulseCtrl.repeat();
@@ -537,6 +539,20 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
 
   double get _areaSqM => _cachedAreaSqM;
 
+  String _compassDirection() {
+    if (compassBearing == 0 && !scanning) return 'unknown';
+    final d = (compassBearing.round() % 360 + 360) % 360;
+    if (d < 23)  return 'North';
+    if (d < 68)  return 'Northeast';
+    if (d < 113) return 'East';
+    if (d < 158) return 'Southeast';
+    if (d < 203) return 'South';
+    if (d < 248) return 'Southwest';
+    if (d < 293) return 'West';
+    if (d < 338) return 'Northwest';
+    return 'North';
+  }
+
   // ─────────────────────────────────────────────────────────────────────────
   @override
   Widget build(BuildContext context) {
@@ -725,6 +741,7 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
                   navPathCells: _navPathCells,
                   selectedObj: _selObj,
                   robotGX: robotGX, robotGZ: robotGZ, heading: heading,
+                  compassBearing: compassBearing,
                   scale: scale, pan: pan,
                   scanning: scanning,
                 ),
@@ -1070,7 +1087,7 @@ class _MapPainter extends CustomPainter {
   final Set<int> navPathCells;
   final int? selectedObj;
   final int robotGX, robotGZ;
-  final double heading, scale;
+  final double heading, compassBearing, scale;
   final bool scanning;
   final Offset pan;
 
@@ -1080,7 +1097,8 @@ class _MapPainter extends CustomPainter {
     required this.pathCells, required this.navPathCells,
     required this.selectedObj,
     required this.robotGX, required this.robotGZ,
-    required this.heading, required this.scale, required this.pan,
+    required this.heading, required this.compassBearing,
+    required this.scale, required this.pan,
     required this.scanning,
   });
 
@@ -1322,31 +1340,49 @@ class _MapPainter extends CustomPainter {
   /// The compass rotates based on the user's heading so that N always
   /// points toward the ARCore world -Z direction (the initial forward).
   void _drawCompass(Canvas canvas, Size size) {
-    final cx = size.width - 48;
-    final cy = size.height - 48;
+    final cx = size.width - 52;
+    final cy = size.height - 58;
     final center = Offset(cx, cy);
-    const radius = 30.0;
+    const radius = 32.0;
 
     // Background circle
-    canvas.drawCircle(center, radius + 4,
-        Paint()..color = const Color(0xFFF8F8FC).withOpacity(0.92));
-    canvas.drawCircle(center, radius + 4,
+    canvas.drawCircle(center, radius + 5,
+        Paint()..color = const Color(0xFFF8F8FC).withOpacity(0.94));
+    canvas.drawCircle(center, radius + 5,
         Paint()
           ..color = const Color(0xFFD1D5DB)
           ..style = PaintingStyle.stroke
           ..strokeWidth = 1);
 
-    // Rotate so N points toward ARCore -Z (initial forward direction).
-    // The heading value is the user's yaw from ARCore. When heading=0,
-    // user faces -Z (north in map space). We negate so the compass rose
-    // rotates opposite to the user's heading — N stays fixed.
+    // Use true-north bearing from device sensors when available,
+    // fall back to ARCore heading if compass data hasn't arrived yet.
+    // compassBearing is in degrees (0=N, 90=E); convert to radians
+    // and negate so the needle rotates to point north.
+    final useCompass = compassBearing != 0;
+    final rotAngle = useCompass
+        ? -compassBearing * math.pi / 180.0
+        : -heading;
+
     canvas.save();
     canvas.translate(cx, cy);
-    canvas.rotate(-heading);
+    canvas.rotate(rotAngle);
+
+    // Tick marks every 45 degrees
+    for (int i = 0; i < 8; i++) {
+      canvas.save();
+      canvas.rotate(i * math.pi / 4);
+      final len = i % 2 == 0 ? 5.0 : 3.0;
+      canvas.drawLine(
+        Offset(0, -radius + 1),
+        Offset(0, -radius + 1 + len),
+        Paint()..color = const Color(0xFFD1D5DB)..strokeWidth = 1,
+      );
+      canvas.restore();
+    }
 
     // North needle (red)
     final northPath = Path()
-      ..moveTo(0, -radius + 4)
+      ..moveTo(0, -radius + 5)
       ..lineTo(-6, 4)
       ..lineTo(0, -2)
       ..lineTo(6, 4)
@@ -1355,7 +1391,7 @@ class _MapPainter extends CustomPainter {
 
     // South needle (gray)
     final southPath = Path()
-      ..moveTo(0, radius - 4)
+      ..moveTo(0, radius - 5)
       ..lineTo(-6, -4)
       ..lineTo(0, 2)
       ..lineTo(6, -4)
@@ -1363,15 +1399,46 @@ class _MapPainter extends CustomPainter {
     canvas.drawPath(southPath, Paint()..color = const Color(0xFF9CA3AF));
 
     // Direction labels
-    _compassLabel(canvas, 'N', Offset(0, -radius + 10), const Color(0xFFDC2626));
-    _compassLabel(canvas, 'S', Offset(0, radius - 10), const Color(0xFF6B7280));
-    _compassLabel(canvas, 'E', Offset(radius - 10, 0), const Color(0xFF6B7280));
-    _compassLabel(canvas, 'W', Offset(-radius + 10, 0), const Color(0xFF6B7280));
+    _compassLabel(canvas, 'N', Offset(0, -radius + 12), const Color(0xFFDC2626));
+    _compassLabel(canvas, 'S', Offset(0, radius - 12), const Color(0xFF6B7280));
+    _compassLabel(canvas, 'E', Offset(radius - 11, 0), const Color(0xFF6B7280));
+    _compassLabel(canvas, 'W', Offset(-radius + 11, 0), const Color(0xFF6B7280));
 
     canvas.restore();
 
     // Center dot
     canvas.drawCircle(center, 3, Paint()..color = const Color(0xFF374151));
+
+    // Bearing text below compass
+    if (useCompass) {
+      final deg = compassBearing.round() % 360;
+      final dir = _cardinalName(deg);
+      final text = '$deg° $dir';
+      final tp = TextPainter(
+        text: TextSpan(
+          text: text,
+          style: const TextStyle(
+            color: Color(0xFF374151), fontSize: 9,
+            fontWeight: FontWeight.w600,
+          ),
+        ),
+        textDirection: TextDirection.ltr,
+      )..layout();
+      tp.paint(canvas, Offset(cx - tp.width / 2, cy + radius + 10));
+    }
+  }
+
+  static String _cardinalName(int deg) {
+    final d = ((deg % 360) + 360) % 360;
+    if (d < 23)  return 'N';
+    if (d < 68)  return 'NE';
+    if (d < 113) return 'E';
+    if (d < 158) return 'SE';
+    if (d < 203) return 'S';
+    if (d < 248) return 'SW';
+    if (d < 293) return 'W';
+    if (d < 338) return 'NW';
+    return 'N';
   }
 
   void _compassLabel(Canvas canvas, String label, Offset pos, Color color) {
@@ -1402,7 +1469,8 @@ class _MapPainter extends CustomPainter {
       grid != o.grid || objects != o.objects || pathCells != o.pathCells ||
           navPathCells != o.navPathCells ||
           robotGX != o.robotGX || robotGZ != o.robotGZ ||
-          heading != o.heading || scale != o.scale ||
+          heading != o.heading || compassBearing != o.compassBearing ||
+          scale != o.scale ||
           pan != o.pan || scanning != o.scanning || selectedObj != o.selectedObj;
 }
 

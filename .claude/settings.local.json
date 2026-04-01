@@ -21,7 +21,9 @@
       "Bash(wc -l \"/Users/omvarma/Desktop/ketan/Major-Project/android/app/src/main/kotlin/com/ketan/slam\"/*.kt)",
       "Bash(wc -l \"/Users/omvarma/Desktop/ketan/Major-Project/lib\"/*.dart)",
       "Read(//Users/omvarma/flutter/bin/**)",
-      "Read(//usr/local/bin/**)"
+      "Read(//usr/local/bin/**)",
+      "Bash(/Users/omvarma/.pyenv/versions/3.7.17/bin/python3:*)",
+      "Bash(ls /Users/omvarma/Desktop/ketan/Major-Project/android/app/src/main/kotlin/com/ketan/slam/*.kt)"
     ]
   }
 }

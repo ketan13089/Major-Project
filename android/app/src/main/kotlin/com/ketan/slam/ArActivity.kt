@@ -84,6 +84,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     private lateinit var overlayView: DetectionOverlayView
     private lateinit var navView: TextView
     private lateinit var micButton: TextView
+    private lateinit var compassView: CompassView
 
     // ── ARCore ────────────────────────────────────────────────────────────────
     private var session: Session? = null
@@ -330,6 +331,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         try { session?.resume() } catch (e: CameraNotAvailableException) { session = null; return }
         surfaceView.onResume()
         displayRotationHelper?.onResume()
+        compassView.start()
         if (sessionStartMs == 0L) sessionStartMs = System.currentTimeMillis()
     }
 
@@ -337,6 +339,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         super.onPause()
         surfaceView.onPause()
         displayRotationHelper?.onPause()
+        compassView.stop()
         session?.pause()
         overlayView.clearDetections()
         teardownCamera()
@@ -447,6 +450,13 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             importantForAccessibility = android.view.View.IMPORTANT_FOR_ACCESSIBILITY_YES
         }
 
+        // Compass view — real-time true-north bearing via device sensors
+        val compassSize = (100 * dp).toInt()
+        compassView = CompassView(this).apply {
+            contentDescription = "Compass showing current direction"
+            importantForAccessibility = android.view.View.IMPORTANT_FOR_ACCESSIBILITY_YES
+        }
+
         // Mark camera views as not important for TalkBack (decorative/live content)
         surfaceView.importantForAccessibility = android.view.View.IMPORTANT_FOR_ACCESSIBILITY_NO
         overlayView.importantForAccessibility = android.view.View.IMPORTANT_FOR_ACCESSIBILITY_NO
@@ -458,6 +468,11 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT,
             Gravity.TOP or Gravity.START).apply {
             setMargins((16 * dp).toInt(), (48 * dp).toInt(), (16 * dp).toInt(), 0)
+        })
+        root.addView(compassView, FrameLayout.LayoutParams(
+            compassSize, compassSize + (16 * dp).toInt(),
+            Gravity.TOP or Gravity.END).apply {
+            setMargins(0, (44 * dp).toInt(), (12 * dp).toInt(), 0)
         })
         root.addView(navView, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT,
@@ -1449,6 +1464,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             appendLine("Cells total=$gridSize")
             appendLine("Objects confirmed=${sem.totalObjects}")
             appendLine("KFs=${observationStore.size()} drift=${"%.3f".format(cachedDrift)}m")
+            appendLine("Compass ${compassView.bearingDegrees.roundToInt()}°")
             appendLine("YOLO ${lastInferenceMs}ms  OCR ${lastOcrInferenceMs}ms")
             val textObjs = semanticMap.getAllObjects().count { it.textContent != null }
             append("Text landmarks: $textObjs")
@@ -1504,6 +1520,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             ch.invokeMethod("onUpdate", mapOf(
                 "position_x" to s.currentPosition.x, "position_y" to s.currentPosition.y,
                 "position_z" to s.currentPosition.z, "heading"    to heading,
+                "compass_bearing" to compassView.bearingDegrees.toDouble(),
                 "edges_count" to s.edgeCount,         "cells_count" to s.cellCount,
                 "total_objects" to sem.totalObjects,
                 "chairs"             to (sem.objectCounts[ObjectType.CHAIR]             ?: 0),
