@@ -22,21 +22,46 @@ class _PerformanceDashboardState extends State<PerformanceDashboard> {
     super.initState();
     _arChannel.setMethodCallHandler(_handleMethod);
     _fetchMetrics();
+    // Retry periodically if no data yet
+    Future.delayed(const Duration(seconds: 2), () {
+      if (mounted && _metrics.isEmpty && _errorMessage == null) {
+        _fetchMetrics();
+      }
+    });
   }
 
   Future<void> _handleMethod(MethodCall call) async {
     if (call.method == 'perfUpdate' && _isLive) {
-      setState(() => _metrics = Map<String, dynamic>.from(call.arguments));
+      setState(() {
+        _metrics = Map<String, dynamic>.from(call.arguments);
+        _errorMessage = null;  // Clear error on successful update
+      });
     }
   }
+
+  String? _errorMessage;
 
   Future<void> _fetchMetrics() async {
     try {
       final result = await _mapChannel.invokeMethod('getPerformanceMetrics');
       if (result != null && mounted) {
-        setState(() => _metrics = Map<String, dynamic>.from(result));
+        setState(() {
+          _metrics = Map<String, dynamic>.from(result);
+          _errorMessage = null;
+        });
+      } else if (mounted && _metrics.isEmpty) {
+        // No result but also no exception - session might be starting
+        setState(() {
+          _errorMessage = null;  // Keep showing loading spinner
+        });
       }
-    } catch (_) {}
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _errorMessage = 'AR session not active. Start a scan to collect metrics.';
+        });
+      }
+    }
   }
 
   Future<void> _exportReport() async {
@@ -99,7 +124,24 @@ class _PerformanceDashboardState extends State<PerformanceDashboard> {
           ),
         ],
       ),
-      body: _metrics.isEmpty
+      body: _errorMessage != null
+          ? Center(child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(Icons.info_outline, color: textSec, size: 48),
+                const SizedBox(height: 16),
+                Text(_errorMessage!,
+                    style: TextStyle(color: textSec),
+                    textAlign: TextAlign.center),
+                const SizedBox(height: 24),
+                ElevatedButton.icon(
+                  onPressed: _fetchMetrics,
+                  icon: const Icon(Icons.refresh),
+                  label: const Text('Retry'),
+                ),
+              ],
+            ))
+          : _metrics.isEmpty
           ? Center(child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [

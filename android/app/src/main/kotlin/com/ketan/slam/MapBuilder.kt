@@ -245,9 +245,51 @@ class MapBuilder(val res: Float) {
             evictDistantCells(userGX, userGZ)
         }
 
-        // Phase 3: Consistency enforcement + derive output grid
+        // Phase 3: Infer walls at floor boundaries
+        inferWallsAtFloorEdges()
+
+        // Phase 4: Consistency enforcement + derive output grid
         enforceConsistency()
         deriveGrid()
+    }
+
+    /**
+     * Infer walls where floor cells meet unknown cells.
+     * This helps detect white walls that ARCore can't track.
+     * For each FREE cell, if it has unknown neighbors, mark those as potential walls.
+     */
+    private fun inferWallsAtFloorEdges() {
+        val toMarkWall = mutableListOf<GridCell>()
+        
+        for ((cell, lo) in logOdds) {
+            // Only process free (floor) cells with decent confidence
+            if (lo > -0.5f) continue  // not a confident floor cell
+            
+            // Check 4-connected neighbors
+            val neighbors = listOf(
+                GridCell(cell.x + 1, cell.z),
+                GridCell(cell.x - 1, cell.z),
+                GridCell(cell.x, cell.z + 1),
+                GridCell(cell.x, cell.z - 1)
+            )
+            
+            for (neighbor in neighbors) {
+                val neighborLo = logOdds[neighbor]
+                // If neighbor is unknown (not in map or very low confidence)
+                if (neighborLo == null || (neighborLo > -0.3f && neighborLo < 0.3f)) {
+                    // This unknown cell next to floor is likely a wall
+                    toMarkWall.add(neighbor)
+                }
+            }
+        }
+        
+        // Mark inferred wall cells (with moderate evidence)
+        for (cell in toMarkWall.take(50)) {  // Limit per rebuild to avoid overmarking
+            val currentLo = logOdds[cell] ?: 0f
+            if (currentLo < LO_THRESH_OCC) {  // Don't overwrite confirmed walls
+                updateLogOdds(cell.x, cell.z, L_OCCUPIED * 0.5f, wallHint = true)
+            }
+        }
     }
 
     /**
@@ -417,6 +459,46 @@ class MapBuilder(val res: Float) {
         val gx = worldToGrid(wx)
         val gz = worldToGrid(wz)
         updateLogOdds(gx, gz, L_OCCUPIED * 0.6f, wallHint = true)
+    }
+
+    /**
+     * Mark a cell as a white/featureless wall with stronger evidence.
+     * Called when we have high confidence based on floor-hit + miss pattern:
+     * floor is visible but ARCore can't track the wall above it.
+     */
+    fun markWhiteWall(wx: Float, wz: Float) {
+        val gx = worldToGrid(wx)
+        val gz = worldToGrid(wz)
+        // Higher confidence than inferred wall (0.85 vs 0.6 multiplier)
+        updateLogOdds(gx, gz, L_OCCUPIED * 0.85f, wallHint = true)
+        // Track for AR overlay rendering
+        synchronized(recentInferredWalls) {
+            recentInferredWalls.add(wx to wz)
+            // Keep only the most recent 100 inferred wall positions
+            while (recentInferredWalls.size > 100) {
+                recentInferredWalls.removeAt(0)
+            }
+        }
+    }
+
+    /** Recent inferred wall positions for AR overlay rendering */
+    private val recentInferredWalls = mutableListOf<Pair<Float, Float>>()
+
+    /**
+     * Get recently inferred wall positions (for AR overlay rendering).
+     * Returns up to 50 positions for performance reasons.
+     */
+    fun getRecentInferredWalls(): List<Pair<Float, Float>> {
+        synchronized(recentInferredWalls) {
+            return recentInferredWalls.takeLast(50).toList()
+        }
+    }
+
+    /** Clear old inferred wall positions (call periodically) */
+    fun clearOldInferredWalls() {
+        synchronized(recentInferredWalls) {
+            recentInferredWalls.clear()
+        }
     }
 
     // ── Private integration ────────────────────────────────────────────────────

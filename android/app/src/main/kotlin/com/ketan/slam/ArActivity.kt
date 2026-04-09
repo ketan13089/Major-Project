@@ -932,9 +932,9 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
      *
      * Height rules (relative to camera Y, assuming ~1.5m camera height):
      *   relY < -1.2m  → floor level  → mark as free
-     *   -0.5m ≤ relY ≤ 0.6m → true wall level (close to camera height) → mark as wall
-     *   -1.2m ≤ relY < -0.5m → furniture/obstacle level → mark as obstacle (not wall)
-     *   relY > 0.6m   → ceiling/shelf → ignore
+     *   -0.8m ≤ relY ≤ 1.0m → wall level (expanded range for white walls) → mark as wall
+     *   -1.2m ≤ relY < -0.8m → furniture/obstacle level → mark as obstacle (not wall)
+     *   relY > 1.0m   → ceiling/shelf → ignore
      *
      * This separation ensures:
      *   - Beds, tables (low) → obstacle (brown), not wall (dark)
@@ -944,7 +944,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     private fun extractWallsFromDepth(frame: Frame, camera: Camera) {
         if (camera.trackingState != TrackingState.TRACKING) return
         val cameraY = camera.pose.ty()
-        val cols = 8; val rows = 6
+        val cols = 10; val rows = 8  // Increased grid density for better wall coverage
         val stepX = surfaceWidth  / cols.toFloat()
         val stepY = surfaceHeight / rows.toFloat()
 
@@ -956,6 +956,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         val lastFloorPerCol = arrayOfNulls<ColHit>(cols) // deepest floor hit per col
         val wallHitsPerCol  = IntArray(cols)
         val totalHitsPerCol = IntArray(cols)
+        val missesPerCol    = IntArray(cols)  // Track misses for white wall detection
 
         // Collect wall hit screen positions for Strategy 4 (adaptive density)
         val wallHitScreenPts = mutableListOf<Pair<Float, Float>>()
@@ -973,7 +974,13 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
                         (t is Plane && t.trackingState == TrackingState.TRACKING) ||
                                 t is com.google.ar.core.DepthPoint ||
                                 t is com.google.ar.core.InstantPlacementPoint
-                    } ?: continue
+                    }
+                    
+                    if (hit == null) {
+                        // No hit at this position — possible white wall (featureless)
+                        missesPerCol[col]++
+                        continue
+                    }
 
                     totalSuccesses++
                     val hp  = hit.hitPose
@@ -992,12 +999,13 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
                                 lastFloorPerCol[col] = ColHit(hx, hz, row)
                             }
                         }
-                        isVerticalPlane || relY in -0.5f..0.6f -> {
+                        // Expanded wall detection range: -0.8m to 1.0m (was -0.5m to 0.6m)
+                        isVerticalPlane || relY in -0.8f..1.0f -> {
                             mapBuilder.markHitOccupied(hx, hz)
                             wallHitsPerCol[col]++
                             wallHitScreenPts.add(sx to sy)
                         }
-                        relY in -1.2f..-0.5f ->
+                        relY in -1.2f..-0.8f ->
                             mapBuilder.markHitObstacle(hx, hz)
                     }
                 } catch (_: Exception) {}
@@ -1020,10 +1028,63 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             if (wallHitsPerCol[col] > 0) continue  // column already has explicit wall
             if (totalHitsPerCol[col] < 1) continue
             // Floor hit exists but upper rows had no hits → likely wall above
-            // Mark 1 cell step beyond the floor hit along forward direction
-            val wallX = floor.wx + fnx * 0.25f  // 25cm beyond floor hit
-            val wallZ = floor.wz + fnz * 0.25f
-            mapBuilder.markInferredWall(wallX, wallZ)
+            // Mark multiple cells along forward direction to build wall line
+            for (step in 1..3) {
+                val wallX = floor.wx + fnx * (0.20f * step)
+                val wallZ = floor.wz + fnz * (0.20f * step)
+                mapBuilder.markInferredWall(wallX, wallZ)
+            }
+        }
+
+        // ── Strategy 5: White wall detection from miss patterns ──────────────
+        // If a column has floor hits but many misses in upper rows (and no wall hits),
+        // this strongly indicates a featureless white wall. Mark it more aggressively.
+        for (col in 0 until cols) {
+            val floor = lastFloorPerCol[col] ?: continue
+            val misses = missesPerCol[col]
+            val walls = wallHitsPerCol[col]
+            
+            // High miss rate + floor visible + no explicit walls = white wall
+            if (misses >= 3 && walls == 0 && totalHitsPerCol[col] >= 1) {
+                // Strong evidence of white wall — mark multiple cells
+                for (step in 1..4) {
+                    val wallX = floor.wx + fnx * (0.15f * step)
+                    val wallZ = floor.wz + fnz * (0.15f * step)
+                    mapBuilder.markWhiteWall(wallX, wallZ)
+                }
+            }
+        }
+
+        // ── Strategy 6: Full-miss white wall inference ───────────────────────
+        // When looking DIRECTLY at a white wall, we get almost no hits at all
+        // (no floor visible, no depth returns). If miss rate is very high,
+        // infer a wall directly in front of the camera.
+        val totalMisses = missesPerCol.sum()
+        val missRatio = if (totalAttempts > 0) totalMisses.toFloat() / totalAttempts else 0f
+        
+        if (missRatio > 0.50f && totalSuccesses < 15) {
+            // Very high miss rate — likely staring at a white wall
+            // Place wall cells in front of camera at estimated distances
+            val camX = pose.tx()
+            val camZ = pose.tz()
+            
+            // Place walls at 0.5m to 2.5m in front, across the field of view
+            val distances = floatArrayOf(0.6f, 1.0f, 1.5f, 2.0f, 2.5f)
+            val angles = floatArrayOf(-0.4f, -0.2f, 0f, 0.2f, 0.4f) // radians offset from forward
+            
+            for (dist in distances) {
+                for (angleOffset in angles) {
+                    // Rotate forward vector by angle offset
+                    val cos = kotlin.math.cos(angleOffset)
+                    val sin = kotlin.math.sin(angleOffset)
+                    val rotFwdX = fnx * cos - fnz * sin
+                    val rotFwdZ = fnx * sin + fnz * cos
+                    
+                    val wallX = camX + rotFwdX * dist
+                    val wallZ = camZ + rotFwdZ * dist
+                    mapBuilder.markWhiteWall(wallX, wallZ)
+                }
+            }
         }
 
         // ── Strategy 4: Adaptive density near wall hits ──────────────────
@@ -1052,7 +1113,8 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
                         if (hit.distance > 4.0f) continue
                         val relY = hp.ty() - cameraY
                         val isVert = (hit.trackable as? Plane)?.type == Plane.Type.VERTICAL
-                        if (isVert || relY in -0.5f..0.6f) {
+                        // Expanded range to match main detection (-0.8f to 1.0f)
+                        if (isVert || relY in -0.8f..1.0f) {
                             mapBuilder.markHitOccupied(hp.tx(), hp.tz())
                             extraHits++
                         }
@@ -1223,16 +1285,18 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         val leftKnownRatio = leftKnown.toFloat() / leftTotal
         val rightKnownRatio = rightKnown.toFloat() / rightTotal
 
-        if (leftUnkRatio > 0.70f && rightKnownRatio > 0.50f) {
+        // Lowered thresholds: >50% unknown (was 70%) and >30% known (was 50%)
+        // This makes wall inference more aggressive for white walls
+        if (leftUnkRatio > 0.50f && rightKnownRatio > 0.30f) {
             // Left side is likely a white wall
             for ((wx, wz) in inferredCells.take(inferredCells.size / 2)) {
-                mapBuilder.markInferredWall(wx, wz)
+                mapBuilder.markWhiteWall(wx, wz)  // Use stronger evidence
             }
         }
-        if (rightUnkRatio > 0.70f && leftKnownRatio > 0.50f) {
+        if (rightUnkRatio > 0.50f && leftKnownRatio > 0.30f) {
             // Right side is likely a white wall
             for ((wx, wz) in inferredCells.drop(inferredCells.size / 2)) {
-                mapBuilder.markInferredWall(wx, wz)
+                mapBuilder.markWhiteWall(wx, wz)  // Use stronger evidence
             }
         }
     }
@@ -1254,6 +1318,18 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             if (plane.subsumedBy != null) continue
             val type = meshRenderer.classifyPlane(plane, camera.pose)
             meshRenderer.drawPlane(plane, type, projMatrix, viewMatrix)
+        }
+
+        // Draw inferred walls (white/featureless walls detected by miss patterns)
+        val inferredWalls = mapBuilder.getRecentInferredWalls()
+        if (inferredWalls.isNotEmpty()) {
+            meshRenderer.drawInferredWalls(
+                inferredWalls,
+                camera.pose.ty(),
+                mapBuilder.res,
+                projMatrix,
+                viewMatrix
+            )
         }
 
         // Draw ground-plane footprints under confirmed YOLO objects

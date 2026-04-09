@@ -144,25 +144,43 @@ class YoloDetector(context: Context) {
     ): ByteBuffer {
         val buf = inputBuffer
         buf.clear()
-        val rotW = srcHeight
-        val padX = (INPUT_SIZE - rotW) / 2
+        val rotW = srcHeight  // After 90° rotation: width becomes height (480)
+        val padX = (INPUT_SIZE - rotW) / 2  // Horizontal padding: (640-480)/2 = 80px each side
+        
         for (py in 0 until INPUT_SIZE) {
             for (px in 0 until INPUT_SIZE) {
                 val rotX = px - padX
-                if (rotX < 0 || rotX >= rotW) { buf.putFloat(0f); buf.putFloat(0f); buf.putFloat(0f); continue }
-                val srcX  = (srcWidth - 1 - py).coerceIn(0, srcWidth - 1)
-                val srcY  = rotX.coerceIn(0, srcWidth - 1)
-                val yVal  = yBytes[srcY * yRowStride + srcX].toInt() and 0xFF
+                // Skip padding zones (left and right black bars)
+                if (rotX < 0 || rotX >= rotW) { 
+                    buf.putFloat(0f); buf.putFloat(0f); buf.putFloat(0f)
+                    continue 
+                }
+                
+                // 90° clockwise rotation: output(px,py) ← input(srcX,srcY)
+                // Formula: srcX = srcWidth - 1 - py, srcY = rotX
+                val srcX = (srcWidth - 1 - py).coerceIn(0, srcWidth - 1)
+                val srcY = rotX.coerceIn(0, srcHeight - 1)  // FIX: was srcWidth - 1
+                
+                // Read Y (luminance) - full resolution
+                val yIdx = srcY * yRowStride + srcX
+                val yVal = if (yIdx < yBytes.size) yBytes[yIdx].toInt() and 0xFF else 128
+                
+                // Read U,V (chrominance) - half resolution, shared by 2×2 pixel blocks
                 val uvIdx = (srcY / 2) * uvRowStride + (srcX / 2) * uvPixStride
-                val uVal  = uBytes[uvIdx].toInt() and 0xFF
-                val vVal  = vBytes[uvIdx].toInt() and 0xFF
-                val yS = yVal - 16; val uS = uVal - 128; val vS = vVal - 128
+                val uVal = if (uvIdx < uBytes.size) uBytes[uvIdx].toInt() and 0xFF else 128
+                val vVal = if (uvIdx < vBytes.size) vBytes[uvIdx].toInt() and 0xFF else 128
+                
+                // YUV to RGB conversion (BT.601 standard)
+                val yS = yVal - 16
+                val uS = uVal - 128
+                val vS = vVal - 128
                 buf.putFloat((1.164f * yS + 1.596f * vS).toInt().coerceIn(0, 255) / 255f)
                 buf.putFloat((1.164f * yS - 0.392f * uS - 0.813f * vS).toInt().coerceIn(0, 255) / 255f)
                 buf.putFloat((1.164f * yS + 2.017f * uS).toInt().coerceIn(0, 255) / 255f)
             }
         }
-        buf.rewind(); return buf
+        buf.rewind()
+        return buf
     }
 
     private fun parseChannelsFirst(output: Array<FloatArray>, n: Int): List<Detection> {

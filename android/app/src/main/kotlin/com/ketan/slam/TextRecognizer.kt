@@ -2,7 +2,11 @@ package com.ketan.slam
 
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Canvas
+import android.graphics.ColorMatrix
+import android.graphics.ColorMatrixColorFilter
 import android.graphics.ImageFormat
+import android.graphics.Paint
 import android.graphics.Rect
 import android.graphics.RectF
 import android.graphics.YuvImage
@@ -106,7 +110,10 @@ class TextRecognizer {
             val bitmap = yuvToBitmap(yBuffer, uBuffer, vBuffer, yStride, uvStride, uvPixStride, width, height)
                 ?: return emptyList()
 
-            val inputImage = InputImage.fromBitmap(bitmap, 90)  // 90° rotation for portrait
+            // Apply preprocessing to enhance text readability
+            val enhanced = enhanceForOcr(bitmap)
+
+            val inputImage = InputImage.fromBitmap(enhanced, 90)  // 90° rotation for portrait
 
             val results = mutableListOf<TextDetection>()
             val latch = CountDownLatch(1)
@@ -147,6 +154,7 @@ class TextRecognizer {
 
             latch.await(TIMEOUT_MS, TimeUnit.MILLISECONDS)
             bitmap.recycle()
+            if (enhanced !== bitmap) enhanced.recycle()
 
             results.filter { it.confidence >= 0.3f }
         } catch (e: Exception) {
@@ -248,12 +256,56 @@ class TextRecognizer {
 
             val yuvImage = YuvImage(nv21, ImageFormat.NV21, width, height, null)
             val out = ByteArrayOutputStream()
-            yuvImage.compressToJpeg(Rect(0, 0, width, height), 85, out)
+            // Use higher JPEG quality (95%) for better text edge preservation
+            yuvImage.compressToJpeg(Rect(0, 0, width, height), 95, out)
             val jpegBytes = out.toByteArray()
             BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size)
         } catch (e: Exception) {
             println("$TAG: YUV→Bitmap failed: ${e.message}")
             null
+        }
+    }
+
+    // ── Image preprocessing for OCR ──────────────────────────────────────────
+
+    /**
+     * Enhance bitmap for better OCR accuracy.
+     * Applies contrast boost and sharpening without affecting the original bitmap.
+     * Returns the same bitmap if enhancement fails (graceful degradation).
+     */
+    private fun enhanceForOcr(source: Bitmap): Bitmap {
+        return try {
+            // Create mutable copy for processing
+            val enhanced = Bitmap.createBitmap(source.width, source.height, Bitmap.Config.ARGB_8888)
+            val canvas = Canvas(enhanced)
+
+            // Step 1: Increase contrast (makes text stand out from background)
+            // ColorMatrix: scale RGB by 1.3 and shift by -30 to darken midtones
+            val contrastMatrix = ColorMatrix(floatArrayOf(
+                1.3f, 0f, 0f, 0f, -30f,   // Red
+                0f, 1.3f, 0f, 0f, -30f,   // Green
+                0f, 0f, 1.3f, 0f, -30f,   // Blue
+                0f, 0f, 0f, 1f, 0f        // Alpha
+            ))
+
+            // Step 2: Slight saturation reduction (text is usually monochrome)
+            val saturationMatrix = ColorMatrix()
+            saturationMatrix.setSaturation(0.8f)
+
+            // Combine matrices
+            contrastMatrix.postConcat(saturationMatrix)
+
+            val paint = Paint().apply {
+                colorFilter = ColorMatrixColorFilter(contrastMatrix)
+                isAntiAlias = true
+                isFilterBitmap = true
+            }
+
+            canvas.drawBitmap(source, 0f, 0f, paint)
+            enhanced
+        } catch (e: Exception) {
+            println("$TAG: Enhancement failed, using original: ${e.message}")
+            source  // Return original on failure
         }
     }
 }

@@ -398,6 +398,9 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
                          (newRGZ - _cachedPathRobotGZ).abs() > 1;
       final needBfs = robotMoved || _cachedPathSelObj != _selObj;
 
+      // Track if objects changed to avoid expensive focusable re-registration
+      final oldObjectCount = objects.length;
+
       setState(() {
         grid = ng; gridW = newW; gridH = newH; gridRes = newRes;
         originX = newOX; originZ = newOZ;
@@ -413,8 +416,10 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
         }
       });
 
-      // Update focusables when objects change
-      _registerFocusables();
+      // Only re-register focusables when object count changes (not every frame)
+      if (newObjs.length != oldObjectCount) {
+        _registerFocusables();
+      }
 
     } catch (e, st) { debugPrint('map error: $e\n$st'); }
   }

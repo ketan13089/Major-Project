@@ -204,6 +204,57 @@ class MeshRenderer {
         drawMesh(quadBuffer, 6, GLES20.GL_TRIANGLES, SurfaceType.OBJECT)
     }
 
+    /**
+     * Draw vertical wall indicators for inferred wall cells.
+     * Creates small vertical quads at each wall cell position to visualize
+     * detected white/featureless walls that ARCore doesn't track as planes.
+     * Draws an X-shaped cross of two quads so it's visible from any angle.
+     * 
+     * @param wallCells list of (worldX, worldZ) positions where walls were inferred
+     * @param cameraY   camera height (for calculating wall quad placement)
+     * @param cellSize  map cell resolution in metres
+     */
+    fun drawInferredWalls(
+        wallCells: List<Pair<Float, Float>>,
+        cameraY: Float,
+        cellSize: Float,
+        projMatrix: FloatArray,
+        viewMatrix: FloatArray
+    ) {
+        if (program == 0 || wallCells.isEmpty()) return
+        
+        Matrix.multiplyMM(mvpMatrix, 0, projMatrix, 0, viewMatrix, 0)
+        
+        // Draw each wall cell as two perpendicular vertical quads (X-shape)
+        val halfCell = cellSize * 0.7f  // Slightly larger for visibility
+        val wallBottom = cameraY - 1.3f  // approximate floor
+        val wallTop = cameraY + 0.5f     // slightly above camera
+        
+        for ((wx, wz) in wallCells.take(40)) {  // Limit for performance
+            // Quad 1: aligned to X axis (faces Z direction)
+            quadBuffer.clear()
+            quadBuffer.put(wx - halfCell); quadBuffer.put(wallBottom); quadBuffer.put(wz)
+            quadBuffer.put(wx + halfCell); quadBuffer.put(wallBottom); quadBuffer.put(wz)
+            quadBuffer.put(wx + halfCell); quadBuffer.put(wallTop); quadBuffer.put(wz)
+            quadBuffer.put(wx - halfCell); quadBuffer.put(wallBottom); quadBuffer.put(wz)
+            quadBuffer.put(wx + halfCell); quadBuffer.put(wallTop); quadBuffer.put(wz)
+            quadBuffer.put(wx - halfCell); quadBuffer.put(wallTop); quadBuffer.put(wz)
+            quadBuffer.flip()
+            drawMesh(quadBuffer, 6, GLES20.GL_TRIANGLES, SurfaceType.WALL)
+            
+            // Quad 2: aligned to Z axis (faces X direction)
+            quadBuffer.clear()
+            quadBuffer.put(wx); quadBuffer.put(wallBottom); quadBuffer.put(wz - halfCell)
+            quadBuffer.put(wx); quadBuffer.put(wallBottom); quadBuffer.put(wz + halfCell)
+            quadBuffer.put(wx); quadBuffer.put(wallTop); quadBuffer.put(wz + halfCell)
+            quadBuffer.put(wx); quadBuffer.put(wallBottom); quadBuffer.put(wz - halfCell)
+            quadBuffer.put(wx); quadBuffer.put(wallTop); quadBuffer.put(wz + halfCell)
+            quadBuffer.put(wx); quadBuffer.put(wallTop); quadBuffer.put(wz - halfCell)
+            quadBuffer.flip()
+            drawMesh(quadBuffer, 6, GLES20.GL_TRIANGLES, SurfaceType.WALL)
+        }
+    }
+
     // ── Core draw ─────────────────────────────────────────────────────────────
 
     private fun drawMesh(
