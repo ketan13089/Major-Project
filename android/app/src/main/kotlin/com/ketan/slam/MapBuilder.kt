@@ -145,6 +145,10 @@ class MapBuilder(val res: Float) {
      *  NOT reset on rebuild; provides a cumulative measure of mapping confidence. */
     private val observationCounts = ConcurrentHashMap<GridCell, Int>()
 
+    /** Cells identified as door openings by AI semantic priors.
+     *  These cells are treated as walkable by PathPlanner during inflation. */
+    val doorCells = HashSet<GridCell>()
+
     /** Bounding box of all known cells. */
     @Volatile var minGX = 0; @Volatile var maxGX = 0
     @Volatile var minGZ = 0; @Volatile var maxGZ = 0
@@ -385,6 +389,114 @@ class MapBuilder(val res: Float) {
             updateLogOdds(ogx + dx, ogz + dz, L_OCCUPIED, wallHint = false)
     }
 
+    /**
+     * Mark an obstacle footprint only if the object's affordance requires it.
+     * PASS_THROUGH and LANDMARK_ONLY objects skip stamping entirely.
+     * WALL_ATTACHED objects stamp only 1 cell (the wall attachment point).
+     */
+    fun markAffordanceAwareFootprint(wp: Point3D, halfMetres: Float, affordance: ObjectAffordance) {
+        when (affordance) {
+            ObjectAffordance.FLOOR_OBSTACLE -> markObstacleFootprint(wp, halfMetres)
+            ObjectAffordance.WALL_ATTACHED -> {
+                // Stamp only the single cell where the object attaches to the wall
+                val gx = worldToGrid(wp.x)
+                val gz = worldToGrid(wp.z)
+                updateLogOdds(gx, gz, L_OCCUPIED, wallHint = true)
+            }
+            ObjectAffordance.PASS_THROUGH,
+            ObjectAffordance.LANDMARK_ONLY -> { /* no footprint */ }
+        }
+    }
+
+    // ── Semantic prior methods (AI correction fusion) ───────────────────────
+
+    /**
+     * Nudge a cell toward FREE. AI floor prior — gentler than hard overwrite.
+     * delta = FLOOR_BASE_DELTA * confidence, clamped to [L_MIN, L_MAX].
+     */
+    fun applySemanticFloorPrior(gridX: Int, gridZ: Int, confidence: Float) {
+        val delta = SemanticCorrectionConfig.FLOOR_BASE_DELTA * confidence.coerceIn(0f, 1f)
+        val cell = GridCell(gridX, gridZ)
+        val cur = logOdds.getOrDefault(cell, 0f)
+        val updated = (cur + delta).coerceIn(L_MIN, L_MAX)
+        logOdds[cell] = updated
+        grid[cell] = when {
+            updated >= LO_THRESH_OCC  -> if (wallCells.contains(cell)) CELL_WALL.toByte() else CELL_OBSTACLE.toByte()
+            updated <= LO_THRESH_FREE -> CELL_FREE.toByte()
+            else                      -> CELL_UNKNOWN.toByte()
+        }
+        trackBounds(gridX, gridZ)
+    }
+
+    /**
+     * Nudge a cell toward WALL. AI wall prior — bounded, adds wallHint.
+     * delta = WALL_BASE_DELTA * confidence, clamped to L_MAX.
+     */
+    fun applySemanticWallPrior(gridX: Int, gridZ: Int, confidence: Float) {
+        val delta = SemanticCorrectionConfig.WALL_BASE_DELTA * confidence.coerceIn(0f, 1f)
+        val cell = GridCell(gridX, gridZ)
+        val cur = logOdds.getOrDefault(cell, 0f)
+        val updated = (cur + delta).coerceIn(L_MIN, L_MAX)
+        logOdds[cell] = updated
+        wallCells.add(cell)
+        grid[cell] = when {
+            updated >= LO_THRESH_OCC  -> CELL_WALL.toByte()
+            updated <= LO_THRESH_FREE -> CELL_FREE.toByte()
+            else                      -> CELL_UNKNOWN.toByte()
+        }
+        trackBounds(gridX, gridZ)
+    }
+
+    /**
+     * Create a passable opening in a wall band at the given center/orientation.
+     * Only clears wall evidence if the cell's current log-odds < DOOR_WALL_LO_THRESHOLD
+     * to prevent punching through confidently detected walls.
+     */
+    fun applySemanticDoorPrior(
+        centerX: Int, centerZ: Int,
+        orientationDeg: Float, widthCells: Int, confidence: Float
+    ) {
+        val halfWidth = widthCells / 2
+        val radians = Math.toRadians(orientationDeg.toDouble())
+        val dirX = kotlin.math.cos(radians).toFloat()
+        val dirZ = kotlin.math.sin(radians).toFloat()
+
+        for (i in -halfWidth..halfWidth) {
+            val gx = centerX + (i * dirX).roundToInt()
+            val gz = centerZ + (i * dirZ).roundToInt()
+            val cell = GridCell(gx, gz)
+            val cur = logOdds.getOrDefault(cell, 0f)
+
+            // Don't punch through confidently detected walls on first try
+            if (cur >= SemanticCorrectionConfig.DOOR_WALL_LO_THRESHOLD) continue
+
+            val delta = SemanticCorrectionConfig.DOOR_BASE_DELTA * confidence.coerceIn(0f, 1f)
+            val updated = (cur + delta).coerceIn(L_MIN, L_MAX)
+            logOdds[cell] = updated
+            wallCells.remove(cell)
+            doorCells.add(cell)
+            grid[cell] = when {
+                updated >= LO_THRESH_OCC  -> CELL_OBSTACLE.toByte()
+                updated <= LO_THRESH_FREE -> CELL_FREE.toByte()
+                else                      -> CELL_UNKNOWN.toByte()
+            }
+            trackBounds(gx, gz)
+        }
+    }
+
+    /**
+     * Batch apply semantic cell updates.
+     */
+    fun applySemanticPatch(updates: List<SemanticCellUpdate>) {
+        for (u in updates) {
+            when (u.cellClass) {
+                CellClass.FLOOR   -> applySemanticFloorPrior(u.gridX, u.gridZ, u.confidence)
+                CellClass.WALL    -> applySemanticWallPrior(u.gridX, u.gridZ, u.confidence)
+                else -> { /* OBSTACLE and UNKNOWN handled by existing pipeline */ }
+            }
+        }
+    }
+
     /** Clear an obstacle footprint (object removed or position corrected). */
     fun clearObstacleFootprint(wp: Point3D, halfMetres: Float) {
         val halfCells = (halfMetres / res).roundToInt().coerceAtLeast(1)
@@ -523,7 +635,11 @@ class MapBuilder(val res: Float) {
         }
 
         for (plane in kf.planes) integratePlane(plane)
-        for (sighting in kf.objectSightings) markObstacleFootprint(sighting.worldPosition, sighting.footprintHalfMetres)
+        for (sighting in kf.objectSightings) {
+            val objType = ObjectType.fromLabel(sighting.label)
+            val affordance = ObjectAffordance.forType(objType)
+            markAffordanceAwareFootprint(sighting.worldPosition, sighting.footprintHalfMetres, affordance)
+        }
     }
 
     // ── Consistency enforcement ────────────────────────────────────────────────

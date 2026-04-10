@@ -1,0 +1,206 @@
+You are a senior Android/Kotlin + SLAM engineer. Implement end-to-end code changes in this repository to integrate OpenRouter Gemma (`google/gemma-4-31b-it:free`) as a semantic correction layer for BOTH map building and object detection, without harming current behavior.
+
+## Primary Goal
+Add a robust "semantic corrector" that uses Gemma to improve:
+1) occupancy map realism (floor/wall/door/opening structure),
+2) object detection quality (confirm/relabel/suppress/add semantic objects),
+while preserving current SLAM pipeline as authoritative and fail-safe.
+
+## Priority Tiers
+This is a large feature. Implement in this order — each tier must be fully working before starting the next:
+
+**P0 — Fix current bug + feature gating (do first):**
+- Affordance-aware object stamping (fixes the obstacle over-stamping bug for doors/windows/signs)
+- Feature flag + NoOp wiring so app compiles and works identically with AI off
+
+**P1 — Semantic correction engine + MapBuilder priors:**
+- API client, prompt builder, response parser
+- MapBuilder semantic prior methods with concrete fusion math
+- Integration in ArActivity on background executor
+
+**P2 — Polish:**
+- Persistence versioning with backward compat
+- PathPlanner adjustments for door openings
+- Full test suite
+
+## Critical Safety Requirement
+Current app behavior must remain unchanged when AI is disabled or unavailable.
+- Feature flag OFF by default.
+- Non-blocking: no network call on GL thread or rendering thread.
+- If API fails/timeouts/rate-limits, silently fall back to current local pipeline.
+- Never let AI overwrite geometry with hard resets. AI corrections are fused as bounded priors only.
+
+## Repository Context (important)
+This project already has:
+- `ArActivity.kt`: ARCore loop, depth-hit wall extraction, YOLO + OCR pipeline, object merge/add, map rebuild scheduling. Uses Java `Executors` and `AtomicBoolean` for threading.
+- `MapBuilder.kt`: log-odds occupancy map (`ConcurrentHashMap<GridCell, Float>` for log-odds, `ConcurrentHashMap<GridCell, Byte>` for output). Cell types: UNKNOWN=0, FREE=1, OBSTACLE=2, WALL=3, VISITED=4. Log-odds params: `L_FREE=-0.3f`, `L_OCCUPIED=0.9f`, `L_MIN=-4.0f`, `L_MAX=3.5f`. Thresholds: `LO_THRESH_FREE=-0.6f`, `LO_THRESH_OCC=1.2f`.
+- `SemanticObject.kt`: object model with types (CHAIR, DOOR, FIRE_EXTINGUISHER, LIFT_GATE, NOTICE_BOARD, TRASH_CAN, WATER_PURIFIER, WINDOW + OCR classes like EXIT_SIGN, WASHROOM_SIGN, etc.)
+- `PathPlanner.kt`: A* with 2-cell obstacle inflation. Treats FREE/VISITED as walkable; OBSTACLE/WALL blocked.
+- `MapPersistence.kt`: save/load map, objects, wall cells.
+- `SemanticMapManager.kt`: spatial grid + merge/stale logic with `ConcurrentHashMap`.
+
+**Current bug to fix:** Object footprints are broadly stamped as obstacles for ALL types. This blocks corridors for pass-through objects (doors) and wall-attached objects (windows, signs). Only floor-standing objects should stamp obstacle footprints.
+
+## What to Build
+
+### 1) Affordance-aware object stamping [P0]
+Add an `ObjectAffordance` enum to classify how each object type affects the occupancy grid:
+- `PASS_THROUGH` — DOOR, LIFT_GATE: Do NOT stamp as obstacle. Doors should create passable openings.
+- `WALL_ATTACHED` — WINDOW, NOTICE_BOARD, EXIT_SIGN, WASHROOM_SIGN, WARNING_SIGN, FACILITY_SIGN: Stamp only the wall cell the object is attached to, not corridor space.
+- `FLOOR_OBSTACLE` — CHAIR, TRASH_CAN, WATER_PURIFIER, FIRE_EXTINGUISHER: Keep current behavior, stamp obstacle footprint.
+- `LANDMARK_ONLY` — ROOM_LABEL, TEXT_SIGN, STAIRS_SIGN: No collision footprint at all, map marker only.
+
+Wire this into the existing footprint stamping logic in `ArActivity.kt` (wherever objects mark occupancy cells).
+
+### 2) Config + feature gating [P0]
+Add runtime config flags (companion object constants or similar, matching existing style):
+- `AI_SEMANTIC_CORRECTOR_ENABLED: Boolean = false`
+- `AI_SEMANTIC_INTERVAL_MS: Long = 3000`
+- `AI_SEMANTIC_TIMEOUT_MS: Long = 2000`
+- `AI_ENDPOINT_URL: String` (read from BuildConfig or properties file — do NOT hardcode API keys)
+
+Create a `SemanticCorrectorClient` interface with a `NoOpSemanticCorrectorClient` implementation. Wire so the app compiles and runs identically with AI off. The real implementation is only instantiated when the flag is enabled AND a valid endpoint is configured.
+
+### 3) Semantic correction module [P1]
+Create clean, testable Kotlin classes. You decide the file/class decomposition — keep it minimal (2-4 files max, not 5+). The module must:
+
+**Build a text prompt** from:
+- Current map crop: serialize the occupancy grid in a ~15×15 cell window around the user as a compact text grid (e.g., `.` for free, `#` for wall, `O` for obstacle, `?` for unknown, `V` for visited).
+- Recent detections: list of `{type, confidence, gridX, gridZ, affordance}` from SemanticMapManager.
+- Pose/context: user gridX, gridZ, heading.
+- NOTE: Gemma 4 31B IT on OpenRouter is a **text-only** model. Do NOT send images/base64. Build a structured text representation of the scene.
+
+**Call OpenRouter API:**
+- POST to `https://openrouter.ai/api/v1/chat/completions` with model `google/gemma-4-31b-it:free`.
+- Use `java.net.HttpURLConnection` (matching existing codebase style — no OkHttp/Retrofit dependency unless already present).
+- Timeout: `AI_SEMANTIC_TIMEOUT_MS`.
+- Circuit breaker: after 3 consecutive failures, disable API calls for 30 seconds, then retry once. If that fails, back off for 60s. Reset failure count on any success.
+
+**Parse strict JSON response** to typed models (see schema below).
+
+**Fuse corrections** into map/object state using bounded updates (see fusion rules below).
+
+### 4) Extend `MapBuilder.kt` with semantic prior methods [P1]
+Add these methods (names can vary):
+
+```
+applySemanticFloorPrior(gridX: Int, gridZ: Int, confidence: Float)
+applySemanticWallPrior(gridX: Int, gridZ: Int, confidence: Float)
+applySemanticDoorPrior(centerX: Int, centerZ: Int, orientationDeg: Float, widthCells: Int, confidence: Float)
+applySemanticPatch(updates: List<SemanticCellUpdate>)  // batch API
+```
+
+**Concrete fusion rules (log-odds math):**
+- AI confidence [0.0–1.0] maps to delta magnitude: `delta = baseDelta * confidence`
+- **Floor prior:** `baseDelta = -0.4f` (compare to existing `L_FREE = -0.3f`). Applied as: `logOdds[cell] = (logOdds[cell] + delta).coerceIn(L_MIN, L_MAX)`. This nudges toward FREE without hard-forcing.
+- **Wall prior:** `baseDelta = +0.6f` (compare to existing `L_OCCUPIED = 0.9f`). Also set `wallHint = true` for the cell. Clamped to `L_MAX`.
+- **Door prior:** For each cell in the doorway band (`widthCells` centered at `center`, along `orientation`):
+  - Apply floor prior with `baseDelta = -0.8f` (stronger than regular floor, to clear wall evidence).
+  - Remove from `wallCells` set.
+  - BUT only if the cell's current log-odds is < `2.0f` (don't punch through confidently detected walls on first try).
+
+**Temporal consistency (hysteresis):**
+- Maintain a `ConcurrentHashMap<GridCell, Int>` confirmation counter for AI-suggested structural changes (doors, wall removal).
+- Increment counter each time the same cell gets the same AI suggestion. Decrement by 1 every 10 seconds (decay).
+- **Thresholds:** Apply floor/wall prior at half strength when counter = 1. Apply at full strength when counter >= 3. Apply door prior (wall clearing) only when counter >= 3 (i.e., 3 consecutive correction cycles = ~9 seconds of consistent AI agreement).
+- This prevents a single noisy AI response from punching holes in walls.
+
+### 5) Integrate in `ArActivity.kt` [P1]
+- Use a **single-thread `ExecutorService`** (matching existing `rebuildExecutor` pattern) for semantic correction.
+- Throttle: only submit a new correction task if `AI_SEMANTIC_INTERVAL_MS` has elapsed since the last submission AND no correction is currently in-flight (`AtomicBoolean` guard).
+- Skip submission if ARCore tracking state is not TRACKING (don't waste API calls on lost tracking).
+- Snapshot current state (grid crop, objects, pose) on the calling thread (fast copy), then do API call + parsing on the executor thread.
+- Apply corrections back: synchronize with MapBuilder/SemanticMapManager using their existing concurrent data structures. Trigger a map rebuild via existing `rebuildFlag` mechanism after applying corrections.
+
+### 6) Gemma prompt + response contract [P1]
+**System prompt** (send as system message):
+```
+You are an indoor map analysis assistant. Given an occupancy grid snippet and detected objects from a SLAM system, suggest corrections to improve map realism. Respond ONLY with valid JSON matching the schema below. No explanations.
+```
+
+**Response JSON schema:**
+```json
+{
+  "cell_updates": [
+    {"gridX": 0, "gridZ": 0, "class": "FLOOR|WALL|OBSTACLE|UNKNOWN", "confidence": 0.0}
+  ],
+  "doorways": [
+    {"centerX": 0, "centerZ": 0, "orientationDeg": 0.0, "widthCells": 3, "confidence": 0.0}
+  ],
+  "object_updates": [
+    {"id": "string_or_null", "action": "CONFIRM|RELABEL|SUPPRESS|ADD", "label": "DOOR", "confidence": 0.0, "gridX": 0, "gridZ": 0, "affordance": "PASS_THROUGH|WALL_ATTACHED|FLOOR_OBSTACLE|LANDMARK_ONLY"}
+  ],
+  "global_confidence": 0.0
+}
+```
+
+**Parser robustness rules:**
+- Reject entire response if JSON is malformed (try/catch, log warning, return empty).
+- Reject entire response if `global_confidence < 0.3`.
+- Ignore individual `cell_updates` with `confidence < 0.4`.
+- Ignore individual `object_updates` with `confidence < 0.5`.
+- Clamp all grid coordinates to current map bounds.
+- Ignore unknown `class`/`label`/`action`/`affordance` values (skip the entry, don't crash).
+- Limit: process at most 50 `cell_updates`, 5 `doorways`, 10 `object_updates` per response (prevent runaway).
+
+### 7) Persistence updates [P2]
+Update `MapPersistence.kt` to optionally persist:
+- `ObjectAffordance` for each saved semantic object.
+- Source metadata: `local` vs `ai_corrected` flag per object.
+
+**Backward compatibility:** When loading old format (missing these fields), default to `FLOOR_OBSTACLE` affordance and `local` source. Bump format version; old app versions skip unknown fields gracefully.
+
+### 8) Navigation compatibility [P2]
+- In `PathPlanner.kt`: cells marked as door openings (via door prior with counter >= 3) should be treated as walkable (FREE) even if they still have residual obstacle log-odds, ONLY during inflation calculation. Add a `doorCells: Set<GridCell>` parameter or similar.
+- Do NOT create shortcuts through obstacle regions — only allow passage through explicitly identified doorways.
+
+## Performance & Reliability Constraints
+- No extra allocations in per-frame hot path. All AI work is on the dedicated executor.
+- Semantic correction cadence: `AI_SEMANTIC_INTERVAL_MS` (3000ms default) + in-flight guard.
+- Circuit breaker pattern (described above) prevents API spam on failures.
+- Skip corrections when tracking is lost or unstable.
+- Deduplicate: if the grid crop + objects haven't changed significantly since last correction (>80% identical cells), skip the API call.
+
+## Testing Requirements
+Add/update unit tests (at minimum):
+
+1) **Map semantic prior fusion tests** in `MapBuilderTest`:
+   - Wall prior with confidence=0.8 increases log-odds by `0.6 * 0.8 = 0.48`, clamped to L_MAX.
+   - Floor prior with confidence=0.9 decreases log-odds by `0.4 * 0.9 = 0.36`, clamped to L_MIN.
+   - Door prior with counter < 3 does NOT clear wall cells.
+   - Door prior with counter >= 3 clears wall cells and sets log-odds below free threshold.
+
+2) **Object affordance tests:**
+   - DOOR type has `PASS_THROUGH` affordance and is NOT stamped as obstacle.
+   - WINDOW type has `WALL_ATTACHED` affordance.
+   - CHAIR type has `FLOOR_OBSTACLE` affordance and IS stamped as obstacle.
+   - ROOM_LABEL has `LANDMARK_ONLY` and no footprint.
+
+3) **Semantic correction parser tests:**
+   - Malformed JSON returns empty result (no crash).
+   - `global_confidence < 0.3` returns empty result.
+   - Low-confidence individual entries are filtered out.
+   - Valid response is correctly parsed to typed models.
+   - Excess entries beyond limits are truncated.
+
+4) **Regression test:**
+   - With `AI_SEMANTIC_CORRECTOR_ENABLED = false`, no API calls are made, no executor is created, baseline map/object behavior is identical.
+
+5) **Circuit breaker test:**
+   - After 3 failures, API calls are suppressed for 30s.
+   - Success resets failure counter.
+
+Run existing test suite and ensure build passes.
+
+## Implementation Style
+- This is a significant feature, not a surgical patch. Plan accordingly, but keep each class focused.
+- **Threading: use Java `Executors` and `AtomicBoolean`** — this is the existing pattern. Do NOT introduce Kotlin coroutines unless the codebase already uses them.
+- Reuse existing concurrent data structures (`ConcurrentHashMap`, etc.).
+- No broad `catch(Exception)` blocks. Catch specific exceptions; log at debug level without crashing.
+- Short comments only at key integration points.
+
+## Deliverables
+1) Working code changes across relevant Kotlin files.
+2) Short summary of what changed and why.
+3) List of files modified.
+4) Confirmation of behavior with AI off vs AI on.

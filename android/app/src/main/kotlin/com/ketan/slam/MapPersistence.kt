@@ -32,7 +32,7 @@ class MapPersistence(private val context: Context) {
     companion object {
         private const val TAG = "MapPersistence"
         private const val MAP_DIR = "saved_maps"
-        private const val FORMAT_VERSION = 1
+        private const val FORMAT_VERSION = 2
     }
 
     private fun mapsDir(): File {
@@ -158,7 +158,7 @@ class MapPersistence(private val context: Context) {
 
             val json = JSONObject(file.readText())
             val version = json.optInt("version", 0)
-            if (version != FORMAT_VERSION) {
+            if (version < 1 || version > FORMAT_VERSION) {
                 Log.w(TAG, "Unsupported map version: $version")
                 return null
             }
@@ -284,6 +284,9 @@ class MapPersistence(private val context: Context) {
         obj.textContent?.let { j.put("textContent", it) }
         obj.roomNumber?.let { j.put("roomNumber", it) }
         obj.localizationMethod?.let { j.put("locMethod", it) }
+        // v2 fields: affordance + source
+        j.put("affordance", ObjectAffordance.forType(obj.type).name)
+        j.put("source", if (obj.localizationMethod == "ai_semantic") "ai_corrected" else "local")
         return j
     }
 

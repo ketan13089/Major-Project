@@ -62,11 +62,12 @@ class PathPlanner(private val res: Float) {
         startGX: Int, startGZ: Int,
         goalGX: Int, goalGZ: Int,
         semanticObjects: List<SemanticObject> = emptyList(),
-        observationCounts: Map<GridCell, Int>? = null
+        observationCounts: Map<GridCell, Int>? = null,
+        doorCells: Set<GridCell> = emptySet()
     ): List<NavWaypoint> {
         if (grid.isEmpty()) return emptyList()
 
-        val blocked = inflateObstacles(grid)
+        val blocked = inflateObstacles(grid, doorCells)
 
         fun isWalkable(x: Int, z: Int): Boolean {
             if (blocked.contains(GridCell(x, z))) return false
@@ -300,11 +301,13 @@ class PathPlanner(private val res: Float) {
         return true
     }
 
-    private fun inflateObstacles(grid: Map<GridCell, Byte>): Set<GridCell> {
+    private fun inflateObstacles(grid: Map<GridCell, Byte>, doorCells: Set<GridCell> = emptySet()): Set<GridCell> {
         val blocked = HashSet<GridCell>()
         for ((cell, type) in grid) {
             val t = type.toInt()
             if (t == 2 || t == 3) {  // CELL_OBSTACLE or CELL_WALL
+                // Skip inflation for door cells — they are confirmed passable
+                if (cell in doorCells) continue
                 for (dz in -INFLATE..INFLATE)
                     for (dx in -INFLATE..INFLATE)
                         blocked.add(GridCell(cell.x + dx, cell.z + dz))

@@ -1,8 +1,15 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("kotlin-android")
     id("dev.flutter.flutter-gradle-plugin")
 }
+
+// Read API key from local.properties (never commit the actual key)
+val localProps = Properties()
+rootProject.file("local.properties").takeIf { it.exists() }
+    ?.inputStream()?.use { localProps.load(it) }
 
 android {
     namespace = "com.ketan.slam"
@@ -15,7 +22,12 @@ android {
     }
 
     kotlinOptions {
+        @Suppress("DEPRECATION")
         jvmTarget = "1.8"
+    }
+
+    buildFeatures {
+        buildConfig = true
     }
 
     defaultConfig {
@@ -24,6 +36,11 @@ android {
         targetSdk = 34
         versionCode = 1
         versionName = "1.0"
+
+        buildConfigField(
+            "String", "OPENROUTER_API_KEY",
+            "\"${localProps.getProperty("openrouter.api.key", "")}\""
+        )
     }
 
     buildTypes {

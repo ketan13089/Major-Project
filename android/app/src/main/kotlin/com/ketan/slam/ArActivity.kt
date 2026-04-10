@@ -165,6 +165,9 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     @Volatile private var cachedDrift = 0f
     private var lastDriftCheckMs = 0L
 
+    // ── Semantic AI Correction ─────────────────────────────────────────────────
+    private var semanticCorrectionEngine: SemanticCorrectionEngine? = null
+
     // ── Navigation ────────────────────────────────────────────────────────────
     private var navigationManager: NavigationManager? = null
 
@@ -266,10 +269,24 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         semanticMap = SemanticMapManager()
         mapPersistence = MapPersistence(this)
 
-        // Wire up stale-object cleanup → footprint clearing
+        // Wire up stale-object cleanup → footprint clearing (only for obstacle types)
         semanticMap.onObjectRemoved = { obj ->
-            val halfM = ObjectLocalizer.footprintHalfMetres(obj.category)
-            mapBuilder.clearObstacleFootprint(obj.position, halfM)
+            val affordance = ObjectAffordance.forType(obj.type)
+            if (affordance == ObjectAffordance.FLOOR_OBSTACLE) {
+                val halfM = ObjectLocalizer.footprintHalfMetres(obj.category)
+                mapBuilder.clearObstacleFootprint(obj.position, halfM)
+            }
+        }
+
+        // Initialize semantic AI corrector — key comes from BuildConfig (set in local.properties)
+        SemanticCorrectionConfig.apiKey = BuildConfig.OPENROUTER_API_KEY
+        if (SemanticCorrectionConfig.apiKey.isNotBlank() &&
+            SemanticCorrectionConfig.apiKey != "PASTE_YOUR_OPENROUTER_KEY_HERE") {
+            SemanticCorrectionConfig.AI_SEMANTIC_CORRECTOR_ENABLED = true
+            semanticCorrectionEngine = SemanticCorrectionEngine(mapBuilder, semanticMap, RES)
+            println("$TAG: Semantic AI corrector initialized")
+        } else {
+            println("$TAG: Semantic AI corrector disabled (no API key in local.properties)")
         }
 
         navigationManager = NavigationManager(
@@ -382,6 +399,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         announcer?.shutdown(); announcer = null
         navigationManager?.destroy(); navigationManager = null
         poseTracker.destroy()
+        semanticCorrectionEngine?.shutdown()
         detectionExecutor.shutdownNow()
         rebuildExecutor.shutdownNow()
         teardownCamera()
@@ -621,7 +639,9 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
                                     if (smoothed != null) {
                                         mergeOrAdd(det, smoothed, locResult.method)
                                         val halfM = ObjectLocalizer.footprintHalfMetres(det.label)
-                                        mapBuilder.markObstacleFootprint(smoothed, halfM)
+                                        val objType = ObjectType.fromLabel(det.label)
+                                        val affordance = ObjectAffordance.forType(objType)
+                                        mapBuilder.markAffordanceAwareFootprint(smoothed, halfM, affordance)
                                     }
                                 }
                             }
@@ -884,6 +904,13 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
                     }
                 }
             }
+
+            // --- Semantic AI correction (throttled, non-blocking) ---
+            semanticCorrectionEngine?.maybeSubmitCorrection(
+                mapBuilder.worldToGrid(cx),
+                mapBuilder.worldToGrid(cz),
+                latestHeading
+            )
 
             // Stale object removal — every 5s, not every frame
             if (now - lastStaleCheckMs >= 5000L) {
