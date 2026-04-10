@@ -350,10 +350,11 @@ class SemanticCorrectionTest {
     @Test
     fun `SemanticCorrectionConfig defaults are correct`() {
         assertFalse("AI off by default", SemanticCorrectionConfig.AI_SEMANTIC_CORRECTOR_ENABLED)
-        assertEquals(3000L, SemanticCorrectionConfig.AI_SEMANTIC_INTERVAL_MS)
-        assertEquals(2000, SemanticCorrectionConfig.AI_SEMANTIC_TIMEOUT_MS)
+        assertEquals(8000L, SemanticCorrectionConfig.AI_SEMANTIC_INTERVAL_MS)
+        assertEquals(15_000, SemanticCorrectionConfig.AI_SEMANTIC_TIMEOUT_MS)
+        assertEquals(4, SemanticCorrectionConfig.MAX_RETRIES)
         assertEquals(3, SemanticCorrectionConfig.CIRCUIT_BREAKER_THRESHOLD)
-        assertEquals(30_000L, SemanticCorrectionConfig.CIRCUIT_BREAKER_BACKOFF_MS)
+        assertEquals(45_000L, SemanticCorrectionConfig.CIRCUIT_BREAKER_BACKOFF_MS)
         assertEquals(0.3f, SemanticCorrectionConfig.MIN_GLOBAL_CONFIDENCE, 0.001f)
         assertEquals(0.4f, SemanticCorrectionConfig.MIN_CELL_CONFIDENCE, 0.001f)
         assertEquals(0.5f, SemanticCorrectionConfig.MIN_OBJECT_CONFIDENCE, 0.001f)

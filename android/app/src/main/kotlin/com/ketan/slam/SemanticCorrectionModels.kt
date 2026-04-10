@@ -65,10 +65,10 @@ object SemanticCorrectionConfig {
     @Volatile var AI_SEMANTIC_CORRECTOR_ENABLED = false
 
     /** Minimum interval between correction API calls. */
-    const val AI_SEMANTIC_INTERVAL_MS = 3000L
+    const val AI_SEMANTIC_INTERVAL_MS = 8000L
 
     /** HTTP timeout for API calls. */
-    const val AI_SEMANTIC_TIMEOUT_MS = 2000
+    const val AI_SEMANTIC_TIMEOUT_MS = 15_000
 
     /** OpenRouter endpoint. */
     const val AI_ENDPOINT_URL = "https://openrouter.ai/api/v1/chat/completions"
@@ -76,10 +76,15 @@ object SemanticCorrectionConfig {
     /** Model identifier. */
     const val AI_MODEL = "google/gemma-4-31b-it:free"
 
-    // Circuit breaker
+    // Retry policy
+    const val MAX_RETRIES = 4
+    const val RETRY_BASE_DELAY_MS = 5_000L
+    const val RETRY_MAX_DELAY_MS = 60_000L
+
+    // Circuit breaker — only trips after all retries exhausted on repeated calls
     const val CIRCUIT_BREAKER_THRESHOLD = 3
-    const val CIRCUIT_BREAKER_BACKOFF_MS = 30_000L
-    const val CIRCUIT_BREAKER_EXTENDED_BACKOFF_MS = 60_000L
+    const val CIRCUIT_BREAKER_BACKOFF_MS = 45_000L
+    const val CIRCUIT_BREAKER_EXTENDED_BACKOFF_MS = 90_000L
 
     // Confidence thresholds
     const val MIN_GLOBAL_CONFIDENCE = 0.3f
