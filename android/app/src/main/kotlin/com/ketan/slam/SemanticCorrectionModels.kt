@@ -74,7 +74,7 @@ object SemanticCorrectionConfig {
     const val AI_ENDPOINT_URL = "https://openrouter.ai/api/v1/chat/completions"
 
     /** Model identifier. */
-    const val AI_MODEL = "google/gemma-4-31b-it:free"
+    const val AI_MODEL = "qwen/qwen3-next-80b-a3b-instruct:free"
 
     // Retry policy
     const val MAX_RETRIES = 4

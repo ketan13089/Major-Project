@@ -1650,14 +1650,15 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     }
 
     private fun buildMapPayload(curPos: Point3D): Map<String, Any> {
-        val localGrid = HashMap(mapBuilder.grid)
+        val localGrid = mapBuilder.grid
         if (localGrid.isEmpty()) return mapOf(
             "occupancyGrid" to ByteArray(0), "gridWidth" to 0, "gridHeight" to 0,
             "gridResolution" to RES.toDouble(), "objects" to emptyList<Any>()
         )
 
-        val gMinX = localGrid.keys.minOf { it.x }; val gMaxX = localGrid.keys.maxOf { it.x }
-        val gMinZ = localGrid.keys.minOf { it.z }; val gMaxZ = localGrid.keys.maxOf { it.z }
+        // Use cached bounds from MapBuilder instead of iterating all keys
+        val gMinX = mapBuilder.minGX; val gMaxX = mapBuilder.maxGX
+        val gMinZ = mapBuilder.minGZ; val gMaxZ = mapBuilder.maxGZ
         val w = gMaxX - gMinX + 1; val h = gMaxZ - gMinZ + 1
 
         val bytes = ByteArray(w * h)

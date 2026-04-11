@@ -155,6 +155,16 @@ class MapBuilder(val res: Float) {
 
     private val observedThisRebuild = HashSet<GridCell>()
 
+    /** Counter for lightRebuild — used to throttle expensive passes. */
+    private var lightRebuildCount = 0
+
+    // ── Lookup helper (avoids repeated GridCell allocation in hot loops) ──────
+
+    /** Read log-odds by (x, z) without allocating if the cell exists in the
+     *  iteration set. Falls back to a short-lived GridCell for misses. */
+    private fun loAt(x: Int, z: Int): Float =
+        logOdds.getOrDefault(GridCell(x, z), 0f)
+
     // ── Full Rebuild ───────────────────────────────────────────────────────────
 
     /**
@@ -215,9 +225,13 @@ class MapBuilder(val res: Float) {
      */
     @Synchronized
     fun lightRebuild(userGX: Int, userGZ: Int) {
-        // Phase 1: Decay all cells, collect zeroed-out ones for removal
+        lightRebuildCount++
+
+        // Phase 1: Decay + derive in a SINGLE pass (was 2 separate passes).
+        // This is the hot loop — runs every 2s over all cells.
         val toRemove = mutableListOf<GridCell>()
         for ((cell, lo) in logOdds) {
+            var newLo = lo
             if (lo > 0f) {
                 val obs = observationCounts.getOrDefault(cell, 0)
                 val decay = when {
@@ -225,18 +239,25 @@ class MapBuilder(val res: Float) {
                     obs >= 5  -> 0.08f
                     else      -> 0.15f
                 }
-                val newLo = (lo - decay).coerceAtLeast(0f)
+                newLo = (lo - decay).coerceAtLeast(0f)
                 if (newLo == 0f) {
                     toRemove.add(cell)
-                } else {
-                    logOdds[cell] = newLo
+                    continue  // skip derive — cell will be removed
                 }
+                logOdds[cell] = newLo
             } else if (lo < 0f) {
-                logOdds[cell] = (lo + DECAY_PER_REBUILD * 0.5f).coerceAtMost(0f)
+                newLo = (lo + DECAY_PER_REBUILD * 0.5f).coerceAtMost(0f)
+                logOdds[cell] = newLo
+            }
+            // Inline derive — avoids a second full iteration
+            grid[cell] = when {
+                newLo >= LO_THRESH_OCC  -> if (wallCells.contains(cell)) CELL_WALL.toByte() else CELL_OBSTACLE.toByte()
+                newLo <= LO_THRESH_FREE -> CELL_FREE.toByte()
+                else                    -> CELL_UNKNOWN.toByte()
             }
         }
 
-        // Remove zeroed cells — they contribute nothing and waste iteration time
+        // Remove zeroed cells
         for (cell in toRemove) {
             logOdds.remove(cell)
             grid.remove(cell)
@@ -249,12 +270,15 @@ class MapBuilder(val res: Float) {
             evictDistantCells(userGX, userGZ)
         }
 
-        // Phase 3: Infer walls at floor boundaries
-        inferWallsAtFloorEdges()
-
-        // Phase 4: Consistency enforcement + derive output grid
-        enforceConsistency()
-        deriveGrid()
+        // Phase 3: Expensive structural passes — throttled to avoid O(n×neighbors)
+        // every 2s. Wall inference every 10s, consistency every 6s.
+        if (lightRebuildCount % 5 == 0) {
+            inferWallsAtFloorEdges()
+        }
+        if (lightRebuildCount % 3 == 0) {
+            enforceConsistency()
+            deriveGrid()  // re-derive after consistency modifications
+        }
     }
 
     /**
@@ -264,33 +288,26 @@ class MapBuilder(val res: Float) {
      */
     private fun inferWallsAtFloorEdges() {
         val toMarkWall = mutableListOf<GridCell>()
-        
+
         for ((cell, lo) in logOdds) {
-            // Only process free (floor) cells with decent confidence
             if (lo > -0.5f) continue  // not a confident floor cell
-            
-            // Check 4-connected neighbors
-            val neighbors = listOf(
-                GridCell(cell.x + 1, cell.z),
-                GridCell(cell.x - 1, cell.z),
-                GridCell(cell.x, cell.z + 1),
-                GridCell(cell.x, cell.z - 1)
-            )
-            
-            for (neighbor in neighbors) {
-                val neighborLo = logOdds[neighbor]
-                // If neighbor is unknown (not in map or very low confidence)
-                if (neighborLo == null || (neighborLo > -0.3f && neighborLo < 0.3f)) {
-                    // This unknown cell next to floor is likely a wall
-                    toMarkWall.add(neighbor)
-                }
-            }
+            if (toMarkWall.size >= 50) break  // early exit — limit per rebuild
+
+            val cx = cell.x; val cz = cell.z
+            // Check 4-connected neighbors inline (avoids list + GridCell allocations)
+            val nLo1 = loAt(cx + 1, cz)
+            if (nLo1 > -0.3f && nLo1 < 0.3f) toMarkWall.add(GridCell(cx + 1, cz))
+            val nLo2 = loAt(cx - 1, cz)
+            if (nLo2 > -0.3f && nLo2 < 0.3f) toMarkWall.add(GridCell(cx - 1, cz))
+            val nLo3 = loAt(cx, cz + 1)
+            if (nLo3 > -0.3f && nLo3 < 0.3f) toMarkWall.add(GridCell(cx, cz + 1))
+            val nLo4 = loAt(cx, cz - 1)
+            if (nLo4 > -0.3f && nLo4 < 0.3f) toMarkWall.add(GridCell(cx, cz - 1))
         }
-        
-        // Mark inferred wall cells (with moderate evidence)
-        for (cell in toMarkWall.take(50)) {  // Limit per rebuild to avoid overmarking
+
+        for (cell in toMarkWall) {
             val currentLo = logOdds[cell] ?: 0f
-            if (currentLo < LO_THRESH_OCC) {  // Don't overwrite confirmed walls
+            if (currentLo < LO_THRESH_OCC) {
                 updateLogOdds(cell.x, cell.z, L_OCCUPIED * 0.5f, wallHint = true)
             }
         }
@@ -306,36 +323,61 @@ class MapBuilder(val res: Float) {
         if (excess <= 0) return
 
         val radiusSq = EVICT_RADIUS_CELLS * EVICT_RADIUS_CELLS
-        data class Candidate(val cell: GridCell, val distSq: Int, val priority: Int)
-        val candidates = mutableListOf<Candidate>()
 
-        for ((cell, _) in logOdds) {
-            val dx = cell.x - userGX
-            val dz = cell.z - userGZ
-            val distSq = dx * dx + dz * dz
-            if (distSq < radiusSq) continue  // keep cells near user
+        // Two-pass eviction: first evict UNKNOWN/FREE (cheap), only sort if needed.
+        // This avoids O(n log n) sort on every eviction for the common case.
+        var evicted = 0
+        val target = excess + excess / 4  // overshoot 25% to avoid re-triggering next cycle
 
-            val cellType = grid[cell]?.toInt() ?: CELL_UNKNOWN
-            val priority = when (cellType) {
-                CELL_UNKNOWN  -> 0   // evict first
-                CELL_FREE     -> 1
-                CELL_OBSTACLE -> 2
-                CELL_WALL     -> 3   // evict last (walls are expensive to re-detect)
-                CELL_VISITED  -> 4   // prefer to keep (user path)
-                else          -> 1
+        // Fast pass: evict unknown cells beyond radius (no sorting needed)
+        if (evicted < target) {
+            val iter = logOdds.entries.iterator()
+            while (iter.hasNext() && evicted < target) {
+                val (cell, _) = iter.next()
+                val dx = cell.x - userGX; val dz = cell.z - userGZ
+                if (dx * dx + dz * dz < radiusSq) continue
+                val ct = grid[cell]?.toInt() ?: CELL_UNKNOWN
+                if (ct == CELL_UNKNOWN) {
+                    iter.remove()
+                    grid.remove(cell); observationCounts.remove(cell); wallCells.remove(cell)
+                    evicted++
+                }
             }
-            candidates.add(Candidate(cell, distSq, priority))
         }
 
-        candidates.sortWith(compareBy<Candidate> { it.priority }.thenByDescending { it.distSq })
+        // Fast pass: evict free cells beyond radius
+        if (evicted < target) {
+            val iter = logOdds.entries.iterator()
+            while (iter.hasNext() && evicted < target) {
+                val (cell, _) = iter.next()
+                val dx = cell.x - userGX; val dz = cell.z - userGZ
+                if (dx * dx + dz * dz < radiusSq) continue
+                val ct = grid[cell]?.toInt() ?: CELL_UNKNOWN
+                if (ct == CELL_FREE) {
+                    iter.remove()
+                    grid.remove(cell); observationCounts.remove(cell); wallCells.remove(cell)
+                    evicted++
+                }
+            }
+        }
 
-        val evictCount = excess.coerceAtMost(candidates.size)
-        for (i in 0 until evictCount) {
-            val c = candidates[i]
-            logOdds.remove(c.cell)
-            grid.remove(c.cell)
-            observationCounts.remove(c.cell)
-            wallCells.remove(c.cell)
+        // Slow pass: if still over, evict obstacles by distance (skip walls/visited)
+        if (evicted < target) {
+            val obstaclesByDist = mutableListOf<Pair<GridCell, Int>>()
+            for ((cell, _) in logOdds) {
+                val dx = cell.x - userGX; val dz = cell.z - userGZ
+                val dSq = dx * dx + dz * dz
+                if (dSq < radiusSq) continue
+                val ct = grid[cell]?.toInt() ?: CELL_UNKNOWN
+                if (ct == CELL_OBSTACLE) obstaclesByDist.add(cell to dSq)
+            }
+            obstaclesByDist.sortByDescending { it.second }
+            for ((cell, _) in obstaclesByDist) {
+                if (evicted >= target) break
+                logOdds.remove(cell); grid.remove(cell)
+                observationCounts.remove(cell); wallCells.remove(cell)
+                evicted++
+            }
         }
     }
 
@@ -688,47 +730,53 @@ class MapBuilder(val res: Float) {
         // plane detection are already multi-cell thick due to sensor noise.
     }
 
+    /** Count occupied 8-neighbors using [loAt] to reduce GridCell allocations. */
     private fun countOccupiedNeighbors(cell: GridCell): Int {
+        val cx = cell.x; val cz = cell.z
         var count = 0
-        for (dz in -1..1) for (dx in -1..1) {
-            if (dx == 0 && dz == 0) continue
-            val lo = logOdds.getOrDefault(GridCell(cell.x + dx, cell.z + dz), 0f)
-            if (lo >= LO_THRESH_OCC) count++
-        }
+        if (loAt(cx - 1, cz - 1) >= LO_THRESH_OCC) count++
+        if (loAt(cx    , cz - 1) >= LO_THRESH_OCC) count++
+        if (loAt(cx + 1, cz - 1) >= LO_THRESH_OCC) count++
+        if (loAt(cx - 1, cz    ) >= LO_THRESH_OCC) count++
+        if (loAt(cx + 1, cz    ) >= LO_THRESH_OCC) count++
+        if (loAt(cx - 1, cz + 1) >= LO_THRESH_OCC) count++
+        if (loAt(cx    , cz + 1) >= LO_THRESH_OCC) count++
+        if (loAt(cx + 1, cz + 1) >= LO_THRESH_OCC) count++
         return count
     }
 
     private fun isWallGap(cell: GridCell): Boolean {
-        val left  = logOdds.getOrDefault(GridCell(cell.x - 1, cell.z    ), 0f) >= LO_THRESH_OCC
-        val right = logOdds.getOrDefault(GridCell(cell.x + 1, cell.z    ), 0f) >= LO_THRESH_OCC
-        val up    = logOdds.getOrDefault(GridCell(cell.x,     cell.z - 1), 0f) >= LO_THRESH_OCC
-        val down  = logOdds.getOrDefault(GridCell(cell.x,     cell.z + 1), 0f) >= LO_THRESH_OCC
-        return (left && right) || (up && down)
+        val cx = cell.x; val cz = cell.z
+        val left  = loAt(cx - 1, cz) >= LO_THRESH_OCC
+        val right = loAt(cx + 1, cz) >= LO_THRESH_OCC
+        if (left && right) return true
+        val up   = loAt(cx, cz - 1) >= LO_THRESH_OCC
+        val down = loAt(cx, cz + 1) >= LO_THRESH_OCC
+        return up && down
     }
 
     /** Detect 2-cell wall gaps: occupied cells separated by 2 on same axis. */
     private fun isWallGap2(cell: GridCell): Boolean {
-        val left2  = logOdds.getOrDefault(GridCell(cell.x - 2, cell.z    ), 0f) >= LO_THRESH_OCC
-        val right1 = logOdds.getOrDefault(GridCell(cell.x + 1, cell.z    ), 0f) >= LO_THRESH_OCC
-        val left1  = logOdds.getOrDefault(GridCell(cell.x - 1, cell.z    ), 0f) >= LO_THRESH_OCC
-        val right2 = logOdds.getOrDefault(GridCell(cell.x + 2, cell.z    ), 0f) >= LO_THRESH_OCC
-        val up2    = logOdds.getOrDefault(GridCell(cell.x,     cell.z - 2), 0f) >= LO_THRESH_OCC
-        val down1  = logOdds.getOrDefault(GridCell(cell.x,     cell.z + 1), 0f) >= LO_THRESH_OCC
-        val up1    = logOdds.getOrDefault(GridCell(cell.x,     cell.z - 1), 0f) >= LO_THRESH_OCC
-        val down2  = logOdds.getOrDefault(GridCell(cell.x,     cell.z + 2), 0f) >= LO_THRESH_OCC
-        // Cell is part of a 2-cell gap if an occupied cell is 2 away on one side
-        // and the neighbor between them is also unknown/free
-        return (left2 && right1) || (left1 && right2) ||
-               (up2 && down1) || (up1 && down2)
+        val cx = cell.x; val cz = cell.z
+        // Horizontal checks
+        val r1 = loAt(cx + 1, cz) >= LO_THRESH_OCC
+        val l1 = loAt(cx - 1, cz) >= LO_THRESH_OCC
+        if ((loAt(cx - 2, cz) >= LO_THRESH_OCC && r1) ||
+            (l1 && loAt(cx + 2, cz) >= LO_THRESH_OCC)) return true
+        // Vertical checks
+        val d1 = loAt(cx, cz + 1) >= LO_THRESH_OCC
+        val u1 = loAt(cx, cz - 1) >= LO_THRESH_OCC
+        return (loAt(cx, cz - 2) >= LO_THRESH_OCC && d1) ||
+               (u1 && loAt(cx, cz + 2) >= LO_THRESH_OCC)
     }
 
     /** Detect L-shaped corner pattern: 2 adjacent occupied neighbors at 90°. */
     private fun isLCorner(cell: GridCell): Boolean {
-        val l = logOdds.getOrDefault(GridCell(cell.x - 1, cell.z), 0f) >= LO_THRESH_OCC
-        val r = logOdds.getOrDefault(GridCell(cell.x + 1, cell.z), 0f) >= LO_THRESH_OCC
-        val u = logOdds.getOrDefault(GridCell(cell.x, cell.z - 1), 0f) >= LO_THRESH_OCC
-        val d = logOdds.getOrDefault(GridCell(cell.x, cell.z + 1), 0f) >= LO_THRESH_OCC
-        // L-shape: exactly 2 cardinal neighbors at 90° (not opposing)
+        val cx = cell.x; val cz = cell.z
+        val l = loAt(cx - 1, cz) >= LO_THRESH_OCC
+        val r = loAt(cx + 1, cz) >= LO_THRESH_OCC
+        val u = loAt(cx, cz - 1) >= LO_THRESH_OCC
+        val d = loAt(cx, cz + 1) >= LO_THRESH_OCC
         return (l && u) || (l && d) || (r && u) || (r && d)
     }
 
