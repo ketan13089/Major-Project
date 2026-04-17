@@ -29,7 +29,9 @@
       "WebFetch(domain:openrouter.ai)",
       "Bash(find /Users/omvarma/Desktop/ketan/Major-Project -name \"build.gradle*\" -type f -exec grep -l \"arcore\" {} \\\\;)",
       "Bash(find C:UsersketanStudioProjectsslam -type f -name *.kt -o -name *.gradle)",
-      "Bash(./gradlew :app:compileDebugKotlin)"
+      "Bash(./gradlew :app:compileDebugKotlin)",
+      "Bash(git commit *)",
+      "Bash(git push *)"
     ]
   }
 }

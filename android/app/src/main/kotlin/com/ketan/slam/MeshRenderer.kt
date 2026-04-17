@@ -61,28 +61,32 @@ class MeshRenderer {
             }
         """
 
-        // Grid cell size in metres; line thickness controlled by fwidth for
-        // roughly constant on-screen pixel width regardless of distance.
+        // Dotted mesh shader for vertical walls. Dots sit on a world-space
+        // lattice keyed to (x + z, y), which is continuous across adjacent
+        // walls — two perpendicular walls sharing a corner evaluate the same
+        // (x,z,y) at the seam so dots line up where walls meet.
+        // fwidth gives roughly constant on-screen dot size with distance.
         private const val GRID_FRAGMENT_SHADER = """
             #extension GL_OES_standard_derivatives : enable
             precision mediump float;
             uniform vec4 u_Color;
             varying vec3 v_WorldPos;
 
-            float gridLine(vec2 uv) {
-                vec2 g = abs(fract(uv - 0.5) - 0.5) / fwidth(uv);
-                float line = min(g.x, g.y);
-                return 1.0 - min(line, 1.0);
+            float dotMask(vec2 uv) {
+                // Distance from the nearest lattice point, normalized by pixel width
+                vec2 f = fract(uv) - 0.5;
+                float d = length(f) / max(fwidth(uv).x, fwidth(uv).y);
+                // 0 at center of dot, rises outward. Smoothstep gives soft edge.
+                return 1.0 - smoothstep(0.6, 1.2, d);
             }
 
             void main() {
-                // Grid in the wall's vertical plane: use world Y and horizontal
-                // distance (X+Z projected) so lines stay aligned with gravity.
-                vec2 uv = vec2(v_WorldPos.x + v_WorldPos.z, v_WorldPos.y) * 4.0; // 0.25 m cells
-                float line = gridLine(uv);
-                // Bright grid lines, nearly transparent fill so the camera feed shows through.
+                // 0.15 m lattice on (horizontal-arc, vertical) — shared across walls.
+                vec2 uv = vec2(v_WorldPos.x + v_WorldPos.z, v_WorldPos.y) / 0.15;
+                float dots = dotMask(uv);
                 vec3 rgb = u_Color.rgb;
-                float alpha = mix(0.04, 0.85, line);
+                // Near-invisible fill so the camera feed shows through, bright dots.
+                float alpha = mix(0.02, 0.9, dots);
                 gl_FragColor = vec4(rgb, alpha);
             }
         """
