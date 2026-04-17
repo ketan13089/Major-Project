@@ -556,15 +556,11 @@ class MapBuilder(val res: Float) {
     }
 
     // ── Depth-hit based map updates ───────────────────────────────────────────
-    // Called from ArActivity.extractWallsFromDepth() on the GL thread.
-    // These use confirmed 3D hit points from ARCore hit-testing on the current
-    // frame — much stronger evidence than ray casting or plane detection.
+    // Called from ArActivity depth processing on the GL thread.
 
     /**
      * Mark a confirmed floor-level hit point as free space.
      * Called when a hit-test returns a point at floor level (below camera by >1.2m).
-     * Uses moderate free evidence — enough to establish walkability but not so
-     * strong that it overwhelms nearby obstacle/wall evidence.
      */
     fun markHitFree(wx: Float, wz: Float) {
         val gx = worldToGrid(wx)
@@ -575,7 +571,6 @@ class MapBuilder(val res: Float) {
     /**
      * Mark a confirmed wall hit point as occupied WALL.
      * Called when a hit-test returns a point near camera height or on a vertical plane.
-     * Adds to wallCells so it renders as CELL_WALL (dark).
      */
     fun markHitOccupied(wx: Float, wz: Float) {
         val gx = worldToGrid(wx)
@@ -585,7 +580,6 @@ class MapBuilder(val res: Float) {
 
     /**
      * Mark a confirmed obstacle (furniture) hit point as occupied OBSTACLE.
-     * Called when a hit-test returns a point at furniture level (between floor and wall).
      * Does NOT add to wallCells — renders as CELL_OBSTACLE (brown), not wall (dark).
      */
     fun markHitObstacle(wx: Float, wz: Float) {
@@ -602,6 +596,86 @@ class MapBuilder(val res: Float) {
         val gx = worldToGrid(wx)
         val gz = worldToGrid(wz)
         updateLogOdds(gx, gz, L_OCCUPIED, wallHint = true)
+    }
+
+    // ── Confidence-weighted dense depth methods ──────────────────────────────
+
+    /**
+     * Unified confidence-weighted depth point integration.
+     * Replaces separate mark methods for dense depth processing.
+     *
+     * Confidence weighting:
+     *   < 64  → skip (too noisy)
+     *   64-127  → 0.5x (weak evidence)
+     *   128-191 → 0.85x (good evidence)
+     *   192-255 → 1.2x (strong evidence)
+     *
+     * Height classification (relY = point Y - camera Y):
+     *   < -1.2m         → floor (free)
+     *   -1.2m to -0.8m  → furniture/obstacle
+     *   -0.8m to 1.0m   → wall
+     *   > 1.0m          → ceiling (ignore)
+     */
+    fun markDepthPoint(wx: Float, wz: Float, confidence: Int, relY: Float) {
+        if (confidence < 64) return  // too noisy, skip
+
+        val confMultiplier = when {
+            confidence < 128 -> 0.5f
+            confidence < 192 -> 0.85f
+            else             -> 1.2f
+        }
+
+        when {
+            relY < -1.2f -> {
+                // Floor — mark as free
+                val gx = worldToGrid(wx)
+                val gz = worldToGrid(wz)
+                updateLogOdds(gx, gz, L_FREE * 2f * confMultiplier)
+            }
+            relY in -1.2f..-0.8f -> {
+                // Furniture/obstacle level
+                val gx = worldToGrid(wx)
+                val gz = worldToGrid(wz)
+                updateLogOdds(gx, gz, L_OCCUPIED * confMultiplier, wallHint = false)
+            }
+            relY in -0.8f..1.0f -> {
+                // Wall level
+                val gx = worldToGrid(wx)
+                val gz = worldToGrid(wz)
+                updateLogOdds(gx, gz, L_OCCUPIED * confMultiplier, wallHint = true)
+            }
+            // relY > 1.0f → ceiling, ignore
+        }
+    }
+
+    /**
+     * Bresenham ray clearing from camera to hit point.
+     * Marks intermediate cells as free space — measurement-driven free carving.
+     * Only call for high-confidence wall hits (conf >= 128, depth > 0.5m).
+     */
+    fun markDepthFreeRay(camWx: Float, camWz: Float, hitWx: Float, hitWz: Float) {
+        val gx0 = worldToGrid(camWx)
+        val gz0 = worldToGrid(camWz)
+        val gx1 = worldToGrid(hitWx)
+        val gz1 = worldToGrid(hitWz)
+
+        // Don't clear the hit cell itself — walk up to 1 cell before it
+        val dx = abs(gx1 - gx0)
+        val dz = abs(gz1 - gz0)
+        val steps = maxOf(dx, dz)
+        if (steps < 2) return  // too close, nothing to clear
+
+        bresenhamLine(gx0, gz0, gx1, gz1) { gx, gz ->
+            // Stop 1 cell before the hit point
+            val toDstX = abs(gx1 - gx)
+            val toDstZ = abs(gz1 - gz)
+            if (toDstX <= 1 && toDstZ <= 1) return@bresenhamLine
+            val lo = logOdds.getOrDefault(GridCell(gx, gz), 0f)
+            // Don't clear confirmed occupied cells
+            if (lo < LO_THRESH_OCC) {
+                updateLogOdds(gx, gz, L_FREE)
+            }
+        }
     }
 
     /**

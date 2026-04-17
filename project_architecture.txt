@@ -1,0 +1,126 @@
+Here’s the project architecture generated from your current codebase.
+
+==================================================================
+PROJECT ARCHITECTURE: Indoor SLAM Navigation (Flutter + Android)
+==================================================================
+
+1) Flutter Layer (lib/)
+-----------------------
+- main.dart
+  - App entry point, routing, and HomePage.
+  - Routes:
+    - / -> HomePage
+    - /map -> IndoorMapViewer
+    - /saved-maps -> SavedMapsScreen
+    - /performance -> PerformanceDashboard
+
+- indoor_map_viewer.dart
+  - Live/saved map visualization.
+  - Handles AR launch, map payload rendering, object selection, BFS path visualization, and voice navigation UI state.
+  - Channels:
+    - com.ketan.slam/ar
+    - com.ketan.slam/nav
+    - com.ketan.slam/map_store
+
+- saved_maps_screen.dart
+  - Lists, opens, and deletes saved map sessions.
+  - Channel:
+    - com.ketan.slam/map_store
+
+- performance_dashboard.dart
+  - Displays runtime metrics and exports performance reports.
+  - Channels:
+    - com.ketan.slam/ar
+    - com.ketan.slam/map
+
+- accessibility_service.dart
+  - Accessibility orchestration:
+    - TTS announcements
+    - Focus management
+    - Volume-button-based navigation
+  - Channels:
+    - com.ketan.slam/tts
+    - com.ketan.slam/volume_buttons
+
+
+2) MethodChannel Bridge
+-----------------------
+- com.ketan.slam/ar
+  - Flutter -> Native: openAR
+  - Native -> Flutter: pose/map/session updates (e.g., onUpdate, updateMap, onARClosed)
+
+- com.ketan.slam/nav
+  - Flutter -> Native: startVoiceNav, stopNavigation
+  - Native -> Flutter: navStateChange, navInstruction
+
+- com.ketan.slam/map
+  - Native map/performance services for dashboard and report export.
+
+- com.ketan.slam/map_store
+  - Persistence services:
+    - listSavedMaps / listMaps
+    - loadMapPayload
+    - deleteMap
+    - metadata retrieval
+
+- com.ketan.slam/tts
+  - Native text-to-speech controls.
+
+- com.ketan.slam/volume_buttons
+  - Native volume key events mapped to accessibility actions.
+
+
+3) Android/Kotlin Layer (android/app/src/main/kotlin/com/ketan/slam/)
+----------------------------------------------------------------------
+- MainActivity
+  - Flutter engine bootstrap and caching.
+  - Registers core channels:
+    - ar, map_store, tts, volume_buttons
+  - Launches ArActivity on openAR.
+  - Hosts persistence bridge so map storage survives ArActivity lifecycle.
+
+- ArActivity (central orchestrator)
+  - ARCore session lifecycle + GL rendering.
+  - Coordinates:
+    - Mapping pipeline
+    - Detection pipeline (YOLO + OCR)
+    - Navigation pipeline
+    - Performance/report interfaces
+  - Registers nav/map channels on native side.
+
+- Core SLAM/Map modules
+  - MapBuilder
+  - PoseTracker
+  - SlamEngine
+  - ObservationStore
+  - ObjectLocalizer
+  - SemanticMapManager
+
+- AI/Perception modules
+  - YoloDetector (TFLite object detection)
+  - TextRecognizer (ML Kit OCR)
+  - SemanticCorrectionEngine (+ models)
+
+- Navigation modules
+  - NavigationManager
+  - PathPlanner
+  - NavigationGuide
+  - VoiceCommandProcessor
+
+- Support/auxiliary modules
+  - MapPersistence
+  - AccessibilityHandler
+  - PerformanceTracker
+  - HazardWarningSystem
+  - SpatialAudioEngine
+  - Rendering helpers (BackgroundRenderer, MeshRenderer, DetectionOverlayView, CompassView, etc.)
+
+
+4) End-to-End Runtime Flow
+--------------------------
+1. Flutter UI triggers AR/navigation/map actions through MethodChannels.
+2. MainActivity routes bootstrap/persistence requests and launches ArActivity for AR.
+3. ArActivity runs ARCore + SLAM + detection + navigation orchestration.
+4. Native side streams updates (pose, map payload, nav state, metrics) back to Flutter.
+5. Flutter renders map/object/nav UI, saved maps, performance dashboard, and accessibility feedback.
+
