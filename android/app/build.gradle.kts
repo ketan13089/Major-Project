@@ -41,6 +41,17 @@ android {
             "String", "OPENROUTER_API_KEY",
             "\"${localProps.getProperty("openrouter.api.key", "")}\""
         )
+
+        // LLM Assistant (query + navigation) — separate key + model id so it
+        // can be swapped independently of the semantic corrector.
+        buildConfigField(
+            "String", "LLM_ASSISTANT_API_KEY",
+            "\"${localProps.getProperty("llm.assistant.api.key", "")}\""
+        )
+        buildConfigField(
+            "String", "LLM_ASSISTANT_MODEL",
+            "\"${localProps.getProperty("llm.assistant.model", "")}\""
+        )
     }
 
     buildTypes {

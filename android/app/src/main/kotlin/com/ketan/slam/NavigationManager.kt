@@ -79,6 +79,57 @@ class NavigationManager(
 
     fun startVoiceCommand() = voice.startListening()
 
+    /**
+     * Kick off turn-by-turn navigation to an explicit destination (bypassing
+     * the voice-intent → object-matching layer). Used by the LLM assistant,
+     * which resolves the destination itself.
+     */
+    fun navigateToExplicit(
+        dest: SemanticObject,
+        userX: Float, userZ: Float,
+        grid: Map<GridCell, Byte>,
+        semanticMap: SemanticMapManager,
+        observationCounts: Map<GridCell, Int>? = null
+    ) {
+        cachedObservationCounts = observationCounts
+        val startGX = (userX / res).roundToInt()
+        val startGZ = (userZ / res).roundToInt()
+        val goalGX  = (dest.position.x / res).roundToInt()
+        val goalGZ  = (dest.position.z / res).roundToInt()
+
+        val path = planner.planPath(grid, startGX, startGZ, goalGX, goalGZ,
+            semanticObjects = semanticMap.getAllObjects(),
+            observationCounts = observationCounts)
+        if (path.isEmpty()) {
+            setState(NavigationState.ERROR, "No clear path — route may be blocked")
+            guide.speak("Cannot find a clear path there. Try scanning more of the area.")
+            return
+        }
+
+        // Synthesize an intent for the session record (not used for matching).
+        val syntheticIntent = NavigationIntent(
+            destinationType = dest.type,
+            qualifier = DestinationQualifier.NEAREST,
+            rawText = "llm:${dest.category}"
+        )
+        navStartMs = System.currentTimeMillis()
+        navReplans = 0
+        currentSession = NavigationSession(syntheticIntent, dest, path)
+        setState(NavigationState.NAVIGATING, "Navigating to ${dest.category}")
+        onPathUpdated(path)
+
+        val distM = dist(userX, userZ, dest.position.x, dest.position.z)
+        val distStr = distM.roundToInt().coerceAtLeast(1).let { if (it == 1) "1 metre" else "$it metres" }
+        guide.speak("Navigating to the ${dest.category}. Distance: $distStr.")
+
+        val firstInstr = guide.computeInstruction(userX, userZ, 0f, path, res)
+        if (firstInstr != null) {
+            guide.speak(firstInstr.text)
+            onInstruction(firstInstr)
+            currentSession = currentSession!!.copy(lastInstruction = firstInstr)
+        }
+    }
+
     fun stopNavigation() {
         pendingIntent  = null
         currentSession = null

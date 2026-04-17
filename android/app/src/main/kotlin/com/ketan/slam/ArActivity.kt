@@ -85,6 +85,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     private lateinit var navView: TextView
     private lateinit var micButton: TextView
     private lateinit var compassView: CompassView
+    private lateinit var rootLayout: FrameLayout
 
     // ── ARCore ────────────────────────────────────────────────────────────────
     private var session: Session? = null
@@ -166,6 +167,15 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
 
     // ── Semantic AI Correction ─────────────────────────────────────────────────
     private var semanticCorrectionEngine: SemanticCorrectionEngine? = null
+
+    // ── LLM Assistant (query + navigation + vision updates) ───────────────────
+    private var llmAssistant: LlmAssistant? = null
+    private var llmUi: LlmAssistantUi? = null
+    private val llmExecutor: java.util.concurrent.ExecutorService =
+        Executors.newSingleThreadExecutor()
+    // Latest YUV snapshot (re-published from the shared-camera listener) for
+    // vision updates. We copy these once per listener tick, not per frame.
+    @Volatile private var llmLastYuv: LlmYuvSnapshot? = null
 
     // ── Navigation ────────────────────────────────────────────────────────────
     private var navigationManager: NavigationManager? = null
@@ -288,6 +298,16 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             println("$TAG: Semantic AI corrector disabled (no API key in local.properties)")
         }
 
+        // LLM Assistant — reads key + model from BuildConfig (local.properties).
+        LlmAssistantConfig.apiKey = BuildConfig.LLM_ASSISTANT_API_KEY
+        LlmAssistantConfig.model  = BuildConfig.LLM_ASSISTANT_MODEL
+        if (LlmAssistantConfig.enabled) {
+            llmAssistant = LlmAssistant(semanticMap, mapBuilder)
+            println("$TAG: LLM assistant initialized (model=${LlmAssistantConfig.model})")
+        } else {
+            println("$TAG: LLM assistant disabled — set llm.assistant.api.key and llm.assistant.model in local.properties")
+        }
+
         navigationManager = NavigationManager(
             context       = this,
             res           = RES,
@@ -324,6 +344,9 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         // Performance tracking
         PerformanceTracker.reset()
         PerformanceTracker.markSessionStart()
+
+        // Attach LLM assistant UI (Ask + Guide me to FABs + spinner + reply card).
+        attachLlmUi()
 
         // Hazard warning + spatial audio — FROZEN (disabled for now)
         // @Suppress("DEPRECATION")
@@ -373,6 +396,195 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         } catch (e: Exception) { println("$TAG: auto-save: ${e.message}") }
     }
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // LLM Assistant integration
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private fun attachLlmUi() {
+        llmUi = LlmAssistantUi(this, rootLayout) { flow, transcript ->
+            when (flow) {
+                LlmTaskKind.QUERY    -> runLlmQuery(transcript)
+                LlmTaskKind.NAVIGATE -> runLlmNavigate(transcript)
+                else                 -> {}
+            }
+        }
+    }
+
+    private fun runLlmQuery(text: String) {
+        val assistant = llmAssistant ?: run {
+            llmUi?.toast("LLM assistant not configured"); return
+        }
+        val pose = latestPose ?: run {
+            llmUi?.toast("Waiting for tracking — try again in a moment"); return
+        }
+        llmUi?.showLoading(true)
+        llmExecutor.execute {
+            val result = try {
+                assistant.query(text, pose.tx(), pose.tz(), latestHeading)
+            } catch (e: Exception) { println("$TAG: LLM query: ${e.message}"); null }
+            runOnUiThread {
+                llmUi?.showLoading(false)
+                if (result == null) {
+                    llmUi?.toast("Assistant unavailable. Check network or API key.")
+                } else {
+                    llmUi?.showReply(result.answer)
+                    announcer?.speak(result.answer)
+                }
+            }
+        }
+    }
+
+    private fun runLlmNavigate(text: String) {
+        val assistant = llmAssistant ?: run {
+            llmUi?.toast("LLM assistant not configured"); return
+        }
+        val pose = latestPose ?: run {
+            llmUi?.toast("Waiting for tracking — try again in a moment"); return
+        }
+        llmUi?.showLoading(true)
+        llmExecutor.execute {
+            val result = try {
+                assistant.navigate(text, pose.tx(), pose.tz(), latestHeading)
+            } catch (e: Exception) { println("$TAG: LLM navigate: ${e.message}"); null }
+            runOnUiThread {
+                llmUi?.showLoading(false)
+                if (result == null) {
+                    llmUi?.toast("Could not plan route.")
+                    return@runOnUiThread
+                }
+                llmUi?.showReply(result.spoken)
+                announcer?.speak(result.spoken)
+
+                val dest = resolveLlmDestination(result)
+                if (dest == null) {
+                    announcer?.speak("I couldn't find a matching destination on the map yet. Keep scanning and try again.")
+                    return@runOnUiThread
+                }
+                startLlmNavigationTo(dest)
+            }
+        }
+    }
+
+    /** Find the SemanticObject corresponding to the LLM's chosen target. */
+    private fun resolveLlmDestination(result: LlmNavigateResult): SemanticObject? {
+        // Prefer explicit id if the LLM quoted one from NEARBY_OBJECTS
+        result.targetObjectId?.let { id ->
+            semanticMap.getAllObjects().firstOrNull { it.id == id }?.let { return it }
+        }
+        // Fallback: synthesize a virtual destination from explicit coords
+        val tx = result.targetWorldX; val tz = result.targetWorldZ
+        if (tx != null && tz != null) {
+            return SemanticObject(
+                id = "llm_target_${System.currentTimeMillis()}",
+                type = ObjectType.UNKNOWN,
+                category = "destination",
+                position = Point3D(tx, 0f, tz),
+                boundingBox = BoundingBox2D(0f, 0f, 0f, 0f),
+                confidence = 1f,
+                firstSeen = System.currentTimeMillis(),
+                lastSeen = System.currentTimeMillis(),
+                observations = 2
+            )
+        }
+        return null
+    }
+
+    /** Kick off turn-by-turn navigation to an LLM-chosen destination. */
+    private fun startLlmNavigationTo(dest: SemanticObject) {
+        val pose = latestPose ?: return
+        val nm   = navigationManager ?: return
+        // Ensure the destination exists in the map for arrival detection.
+        if (semanticMap.getAllObjects().none { it.id == dest.id }) {
+            semanticMap.addObject(dest)
+        }
+        val grid = cachedNavGrid ?: HashMap(mapBuilder.grid)
+        nm.navigateToExplicit(
+            dest = dest,
+            userX = pose.tx(), userZ = pose.tz(),
+            grid = grid,
+            semanticMap = semanticMap,
+            observationCounts = cachedObsCounts
+        )
+    }
+
+    /** Stash a YUV snapshot for periodic vision updates. Called from the shared-camera listener. */
+    fun publishYuvForLlm(
+        y: ByteArray, u: ByteArray, v: ByteArray,
+        yStride: Int, uvStride: Int, uvPixStride: Int,
+        width: Int, height: Int
+    ) {
+        llmLastYuv = LlmYuvSnapshot(y, u, v, yStride, uvStride, uvPixStride, width, height)
+        maybeRunVisionUpdate()
+    }
+
+    private fun maybeRunVisionUpdate() {
+        val assistant = llmAssistant ?: return
+        val now = System.currentTimeMillis()
+        if (!assistant.shouldRunVisionUpdate(now)) return
+        val snap = llmLastYuv ?: return
+        val pose = latestPose ?: return
+        assistant.markVisionRun(now)
+
+        llmExecutor.execute {
+            val b64 = LlmImageEncoder.yuvToBase64Jpeg(
+                snap.y, snap.u, snap.v,
+                snap.yStride, snap.uvStride, snap.uvPixStride,
+                snap.width, snap.height
+            ) ?: return@execute
+            val result = try {
+                assistant.visionUpdate(b64, pose.tx(), pose.tz(), latestHeading)
+            } catch (e: Exception) { println("$TAG: LLM vision: ${e.message}"); null }
+            if (result != null) applyVisionResult(result, pose)
+        }
+    }
+
+    /**
+     * Merge LLM vision observations into the semantic map by projecting each
+     * (direction, distance_bucket) into approximate world coordinates in
+     * front/left/right/back of the user, then calling semanticMap.addObject
+     * (which de-duplicates nearby entries of the same type).
+     */
+    private fun applyVisionResult(result: LlmVisionUpdate, pose: com.google.ar.core.Pose) {
+        val userX = pose.tx(); val userZ = pose.tz()
+        val heading = latestHeading
+        val now = System.currentTimeMillis()
+
+        result.observed.forEach { obs ->
+            val distance = when (obs.distanceBucket.lowercase()) {
+                "near" -> 1.5f; "mid" -> 3.5f; "far" -> 6.0f; else -> 3.0f
+            }
+            val bearingOffset = when (obs.relativeDirection.lowercase()) {
+                "front" -> 0f
+                "right" -> (Math.PI / 2).toFloat()
+                "back"  -> Math.PI.toFloat()
+                "left"  -> -(Math.PI / 2).toFloat()
+                else    -> 0f
+            }
+            val worldBearing = heading + bearingOffset
+            // ARCore: -Z forward, +X right
+            val tx = userX + kotlin.math.sin(worldBearing) * distance
+            val tz = userZ - kotlin.math.cos(worldBearing) * distance
+
+            val type = ObjectType.fromLabel(obs.label)
+            val obj = SemanticObject(
+                id = "llm_vis_${now}_${obs.label.hashCode()}",
+                type = type,
+                category = obs.label,
+                position = Point3D(tx, pose.ty(), tz),
+                boundingBox = BoundingBox2D(0f, 0f, 0f, 0f),
+                confidence = 0.6f,
+                firstSeen = now,
+                lastSeen = now,
+                observations = 1,
+                localizationMethod = "llm_vision"
+            )
+            semanticMap.addObject(obj)
+        }
+        if (result.summary.isNotBlank()) {
+            println("$TAG: LLM vision: ${result.summary}")
+        }
+    }
+
     override fun onDestroy() {
         destroyed = true
         // Notify Flutter that AR is closing so it can resume its accessibility
@@ -399,6 +611,8 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         navigationManager?.destroy(); navigationManager = null
         poseTracker.destroy()
         semanticCorrectionEngine?.shutdown()
+        llmUi?.destroy(); llmUi = null
+        llmExecutor.shutdownNow()
         detectionExecutor.shutdownNow()
         rebuildExecutor.shutdownNow()
         teardownCamera()
@@ -479,6 +693,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         overlayView.importantForAccessibility = android.view.View.IMPORTANT_FOR_ACCESSIBILITY_NO
 
         val root = FrameLayout(this)
+        rootLayout = root
         root.addView(surfaceView, mpmp())
         root.addView(overlayView, mpmp())
         root.addView(hudView, FrameLayout.LayoutParams(
@@ -606,6 +821,9 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
                     val currentFrame = latestFrame
                     val capturedFrameTs = latestFrameTs   // timestamp when this frame was current
                     img.close()
+
+                    // Publish a copy to the LLM assistant (throttled internally).
+                    publishYuvForLlm(yB, uB, vB, yStride, uvStride, uvPix, CAM_W, CAM_H)
 
                     detectionExecutor.execute {
                         val t0 = System.currentTimeMillis()
