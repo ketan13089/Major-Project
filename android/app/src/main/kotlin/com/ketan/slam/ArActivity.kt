@@ -133,15 +133,14 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     private val rebuilding = AtomicBoolean(false)
     private var lastRebuildMs = 0L
     @Volatile private var lastRebuildVersion = 0L
-    private var lastDepthSampleMs = 0L          // throttle depth-hit sampling
-    private var lastDepthImageMs = 0L           // throttle depth image analysis
+    private var lastDepthProcessMs = 0L          // throttle dense depth + confidence
     private var lastWallInferMs  = 0L           // throttle motion-based wall inference
 
-    // Pre-allocated buffers for depth image processing (Strategy 1)
-    private val depthWorldPts = FloatArray(240 * 180 * 3) // worst-case depth image size
-    private var depthPtCount = 0
-    // Reusable HashMap for depth bin analysis — cleared each call instead of re-allocated
-    private val depthBins = HashMap<Int, Int>(64)
+    // Pre-allocated buffer for depth unprojection
+    private val depthWorldBuf = FloatArray(3)
+
+    // Raw depth capability check — cached after first attempt
+    @Volatile private var rawDepthSupported: Boolean? = null
 
     // ── Flutter ───────────────────────────────────────────────────────────────
     private var methodChannel: MethodChannel? = null
@@ -829,17 +828,11 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
                 PerformanceTracker.recordKeyframe()
             }
 
-            // --- Depth-hit wall extraction (every 750ms on GL thread) ---
+            // --- Dense depth + confidence processing (every 500ms) ---
             val depthNow = System.currentTimeMillis()
-            if (depthNow - lastDepthSampleMs >= 750L) {
-                lastDepthSampleMs = depthNow
-                extractWallsFromDepth(frame, camera)       // Strategies 2 + 4 integrated
-            }
-
-            // --- Strategy 1: Depth image analysis (every 1s) ---
-            if (depthNow - lastDepthImageMs >= 1000L) {
-                lastDepthImageMs = depthNow
-                extractWallsFromDepthImage(frame, camera)
+            if (depthNow - lastDepthProcessMs >= 500L) {
+                lastDepthProcessMs = depthNow
+                extractDepthConfidenceMap(frame, camera)
             }
 
             // --- Strategy 3: Motion-based wall inference (every 2s) ---
@@ -957,225 +950,35 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
      * 2. It works even when ARCore's vertical plane detection fails (common indoors).
      * 3. It samples 120 points per call (12 cols × 10 rows) for dense coverage.
      *
-     * Height rules (relative to camera Y, assuming ~1.5m camera height):
-     *   relY < -1.2m  → floor level  → mark as free
-     *   -0.8m ≤ relY ≤ 1.0m → wall level (expanded range for white walls) → mark as wall
-     *   -1.2m ≤ relY < -0.8m → furniture/obstacle level → mark as obstacle (not wall)
-     *   relY > 1.0m   → ceiling/shelf → ignore
+     * Dense depth + confidence map processing.
+     * Replaces both extractWallsFromDepth (hit-test based) and
+     * extractWallsFromDepthImage (sparse depth image) with a single unified pass.
      *
-     * This separation ensures:
-     *   - Beds, tables (low) → obstacle (brown), not wall (dark)
-     *   - Actual walls (camera height) → wall (dark)
-     *   - Floor → free (white)
-     */
-    private fun extractWallsFromDepth(frame: Frame, camera: Camera) {
-        if (camera.trackingState != TrackingState.TRACKING) return
-        val cameraY = camera.pose.ty()
-        val cols = 10; val rows = 8  // Increased grid density for better wall coverage
-        val stepX = surfaceWidth  / cols.toFloat()
-        val stepY = surfaceHeight / rows.toFloat()
-
-        // ── Strategy 2: Track per-column floor/miss pattern ──────────────
-        // For each column, record the furthest floor hit (screen-space row)
-        // and whether upper rows were all misses. If so, the floor-wall
-        // junction is at that last floor hit.
-        data class ColHit(val wx: Float, val wz: Float, val row: Int)
-        val lastFloorPerCol = arrayOfNulls<ColHit>(cols) // deepest floor hit per col
-        val wallHitsPerCol  = IntArray(cols)
-        val totalHitsPerCol = IntArray(cols)
-        val missesPerCol    = IntArray(cols)  // Track misses for white wall detection
-
-        // Collect wall hit screen positions for Strategy 4 (adaptive density)
-        val wallHitScreenPts = mutableListOf<Pair<Float, Float>>()
-        var totalAttempts = 0; var totalSuccesses = 0
-
-        for (col in 0 until cols) {
-            for (row in 0 until rows) {
-                val sx = col * stepX + stepX / 2f
-                val sy = row * stepY + stepY / 2f
-                totalAttempts++
-                try {
-                    val hits = frame.hitTest(sx, sy)
-                    val hit = hits.firstOrNull { h ->
-                        val t = h.trackable
-                        (t is Plane && t.trackingState == TrackingState.TRACKING) ||
-                                t is com.google.ar.core.DepthPoint ||
-                                t is com.google.ar.core.InstantPlacementPoint
-                    }
-                    
-                    if (hit == null) {
-                        // No hit at this position — possible white wall (featureless)
-                        missesPerCol[col]++
-                        continue
-                    }
-
-                    totalSuccesses++
-                    val hp  = hit.hitPose
-                    val hx  = hp.tx(); val hz = hp.tz(); val hy = hp.ty()
-                    if (hit.distance > 4.0f) continue
-
-                    val relY = hy - cameraY
-                    val isVerticalPlane = (hit.trackable as? Plane)?.type == Plane.Type.VERTICAL
-
-                    when {
-                        relY < -1.2f -> {
-                            mapBuilder.markHitFree(hx, hz)
-                            // Strategy 2: record floor hit for this column
-                            totalHitsPerCol[col]++
-                            if (lastFloorPerCol[col] == null || row < lastFloorPerCol[col]!!.row) {
-                                lastFloorPerCol[col] = ColHit(hx, hz, row)
-                            }
-                        }
-                        // Expanded wall detection range: -0.8m to 1.0m (was -0.5m to 0.6m)
-                        isVerticalPlane || relY in -0.8f..1.0f -> {
-                            mapBuilder.markHitOccupied(hx, hz)
-                            wallHitsPerCol[col]++
-                            wallHitScreenPts.add(sx to sy)
-                        }
-                        relY in -1.2f..-0.8f ->
-                            mapBuilder.markHitObstacle(hx, hz)
-                    }
-                } catch (_: Exception) {}
-            }
-        }
-
-        // ── Strategy 2: Infer walls at floor boundaries ──────────────────
-        // For columns where we got floor hits in lower rows but nothing in
-        // upper rows (and no explicit wall hit), the floor→void transition
-        // is likely a white wall base.
-        val pose = camera.pose
-        val q = pose.rotationQuaternion
-        val fwdX = 2f * (q[0] * q[2] + q[1] * q[3])
-        val fwdZ = 1f - 2f * (q[0] * q[0] + q[1] * q[1])
-        val fLen = sqrt(fwdX * fwdX + fwdZ * fwdZ).coerceAtLeast(0.001f)
-        val fnx = fwdX / fLen; val fnz = fwdZ / fLen
-
-        for (col in 0 until cols) {
-            val floor = lastFloorPerCol[col] ?: continue
-            if (wallHitsPerCol[col] > 0) continue  // column already has explicit wall
-            if (totalHitsPerCol[col] < 1) continue
-            // Floor hit exists but upper rows had no hits → likely wall above
-            // Mark multiple cells along forward direction to build wall line
-            for (step in 1..3) {
-                val wallX = floor.wx + fnx * (0.20f * step)
-                val wallZ = floor.wz + fnz * (0.20f * step)
-                mapBuilder.markInferredWall(wallX, wallZ)
-            }
-        }
-
-        // ── Strategy 5: White wall detection from miss patterns ──────────────
-        // If a column has floor hits but many misses in upper rows (and no wall hits),
-        // this strongly indicates a featureless white wall. Mark it more aggressively.
-        for (col in 0 until cols) {
-            val floor = lastFloorPerCol[col] ?: continue
-            val misses = missesPerCol[col]
-            val walls = wallHitsPerCol[col]
-            
-            // High miss rate + floor visible + no explicit walls = white wall
-            if (misses >= 3 && walls == 0 && totalHitsPerCol[col] >= 1) {
-                // Strong evidence of white wall — mark multiple cells
-                for (step in 1..4) {
-                    val wallX = floor.wx + fnx * (0.15f * step)
-                    val wallZ = floor.wz + fnz * (0.15f * step)
-                    mapBuilder.markWhiteWall(wallX, wallZ)
-                }
-            }
-        }
-
-        // ── Strategy 6: Full-miss white wall inference ───────────────────────
-        // When looking DIRECTLY at a white wall, we get almost no hits at all
-        // (no floor visible, no depth returns). If miss rate is very high,
-        // infer a wall directly in front of the camera.
-        val totalMisses = missesPerCol.sum()
-        val missRatio = if (totalAttempts > 0) totalMisses.toFloat() / totalAttempts else 0f
-        
-        if (missRatio > 0.50f && totalSuccesses < 15) {
-            // Very high miss rate — likely staring at a white wall
-            // Place wall cells in front of camera at estimated distances
-            val camX = pose.tx()
-            val camZ = pose.tz()
-            
-            // Place walls at 0.5m to 2.5m in front, across the field of view
-            val distances = floatArrayOf(0.6f, 1.0f, 1.5f, 2.0f, 2.5f)
-            val angles = floatArrayOf(-0.4f, -0.2f, 0f, 0.2f, 0.4f) // radians offset from forward
-            
-            for (dist in distances) {
-                for (angleOffset in angles) {
-                    // Rotate forward vector by angle offset
-                    val cos = kotlin.math.cos(angleOffset)
-                    val sin = kotlin.math.sin(angleOffset)
-                    val rotFwdX = fnx * cos - fnz * sin
-                    val rotFwdZ = fnx * sin + fnz * cos
-                    
-                    val wallX = camX + rotFwdX * dist
-                    val wallZ = camZ + rotFwdZ * dist
-                    mapBuilder.markWhiteWall(wallX, wallZ)
-                }
-            }
-        }
-
-        // ── Strategy 4: Adaptive density near wall hits ──────────────────
-        // If hit rate is low, do focused sampling around successful wall hits.
-        // Capped at 16 extra hits to protect frame budget.
-        val hitRate = if (totalAttempts > 0) totalSuccesses.toFloat() / totalAttempts else 0f
-        if (hitRate < 0.30f && wallHitScreenPts.isNotEmpty()) {
-            val offsets = floatArrayOf(-20f, 0f, 20f)
-            var extraHits = 0
-            val maxExtraHits = 16
-            for ((sx, sy) in wallHitScreenPts) {
-                if (extraHits >= maxExtraHits) break
-                for (dx in offsets) for (dy in offsets) {
-                    if (extraHits >= maxExtraHits) break
-                    if (dx == 0f && dy == 0f) continue
-                    val nsx = (sx + dx).coerceIn(0f, surfaceWidth.toFloat())
-                    val nsy = (sy + dy).coerceIn(0f, surfaceHeight.toFloat())
-                    try {
-                        val hits = frame.hitTest(nsx, nsy)
-                        val hit = hits.firstOrNull { h ->
-                            val t = h.trackable
-                            (t is Plane && t.trackingState == TrackingState.TRACKING) ||
-                                    t is com.google.ar.core.DepthPoint
-                        } ?: continue
-                        val hp = hit.hitPose
-                        if (hit.distance > 4.0f) continue
-                        val relY = hp.ty() - cameraY
-                        val isVert = (hit.trackable as? Plane)?.type == Plane.Type.VERTICAL
-                        // Expanded range to match main detection (-0.8f to 1.0f)
-                        if (isVert || relY in -0.8f..1.0f) {
-                            mapBuilder.markHitOccupied(hp.tx(), hp.tz())
-                            extraHits++
-                        }
-                    } catch (_: Exception) {}
-                }
-            }
-        }
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Strategy 1: Depth Image Edge Detection
-    // ─────────────────────────────────────────────────────────────────────────
-
-    /**
-     * Read ARCore's raw depth image and extract wall surfaces that hit-tests miss.
-     * Even on textureless white walls, the ToF/stereo sensor often returns some
-     * depth values — just not enough for ARCore to build a Plane.
+     * Uses acquireRawDepthImage() + acquireRawDepthConfidenceImage() for per-pixel
+     * confidence weighting. Falls back to smoothed depth (confidence=255) on
+     * devices that don't support raw depth.
      *
-     * Approach:
-     *  1. Acquire DEPTH16 image (values in mm).
-     *  2. Sample every 15px in a coarse grid.
-     *  3. Unproject (u, v, depth) → world XYZ using camera intrinsics + pose.
-     *  4. Points at wall height (-0.5 to 0.6m relY) → markDepthImageWall().
-     *  5. Columns of consistent depth → wall surface cluster.
+     * Height classification (relY = point Y - camera Y):
+     *   < -1.2m         → floor (free)
+     *   -1.2m to -0.8m  → furniture/obstacle
+     *   -0.8m to 1.0m   → wall
+     *   > 1.0m          → ceiling (ignore)
      */
-    private fun extractWallsFromDepthImage(frame: Frame, camera: Camera) {
+    private fun extractDepthConfidenceMap(frame: Frame, camera: Camera) {
         if (camera.trackingState != TrackingState.TRACKING) return
-        val depthImage = try { frame.acquireDepthImage() } catch (_: Exception) { return }
+
+        val (depthImage, confImage) = acquireDepthPair(frame) ?: return
+
         try {
-            val w = depthImage.width   // typically 160 or 240
-            val h = depthImage.height  // typically 120 or 180
-            val plane = depthImage.planes[0]
-            val buffer = plane.buffer
-            val rowStride = plane.rowStride
+            val w = depthImage.width
+            val h = depthImage.height
+            val depthPlane = depthImage.planes[0]
+            val depthBuf = depthPlane.buffer
+            val depthRowStride = depthPlane.rowStride
+
+            val confPlane = confImage?.planes?.get(0)
+            val confBuf = confPlane?.buffer
+            val confRowStride = confPlane?.rowStride ?: 0
 
             // Camera intrinsics for unprojection
             val intrinsics = camera.textureIntrinsics
@@ -1183,58 +986,199 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             val principal = intrinsics.principalPoint
             val fx = focalLen[0]; val fy = focalLen[1]
             val cx = principal[0]; val cy = principal[1]
-            // Scale intrinsics from camera image resolution to depth image resolution
             val dims = intrinsics.imageDimensions
             val imageW = dims[0].toFloat()
             val imageH = dims[1].toFloat()
-            val sx = w.toFloat() / imageW
-            val sy = h.toFloat() / imageH
-            val dfx = fx * sx; val dfy = fy * sy
-            val dcx = cx * sx; val dcy = cy * sy
+            val scaleX = w.toFloat() / imageW
+            val scaleY = h.toFloat() / imageH
+            val dfx = fx * scaleX; val dfy = fy * scaleY
+            val dcx = cx * scaleX; val dcy = cy * scaleY
 
             val pose = camera.pose
             val cameraY = pose.ty()
-            val step = 15 // sample every 15 pixels
-            depthPtCount = 0
+            val camWx = pose.tx()
+            val camWz = pose.tz()
 
-            // Collect wall-height points and their grid-column depth
-            // For cluster detection: group by quantized depth (10cm bins)
-            depthBins.clear()
+            val step = 4  // dense sampling: every 4 pixels
+            var wallHitCount = 0
+
+            // Per-column tracking for white wall inference
+            val cols = w / step
+            val colMisses = IntArray(cols)
+            val colWallHits = IntArray(cols)
+            val colFloorHits = IntArray(cols)
+            // Store floor hit world positions per column for white wall marking
+            val colFloorWx = FloatArray(cols)
+            val colFloorWz = FloatArray(cols)
+
+            // Forward direction for white wall inference
+            val q = pose.rotationQuaternion
+            val fwdX = 2f * (q[0] * q[2] + q[1] * q[3])
+            val fwdZ = 1f - 2f * (q[0] * q[0] + q[1] * q[1])
+            val fLen = sqrt(fwdX * fwdX + fwdZ * fwdZ).coerceAtLeast(0.001f)
+            val fnx = fwdX / fLen; val fnz = fwdZ / fLen
 
             for (v in step / 2 until h step step) {
                 for (u in step / 2 until w step step) {
-                    val offset = v * rowStride + u * 2
-                    if (offset + 1 >= buffer.capacity()) continue
-                    val depthMm = (buffer.getShort(offset).toInt() and 0xFFFF)
-                    if (depthMm == 0 || depthMm > 5000) continue // 0 = no data, >5m = unreliable
+                    val colIdx = u / step
+                    val depthOffset = v * depthRowStride + u * 2
+                    if (depthOffset + 1 >= depthBuf.capacity()) continue
+
+                    val depthMm = depthBuf.getShort(depthOffset).toInt() and 0xFFFF
+                    if (depthMm == 0 || depthMm > 5000) {
+                        // No depth data — count as miss for white wall inference
+                        if (colIdx < cols) colMisses[colIdx]++
+                        continue
+                    }
+
+                    // Read per-pixel confidence (0-255), default 255 if no confidence image
+                    val conf = if (confBuf != null) {
+                        val confOffset = v * confRowStride + u
+                        if (confOffset < confBuf.capacity()) {
+                            confBuf.get(confOffset).toInt() and 0xFF
+                        } else 255
+                    } else {
+                        255  // full trust for smoothed depth fallback
+                    }
 
                     val depthM = depthMm / 1000f
 
                     // Unproject to camera-local 3D
                     val localX = ((u - dcx) * depthM) / dfx
                     val localY = ((v - dcy) * depthM) / dfy
-                    val localZ = depthM
 
                     // Transform to world space via camera pose
-                    val world = pose.transformPoint(floatArrayOf(localX, localY, -localZ))
+                    val world = pose.transformPoint(floatArrayOf(localX, localY, -depthM))
+                    val wx = world[0]
+                    val wz = world[2]
                     val relY = world[1] - cameraY
 
-                    // Wall band: near camera height
-                    if (relY in -0.5f..0.6f) {
-                        mapBuilder.markDepthImageWall(world[0], world[2])
-                        // Track depth bin for cluster analysis
-                        val bin = (depthM * 10f).roundToInt() // 10cm bins
-                        depthBins[bin] = (depthBins[bin] ?: 0) + 1
-                    } else if (relY < -1.2f) {
-                        // Floor — also useful
-                        mapBuilder.markHitFree(world[0], world[2])
+                    // Unified confidence-weighted integration
+                    mapBuilder.markDepthPoint(wx, wz, conf, relY)
+
+                    // Track per-column stats for white wall inference
+                    if (colIdx < cols) {
+                        when {
+                            relY < -1.2f -> {
+                                colFloorHits[colIdx]++
+                                colFloorWx[colIdx] = wx
+                                colFloorWz[colIdx] = wz
+                            }
+                            relY in -0.8f..1.0f && conf >= 64 -> {
+                                colWallHits[colIdx]++
+                            }
+                        }
+                    }
+
+                    // Free-ray clearing for every 3rd high-confidence wall hit
+                    if (relY in -0.8f..1.0f && conf >= 128 && depthM > 0.5f) {
+                        wallHitCount++
+                        if (wallHitCount % 3 == 0) {
+                            mapBuilder.markDepthFreeRay(camWx, camWz, wx, wz)
+                        }
                     }
                 }
             }
+
+            // ── White wall inference from per-column miss patterns ──────────
+            inferWhiteWallsFromDepthPattern(
+                cols, colMisses, colWallHits, colFloorHits,
+                colFloorWx, colFloorWz,
+                fnx, fnz, camWx, camWz
+            )
+
         } catch (e: Exception) {
-            println("$TAG: depthImage: ${e.message}")
+            println("$TAG: depthConfidence: ${e.message}")
         } finally {
             depthImage.close()
+            confImage?.close()
+        }
+    }
+
+    /**
+     * Acquire raw depth + confidence images, falling back to smoothed depth
+     * if raw depth is not supported on this device.
+     * Returns null if no depth at all is available.
+     */
+    private fun acquireDepthPair(frame: Frame): Pair<android.media.Image, android.media.Image?>? {
+        // Try raw depth first (cached capability check)
+        if (rawDepthSupported != false) {
+            try {
+                val rawDepth = frame.acquireRawDepthImage()
+                val rawConf = try { frame.acquireRawDepthConfidenceImage() } catch (_: Exception) { null }
+                if (rawDepthSupported == null) {
+                    rawDepthSupported = true
+                    println("$TAG: Raw depth supported: true")
+                }
+                return rawDepth to rawConf
+            } catch (_: Exception) {
+                if (rawDepthSupported == null) {
+                    rawDepthSupported = false
+                    println("$TAG: Raw depth supported: false, falling back to smoothed depth")
+                }
+            }
+        }
+
+        // Fallback: smoothed depth with no confidence image (treat as full confidence)
+        return try {
+            val depth = frame.acquireDepthImage()
+            depth to null
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /**
+     * Infer white walls from per-column depth miss patterns.
+     * Replaces Strategies 5 & 6 from the old hit-test approach with
+     * denser per-column data from the depth image.
+     */
+    private fun inferWhiteWallsFromDepthPattern(
+        cols: Int,
+        colMisses: IntArray, colWallHits: IntArray, colFloorHits: IntArray,
+        colFloorWx: FloatArray, colFloorWz: FloatArray,
+        fnx: Float, fnz: Float,
+        camWx: Float, camWz: Float
+    ) {
+        var totalMisses = 0
+        var totalPoints = 0
+
+        for (col in 0 until cols) {
+            val misses = colMisses[col]
+            val walls = colWallHits[col]
+            val floors = colFloorHits[col]
+            totalMisses += misses
+            totalPoints += misses + walls + floors
+
+            // Strategy 5: Column has floor hits but high misses and no wall hits
+            // → featureless white wall above the floor
+            if (floors >= 1 && walls == 0 && misses >= 3) {
+                val floorX = colFloorWx[col]
+                val floorZ = colFloorWz[col]
+                for (step in 1..4) {
+                    val wallX = floorX + fnx * (0.15f * step)
+                    val wallZ = floorZ + fnz * (0.15f * step)
+                    mapBuilder.markWhiteWall(wallX, wallZ)
+                }
+            }
+        }
+
+        // Strategy 6: Very high overall miss ratio → staring directly at white wall
+        val missRatio = if (totalPoints > 0) totalMisses.toFloat() / totalPoints else 0f
+        if (missRatio > 0.50f && (totalPoints - totalMisses) < 15) {
+            val distances = floatArrayOf(0.6f, 1.0f, 1.5f, 2.0f, 2.5f)
+            val angles = floatArrayOf(-0.4f, -0.2f, 0f, 0.2f, 0.4f)
+            for (dist in distances) {
+                for (angleOffset in angles) {
+                    val cos = kotlin.math.cos(angleOffset)
+                    val sin = kotlin.math.sin(angleOffset)
+                    val rotFwdX = fnx * cos - fnz * sin
+                    val rotFwdZ = fnx * sin + fnz * cos
+                    val wallX = camWx + rotFwdX * dist
+                    val wallZ = camWz + rotFwdZ * dist
+                    mapBuilder.markWhiteWall(wallX, wallZ)
+                }
+            }
         }
     }
 
@@ -1650,14 +1594,15 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     }
 
     private fun buildMapPayload(curPos: Point3D): Map<String, Any> {
-        val localGrid = HashMap(mapBuilder.grid)
+        val localGrid = mapBuilder.grid
         if (localGrid.isEmpty()) return mapOf(
             "occupancyGrid" to ByteArray(0), "gridWidth" to 0, "gridHeight" to 0,
             "gridResolution" to RES.toDouble(), "objects" to emptyList<Any>()
         )
 
-        val gMinX = localGrid.keys.minOf { it.x }; val gMaxX = localGrid.keys.maxOf { it.x }
-        val gMinZ = localGrid.keys.minOf { it.z }; val gMaxZ = localGrid.keys.maxOf { it.z }
+        // Use cached bounds from MapBuilder instead of iterating all keys
+        val gMinX = mapBuilder.minGX; val gMaxX = mapBuilder.maxGX
+        val gMinZ = mapBuilder.minGZ; val gMaxZ = mapBuilder.maxGZ
         val w = gMaxX - gMinX + 1; val h = gMaxZ - gMinZ + 1
 
         val bytes = ByteArray(w * h)
