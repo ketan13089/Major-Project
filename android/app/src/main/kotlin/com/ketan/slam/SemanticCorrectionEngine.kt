@@ -185,82 +185,93 @@ class SemanticCorrectionEngine(
         return sb.toString()
     }
 
-    // ── API Call (with exponential backoff + jitter retries) ───────────────
+    // ── API Call (model fallback + exponential backoff retries) ────────────
 
     /**
-     * Attempts the API call up to [SemanticCorrectionConfig.MAX_RETRIES] + 1 times.
-     * On HTTP 429 or 5xx, sleeps with exponential backoff + jitter before retrying.
-     * Only throws after all retries are exhausted.
+     * Tries each model in [SemanticCorrectionConfig.AI_MODELS] in order.
+     * For each model, retries up to [SemanticCorrectionConfig.MAX_RETRIES] times
+     * with exponential backoff + jitter on 429/5xx.
+     * Falls through to the next model when all retries for one model are exhausted.
+     * Only throws after every model has been tried.
      */
     private fun callApi(userPrompt: String): String? {
-        val maxAttempts = SemanticCorrectionConfig.MAX_RETRIES + 1
-        val requestBody = buildRequestBody(userPrompt)
+        val models = SemanticCorrectionConfig.AI_MODELS
+        val maxRetries = SemanticCorrectionConfig.MAX_RETRIES
 
-        for (attempt in 1..maxAttempts) {
-            val conn = (URL(SemanticCorrectionConfig.AI_ENDPOINT_URL).openConnection() as HttpURLConnection)
-            try {
-                conn.requestMethod = "POST"
-                conn.setRequestProperty("Content-Type", "application/json")
-                conn.setRequestProperty("Authorization", "Bearer ${SemanticCorrectionConfig.apiKey}")
-                conn.setRequestProperty("HTTP-Referer", "com.ketan.slam")
-                conn.connectTimeout = SemanticCorrectionConfig.AI_SEMANTIC_TIMEOUT_MS
-                conn.readTimeout = SemanticCorrectionConfig.AI_SEMANTIC_TIMEOUT_MS
-                conn.doOutput = true
+        for ((modelIdx, model) in models.withIndex()) {
+            val requestBody = buildRequestBody(userPrompt, model)
 
-                OutputStreamWriter(conn.outputStream).use { it.write(requestBody) }
+            for (attempt in 1..maxRetries + 1) {
+                val conn = (URL(SemanticCorrectionConfig.AI_ENDPOINT_URL).openConnection() as HttpURLConnection)
+                try {
+                    conn.requestMethod = "POST"
+                    conn.setRequestProperty("Content-Type", "application/json")
+                    conn.setRequestProperty("Authorization", "Bearer ${SemanticCorrectionConfig.apiKey}")
+                    conn.setRequestProperty("HTTP-Referer", "com.ketan.slam")
+                    conn.connectTimeout = SemanticCorrectionConfig.AI_SEMANTIC_TIMEOUT_MS
+                    conn.readTimeout = SemanticCorrectionConfig.AI_SEMANTIC_TIMEOUT_MS
+                    conn.doOutput = true
 
-                val responseCode = conn.responseCode
+                    OutputStreamWriter(conn.outputStream).use { it.write(requestBody) }
 
-                if (responseCode == 200) {
-                    val response = BufferedReader(InputStreamReader(conn.inputStream)).use { it.readText() }
-                    val responseJson = JSONObject(response)
-                    val choices = responseJson.optJSONArray("choices") ?: return null
-                    if (choices.length() == 0) return null
-                    val message = choices.getJSONObject(0).optJSONObject("message") ?: return null
-                    if (attempt > 1) {
-                        println("$TAG: API succeeded on attempt $attempt/$maxAttempts")
+                    val responseCode = conn.responseCode
+
+                    if (responseCode == 200) {
+                        val response = BufferedReader(InputStreamReader(conn.inputStream)).use { it.readText() }
+                        val responseJson = JSONObject(response)
+                        val choices = responseJson.optJSONArray("choices") ?: return null
+                        if (choices.length() == 0) return null
+                        val message = choices.getJSONObject(0).optJSONObject("message") ?: return null
+                        println("$TAG: API success using $model (attempt $attempt)")
+                        return message.optString("content", null)
                     }
-                    return message.optString("content", null)
-                }
 
-                // Read error body for logging
-                val errorBody = try {
-                    conn.errorStream?.bufferedReader()?.readText() ?: ""
-                } catch (_: Exception) { "" }
+                    // Read error body for logging
+                    val errorBody = try {
+                        conn.errorStream?.bufferedReader()?.readText() ?: ""
+                    } catch (_: Exception) { "" }
 
-                val isRetryable = responseCode == 429 || responseCode in 500..599
-                if (isRetryable && attempt < maxAttempts) {
-                    // Parse Retry-After header if present
-                    val retryAfterSec = conn.getHeaderField("Retry-After")?.toLongOrNull()
-                    val backoffMs = if (retryAfterSec != null && retryAfterSec > 0) {
-                        retryAfterSec * 1000
-                    } else {
-                        computeBackoff(attempt)
+                    val isRetryable = responseCode == 429 || responseCode in 500..599
+                    if (isRetryable && attempt <= maxRetries) {
+                        val retryAfterSec = conn.getHeaderField("Retry-After")?.toLongOrNull()
+                        val backoffMs = if (retryAfterSec != null && retryAfterSec > 0) {
+                            retryAfterSec * 1000
+                        } else {
+                            computeBackoff(attempt)
+                        }
+                        println("$TAG: [$model] HTTP $responseCode attempt $attempt/${maxRetries + 1} — retrying in ${backoffMs}ms")
+                        Thread.sleep(backoffMs)
+                        continue
                     }
-                    println("$TAG: HTTP $responseCode on attempt $attempt/$maxAttempts — retrying in ${backoffMs}ms")
-                    Thread.sleep(backoffMs)
-                    continue
-                }
 
-                // Non-retryable or last attempt
-                println("$TAG: API error $responseCode (attempt $attempt/$maxAttempts): $errorBody")
-                throw RuntimeException("API returned $responseCode")
-            } catch (e: RuntimeException) {
-                throw e  // propagate our own RuntimeException
-            } catch (e: Exception) {
-                // Network errors (timeout, connection reset, etc.)
-                if (attempt < maxAttempts) {
-                    val backoffMs = computeBackoff(attempt)
-                    println("$TAG: network error on attempt $attempt/$maxAttempts (${e.message}) — retrying in ${backoffMs}ms")
-                    Thread.sleep(backoffMs)
-                    continue
+                    // Non-retryable or last attempt for this model
+                    if (isRetryable && modelIdx < models.size - 1) {
+                        println("$TAG: [$model] exhausted retries (HTTP $responseCode) — falling back to next model")
+                        break  // try next model
+                    }
+
+                    println("$TAG: API error $responseCode on $model: $errorBody")
+                    throw RuntimeException("API returned $responseCode")
+                } catch (e: RuntimeException) {
+                    throw e
+                } catch (e: Exception) {
+                    if (attempt <= maxRetries) {
+                        val backoffMs = computeBackoff(attempt)
+                        println("$TAG: [$model] network error attempt $attempt/${maxRetries + 1} (${e.message}) — retrying in ${backoffMs}ms")
+                        Thread.sleep(backoffMs)
+                        continue
+                    }
+                    if (modelIdx < models.size - 1) {
+                        println("$TAG: [$model] network errors exhausted — falling back to next model")
+                        break
+                    }
+                    throw RuntimeException("All models failed. Last error: ${e.message}")
+                } finally {
+                    conn.disconnect()
                 }
-                throw RuntimeException("Network error after $maxAttempts attempts: ${e.message}")
-            } finally {
-                conn.disconnect()
             }
         }
-        return null  // unreachable but satisfies compiler
+        return null
     }
 
     /** Exponential backoff: base * 2^(attempt-1) + random jitter up to 2s. */
@@ -271,9 +282,9 @@ class SemanticCorrectionEngine(
         return capped + jitter
     }
 
-    private fun buildRequestBody(userPrompt: String): String {
+    private fun buildRequestBody(userPrompt: String, model: String): String {
         return JSONObject().apply {
-            put("model", SemanticCorrectionConfig.AI_MODEL)
+            put("model", model)
             put("messages", JSONArray().apply {
                 put(JSONObject().apply {
                     put("role", "system")

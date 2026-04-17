@@ -47,6 +47,45 @@ class MeshRenderer {
                 gl_FragColor = u_Color;
             }
         """
+
+        // Grid shader: passes world-space position to fragment, which computes
+        // a procedural grid so vertical walls show as a mesh/wireframe rather
+        // than a solid colored overlay that blocks the camera preview.
+        private const val GRID_VERTEX_SHADER = """
+            uniform mat4 u_MVP;
+            attribute vec4 a_Position;
+            varying vec3 v_WorldPos;
+            void main() {
+                v_WorldPos = a_Position.xyz;
+                gl_Position = u_MVP * a_Position;
+            }
+        """
+
+        // Grid cell size in metres; line thickness controlled by fwidth for
+        // roughly constant on-screen pixel width regardless of distance.
+        private const val GRID_FRAGMENT_SHADER = """
+            #extension GL_OES_standard_derivatives : enable
+            precision mediump float;
+            uniform vec4 u_Color;
+            varying vec3 v_WorldPos;
+
+            float gridLine(vec2 uv) {
+                vec2 g = abs(fract(uv - 0.5) - 0.5) / fwidth(uv);
+                float line = min(g.x, g.y);
+                return 1.0 - min(line, 1.0);
+            }
+
+            void main() {
+                // Grid in the wall's vertical plane: use world Y and horizontal
+                // distance (X+Z projected) so lines stay aligned with gravity.
+                vec2 uv = vec2(v_WorldPos.x + v_WorldPos.z, v_WorldPos.y) * 4.0; // 0.25 m cells
+                float line = gridLine(uv);
+                // Bright grid lines, nearly transparent fill so the camera feed shows through.
+                vec3 rgb = u_Color.rgb;
+                float alpha = mix(0.04, 0.85, line);
+                gl_FragColor = vec4(rgb, alpha);
+            }
+        """
     }
 
     enum class SurfaceType(val r: Float, val g: Float, val b: Float, val a: Float) {
@@ -61,6 +100,13 @@ class MeshRenderer {
     private var aPosition = -1
     private var uMvp = -1
     private var uColor = -1
+
+    // Grid program (used for walls / vertical planes)
+    private var gridProgram = 0
+    private var gridAPosition = -1
+    private var gridUMvp = -1
+    private var gridUColor = -1
+    private var gridSupported = false
 
     // Reusable vertex buffer — large enough for any single plane
     // 3 floats per vertex × MAX_VERTS (+1 for fan center)
@@ -105,6 +151,31 @@ class MeshRenderer {
         aPosition = GLES20.glGetAttribLocation(program, "a_Position")
         uMvp      = GLES20.glGetUniformLocation(program, "u_MVP")
         uColor    = GLES20.glGetUniformLocation(program, "u_Color")
+
+        // Grid program — may fail on GPUs without OES_standard_derivatives;
+        // in that case we silently fall back to the solid shader for walls.
+        try {
+            val gvs = compileShader(GLES20.GL_VERTEX_SHADER, GRID_VERTEX_SHADER)
+            val gfs = compileShader(GLES20.GL_FRAGMENT_SHADER, GRID_FRAGMENT_SHADER)
+            gridProgram = GLES20.glCreateProgram()
+            GLES20.glAttachShader(gridProgram, gvs)
+            GLES20.glAttachShader(gridProgram, gfs)
+            GLES20.glLinkProgram(gridProgram)
+            val gs = IntArray(1)
+            GLES20.glGetProgramiv(gridProgram, GLES20.GL_LINK_STATUS, gs, 0)
+            if (gs[0] == 0) {
+                GLES20.glDeleteProgram(gridProgram)
+                gridProgram = 0
+            } else {
+                gridAPosition = GLES20.glGetAttribLocation(gridProgram, "a_Position")
+                gridUMvp      = GLES20.glGetUniformLocation(gridProgram, "u_MVP")
+                gridUColor    = GLES20.glGetUniformLocation(gridProgram, "u_Color")
+                gridSupported = true
+            }
+        } catch (_: RuntimeException) {
+            gridProgram = 0
+            gridSupported = false
+        }
     }
 
     // ── Plane rendering ───────────────────────────────────────────────────────
@@ -263,7 +334,13 @@ class MeshRenderer {
         mode: Int,
         type: SurfaceType
     ) {
-        GLES20.glUseProgram(program)
+        val useGrid = type == SurfaceType.WALL && gridSupported && gridProgram != 0
+        val prog = if (useGrid) gridProgram else program
+        val attrib = if (useGrid) gridAPosition else aPosition
+        val mvpLoc = if (useGrid) gridUMvp else uMvp
+        val colorLoc = if (useGrid) gridUColor else uColor
+
+        GLES20.glUseProgram(prog)
 
         // Blending
         GLES20.glEnable(GLES20.GL_BLEND)
@@ -274,18 +351,23 @@ class MeshRenderer {
         GLES20.glDepthMask(false)
 
         // Uniforms
-        GLES20.glUniformMatrix4fv(uMvp, 1, false, mvpMatrix, 0)
-        GLES20.glUniform4f(uColor, type.r, type.g, type.b, type.a)
+        GLES20.glUniformMatrix4fv(mvpLoc, 1, false, mvpMatrix, 0)
+        // Wall grid uses brighter base RGB; fragment shader modulates alpha.
+        if (useGrid) {
+            GLES20.glUniform4f(colorLoc, type.r, type.g, type.b, 1.0f)
+        } else {
+            GLES20.glUniform4f(colorLoc, type.r, type.g, type.b, type.a)
+        }
 
         // Vertex attrib
         buffer.position(0)
-        GLES20.glVertexAttribPointer(aPosition, 3, GLES20.GL_FLOAT, false, 0, buffer)
-        GLES20.glEnableVertexAttribArray(aPosition)
+        GLES20.glVertexAttribPointer(attrib, 3, GLES20.GL_FLOAT, false, 0, buffer)
+        GLES20.glEnableVertexAttribArray(attrib)
 
         GLES20.glDrawArrays(mode, 0, vertCount)
 
         // Cleanup
-        GLES20.glDisableVertexAttribArray(aPosition)
+        GLES20.glDisableVertexAttribArray(attrib)
         GLES20.glDepthMask(true)
         GLES20.glDisable(GLES20.GL_BLEND)
     }

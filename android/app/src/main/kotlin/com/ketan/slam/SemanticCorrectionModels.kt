@@ -73,11 +73,15 @@ object SemanticCorrectionConfig {
     /** OpenRouter endpoint. */
     const val AI_ENDPOINT_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-    /** Model identifier. */
-    const val AI_MODEL = "google/gemma-4-31b-it:free"
+    /** Primary model — tries these in order on 429 rate limits. */
+    val AI_MODELS = listOf(
+        "nvidia/nemotron-3-super-120b-a12b:free",
+        "google/gemma-4-26b-a4b-it:free",
+        "minimax/minimax-m2.5:free"
+    )
 
     // Retry policy
-    const val MAX_RETRIES = 4
+    const val MAX_RETRIES = 3
     const val RETRY_BASE_DELAY_MS = 5_000L
     const val RETRY_MAX_DELAY_MS = 60_000L
 

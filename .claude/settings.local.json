@@ -25,7 +25,9 @@
       "Bash(/Users/omvarma/.pyenv/versions/3.7.17/bin/python3:*)",
       "Bash(ls /Users/omvarma/Desktop/ketan/Major-Project/android/app/src/main/kotlin/com/ketan/slam/*.kt)",
       "Bash(ls -lh /Users/omvarma/Desktop/ketan/Major-Project/android/app/src/main/assets/*.tflite)",
-      "Bash(./gradlew :app:testDebugUnitTest --tests \"com.ketan.slam.SemanticCorrectionTest\")"
+      "Bash(./gradlew :app:testDebugUnitTest --tests \"com.ketan.slam.SemanticCorrectionTest\")",
+      "WebFetch(domain:openrouter.ai)",
+      "Bash(find /Users/omvarma/Desktop/ketan/Major-Project -name \"build.gradle*\" -type f -exec grep -l \"arcore\" {} \\\\;)"
     ]
   }
 }
