@@ -21,16 +21,16 @@ Open (or create) the file:
 Add two lines (alongside any existing `sdk.dir=`, `openrouter.api.key=`, etc.):
 
 ```properties
-llm.assistant.api.key=PUT_YOUR_OPENROUTER_KEY_HERE
-llm.assistant.model=PUT_YOUR_MODEL_ID_HERE
+llm.assistant.api.key=sk-or-v1-...
+llm.assistant.model=z-ai/glm-4.6v
 ```
 
 Notes:
 - The key is a standard OpenRouter key starting with `sk-or-...`.
-- The model id is the OpenRouter string for GLM 4.7 — look it up at
-  https://openrouter.ai/models and paste the exact id (e.g. something like
-  `z-ai/glm-4.6` or `thudm/glm-4.7-plus`; OpenRouter's catalog is the source
-  of truth).
+- `z-ai/glm-4.6v` is the multimodal GLM 4.6 — it's what this project uses
+  because the vision-update flow needs image input. If you later swap to a
+  text-only model (e.g. `z-ai/glm-4.7`), bump `VISION_UPDATE_INTERVAL_MS` to
+  a very high value in `LlmAssistant.kt` so the image calls stop firing.
 - `local.properties` is already gitignored. Never commit the key.
 - If either line is blank the assistant stays disabled at runtime and the
   FABs show a toast explaining that.

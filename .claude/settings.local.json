@@ -31,7 +31,8 @@
       "Bash(find C:UsersketanStudioProjectsslam -type f -name *.kt -o -name *.gradle)",
       "Bash(./gradlew :app:compileDebugKotlin)",
       "Bash(git commit *)",
-      "Bash(git push *)"
+      "Bash(git push *)",
+      "WebSearch"
     ]
   }
 }
