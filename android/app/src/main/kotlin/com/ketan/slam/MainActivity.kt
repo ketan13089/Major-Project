@@ -14,8 +14,45 @@ class MainActivity : FlutterActivity() {
 
     private val CHANNEL = "com.ketan.slam/ar"
     private val MAP_STORE_CHANNEL = "com.ketan.slam/map_store"
+    private val MAP_CHANNEL = "com.ketan.slam/map"
     private val TTS_CHANNEL = "com.ketan.slam/tts"
     private val VOLUME_CHANNEL = "com.ketan.slam/volume_buttons"
+
+    companion object {
+        /**
+         * Installs the baseline `com.ketan.slam/map` handler on the given
+         * Flutter engine. Answers read-only PerformanceTracker queries so the
+         * dashboard works even when ArActivity isn't running. Other methods
+         * respond with a friendly "ar_not_running" error rather than timing
+         * out silently.
+         *
+         * ArActivity overrides this with its richer handler while it's alive
+         * and must call this again from onDestroy to restore the baseline.
+         */
+        fun installBaselineMapChannel(context: android.content.Context, engine: FlutterEngine) {
+            MethodChannel(engine.dartExecutor.binaryMessenger, "com.ketan.slam/map")
+                .setMethodCallHandler { call, result ->
+                    when (call.method) {
+                        "getPerformanceMetrics" -> {
+                            // Safe even if no AR session has ever run — returns zeroed snapshot.
+                            result.success(PerformanceTracker.snapshot().toFlatMap())
+                        }
+                        "exportPerformanceReport" -> {
+                            val path = PerformanceTracker.exportJson(context)
+                            if (path != null) result.success(mapOf("path" to path))
+                            else result.error("EXPORT_FAILED", "Failed to export report", null)
+                        }
+                        // Anything that requires the live AR session is unavailable here.
+                        "saveMap", "loadMap", "listMaps", "deleteMap",
+                        "triggerEmergency" -> {
+                            result.error("AR_NOT_RUNNING",
+                                "AR session is not active. Open the AR scan first.", null)
+                        }
+                        else -> result.notImplemented()
+                    }
+                }
+        }
+    }
 
     private lateinit var accessibilityHandler: AccessibilityHandler
     private var volumeNavEnabled = true
@@ -42,6 +79,11 @@ class MainActivity : FlutterActivity() {
         FlutterEngineCache
             .getInstance()
             .put("slam_engine", flutterEngine)
+
+        // Baseline map channel: makes the Performance Metrics dashboard work
+        // even when no AR scan is running. ArActivity installs its fuller
+        // handler on top of this while live, then restores this one onDestroy.
+        installBaselineMapChannel(this, flutterEngine)
 
         // Set up method channel for opening AR
         MethodChannel(

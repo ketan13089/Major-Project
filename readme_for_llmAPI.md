@@ -66,12 +66,26 @@ The Gradle build reads `local.properties` and injects both values into
 
 ## 5. Tuning
 
-Runtime constants (edit in `LlmAssistant.kt` → `LlmAssistantConfig`):
+Most cost/rate controls live in `LlmCallGuard.kt` (cooldowns, motion gates):
 
-- `VISION_UPDATE_INTERVAL_MS` — how often vision updates fire (default 12 s)
-- `CONTEXT_RADIUS_M` — how many metres of map are serialized per call (10 m)
-- `MAX_CONTEXT_OBJECTS` — token budget for NEARBY_OBJECTS (40)
+- `ASK_COOLDOWN_MS` (2.5 s), `NAVIGATE_COOLDOWN_MS` (3 s), `VISION_COOLDOWN_MS` (15 s)
+- `VISION_MOVE_THRESHOLD_M` (1.2 m) — resend when user has walked this far
+- `VISION_TURN_THRESHOLD_RAD` (~25°) — resend when user has rotated this much
+- `VISION_IDLE_REFRESH_MS` (60 s) — force refresh if stationary this long
+- `VISION_FRAME_SIMILARITY` (6%) — skip resend when scene looks unchanged
+
+Prompt/shape controls live in `LlmAssistant.kt` → `LlmAssistantConfig`:
+
+- `CONTEXT_RADIUS_M` (10 m) — map radius serialized per call
+- `MAX_CONTEXT_OBJECTS` (30) — cap on NEARBY_OBJECTS token cost
+- `VISION_JPEG_QUALITY` (55) — image compression, lower = cheaper
 - `TEMPERATURE`, `MAX_TOKENS`, `TIMEOUT_MS` — standard knobs
+
+The Ask button only attaches the camera image for *visual* questions
+(keywords in `AskNeedsImageClassifier`). Map-only questions ("how far is
+the nearest door") stay text-only and cost ~3–5× less. The Guide button
+is text-only on the first attempt and only retries with an image if the
+LLM returns no target on the text-only pass.
 
 ## 6. Permissions already in the manifest
 

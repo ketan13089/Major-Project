@@ -160,12 +160,23 @@ object PerformanceTracker {
             val avg = s.average()
             if (avg > 0f) 1000f / avg else 0f
         }
+        // Guard against empty-sample + division edge cases: min/max return 0
+        // when the deque has no entries, which would yield Infinity when
+        // inverted to FPS and crash the Dart side on JSON serialization.
+        val minFps = frameTimes.let {
+            if (it.size() == 0) 0f
+            else { val m = it.max(); if (m > 0f) 1000f / m else 0f }
+        }
+        val maxFps = frameTimes.let {
+            if (it.size() == 0) 0f
+            else { val m = it.min(); if (m > 0f) 1000f / m else 0f }
+        }
         return PerformanceSnapshot(
             sessionDurationSec = sessionDurationSec,
             totalFrames = totalFrames.get(),
             avgFps = fps,
-            minFps = frameTimes.let { if (it.max() > 0f) 1000f / it.max() else 0f },
-            maxFps = frameTimes.let { if (it.min() > 0f) 1000f / it.min() else 0f },
+            minFps = minFps,
+            maxFps = maxFps,
 
             yoloAvgMs = yoloLatencies.average(),
             yoloP95Ms = yoloLatencies.percentile(95f),
@@ -448,31 +459,37 @@ data class PerformanceSnapshot(
         })
     }
 
-    fun toFlatMap(): Map<String, Any> = mapOf(
-        "sessionDurationSec" to sessionDurationSec,
-        "totalFrames" to totalFrames,
-        "avgFps" to avgFps, "minFps" to minFps, "maxFps" to maxFps,
-        "yoloAvgMs" to yoloAvgMs, "yoloP95Ms" to yoloP95Ms, "yoloMaxMs" to yoloMaxMs,
-        "totalYoloRuns" to totalYoloRuns, "totalDetections" to totalDetections,
-        "avgConfidence" to avgConfidence, "avgDetectionsPerRun" to avgDetectionsPerRun,
-        "ocrAvgMs" to ocrAvgMs, "ocrP95Ms" to ocrP95Ms,
-        "totalOcrRuns" to totalOcrRuns, "totalTextDetections" to totalTextDetections,
-        "rebuildAvgMs" to rebuildAvgMs, "rebuildMaxMs" to rebuildMaxMs,
-        "totalRebuilds" to totalRebuilds,
-        "lightRebuildAvgMs" to lightRebuildAvgMs, "totalLightRebuilds" to totalLightRebuilds,
-        "currentGridSize" to currentGridSize, "peakGridSize" to peakGridSize,
-        "currentFreeCells" to currentFreeCells, "currentWallCells" to currentWallCells,
-        "currentObstacleCells" to currentObstacleCells, "currentVisitedCells" to currentVisitedCells,
-        "pathPlanAvgMs" to pathPlanAvgMs, "pathPlanMaxMs" to pathPlanMaxMs,
-        "avgPathLength" to avgPathLength,
-        "totalPathPlans" to totalPathPlans, "failedPathPlans" to failedPathPlans,
-        "avgDrift" to avgDrift, "maxDrift" to maxDrift,
-        "totalDriftRebuilds" to totalDriftRebuilds, "totalKeyframes" to totalKeyframes,
-        "currentObjectCount" to currentObjectCount, "peakObjectCount" to peakObjectCount,
-        "totalNavSessions" to totalNavSessions, "successfulNavSessions" to successfulNavSessions,
-        "avgNavDurationSec" to avgNavDurationSec, "avgReplansPerSession" to avgReplansPerSession,
-        "avgMemoryMb" to avgMemoryMb, "peakMemoryMb" to peakMemoryMb
-    )
+    fun toFlatMap(): Map<String, Any> {
+        // Flutter's StandardMethodCodec rejects NaN/Infinity doubles, which
+        // would silently fail the whole invokeMethod() and leave the Dart
+        // dashboard stuck on "waiting for data". Sanitize every float.
+        fun f(v: Float): Float = if (v.isFinite()) v else 0f
+        return mapOf(
+            "sessionDurationSec" to f(sessionDurationSec),
+            "totalFrames" to totalFrames,
+            "avgFps" to f(avgFps), "minFps" to f(minFps), "maxFps" to f(maxFps),
+            "yoloAvgMs" to f(yoloAvgMs), "yoloP95Ms" to f(yoloP95Ms), "yoloMaxMs" to f(yoloMaxMs),
+            "totalYoloRuns" to totalYoloRuns, "totalDetections" to totalDetections,
+            "avgConfidence" to f(avgConfidence), "avgDetectionsPerRun" to f(avgDetectionsPerRun),
+            "ocrAvgMs" to f(ocrAvgMs), "ocrP95Ms" to f(ocrP95Ms),
+            "totalOcrRuns" to totalOcrRuns, "totalTextDetections" to totalTextDetections,
+            "rebuildAvgMs" to f(rebuildAvgMs), "rebuildMaxMs" to f(rebuildMaxMs),
+            "totalRebuilds" to totalRebuilds,
+            "lightRebuildAvgMs" to f(lightRebuildAvgMs), "totalLightRebuilds" to totalLightRebuilds,
+            "currentGridSize" to f(currentGridSize), "peakGridSize" to f(peakGridSize),
+            "currentFreeCells" to f(currentFreeCells), "currentWallCells" to f(currentWallCells),
+            "currentObstacleCells" to f(currentObstacleCells), "currentVisitedCells" to f(currentVisitedCells),
+            "pathPlanAvgMs" to f(pathPlanAvgMs), "pathPlanMaxMs" to f(pathPlanMaxMs),
+            "avgPathLength" to f(avgPathLength),
+            "totalPathPlans" to totalPathPlans, "failedPathPlans" to failedPathPlans,
+            "avgDrift" to f(avgDrift), "maxDrift" to f(maxDrift),
+            "totalDriftRebuilds" to totalDriftRebuilds, "totalKeyframes" to totalKeyframes,
+            "currentObjectCount" to f(currentObjectCount), "peakObjectCount" to peakObjectCount,
+            "totalNavSessions" to totalNavSessions, "successfulNavSessions" to successfulNavSessions,
+            "avgNavDurationSec" to f(avgNavDurationSec), "avgReplansPerSession" to f(avgReplansPerSession),
+            "avgMemoryMb" to f(avgMemoryMb), "peakMemoryMb" to f(peakMemoryMb)
+        )
+    }
 
     private fun Float.f1() = "%.1f".format(this)
     private fun Float.f2() = "%.2f".format(this)

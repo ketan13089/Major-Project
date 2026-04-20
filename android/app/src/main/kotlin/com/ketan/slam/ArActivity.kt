@@ -173,6 +173,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     private var llmUi: LlmAssistantUi? = null
     private val llmExecutor: java.util.concurrent.ExecutorService =
         Executors.newSingleThreadExecutor()
+    private val llmGuard = LlmCallGuard()
     // Latest YUV snapshot (re-published from the shared-camera listener) for
     // vision updates. We copy these once per listener tick, not per frame.
     @Volatile private var llmLastYuv: LlmYuvSnapshot? = null
@@ -417,30 +418,41 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         val pose = latestPose ?: run {
             llmUi?.toast("Waiting for tracking — try again in a moment"); return
         }
+        if (!llmGuard.tryBeginAsk(System.currentTimeMillis())) {
+            llmUi?.toast("Please wait a moment before asking again"); return
+        }
+
         val snap = llmLastYuv
-        
+        val needsImage = AskNeedsImageClassifier.needsImage(text)
+
         llmUi?.showLoading(true)
         llmExecutor.execute {
-            // Encode the most recent YUV snapshot to Base64 to send the user's view 
-            // the exact moment they hit the green "Ask" button.
-            val b64 = snap?.let {
+            val b64 = if (needsImage && snap != null) {
                 LlmImageEncoder.yuvToBase64Jpeg(
-                    it.y, it.u, it.v,
-                    it.yStride, it.uvStride, it.uvPixStride,
-                    it.width, it.height
+                    snap.y, snap.u, snap.v,
+                    snap.yStride, snap.uvStride, snap.uvPixStride,
+                    snap.width, snap.height,
+                    quality = LlmAssistantConfig.VISION_JPEG_QUALITY
                 )
-            }
-            
+            } else null
+
             val result = try {
                 assistant.query(text, pose.tx(), pose.tz(), latestHeading, b64)
             } catch (e: Exception) { println("$TAG: LLM query: ${e.message}"); null }
+            finally { llmGuard.endAsk() }
+
             runOnUiThread {
                 llmUi?.showLoading(false)
                 if (result == null) {
                     llmUi?.toast("Assistant unavailable. Check network or API key.")
                 } else {
-                    llmUi?.showReply(result.answer)
-                    announcer?.speak(result.answer)
+                    val clean = TtsSanitizer.clean(result.answer)
+                    if (clean.isBlank()) {
+                        llmUi?.toast("Empty response from assistant.")
+                    } else {
+                        llmUi?.showReply(clean)
+                        announcer?.speak(clean)
+                    }
                 }
             }
         }
@@ -453,23 +465,57 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         val pose = latestPose ?: run {
             llmUi?.toast("Waiting for tracking — try again in a moment"); return
         }
+        if (!llmGuard.tryBeginNavigate(System.currentTimeMillis())) {
+            llmUi?.toast("Please wait a moment before navigating again"); return
+        }
+
         llmUi?.showLoading(true)
         llmExecutor.execute {
-            val result = try {
+            // First attempt: text-only (map is usually enough).
+            var result = try {
                 assistant.navigate(text, pose.tx(), pose.tz(), latestHeading)
             } catch (e: Exception) { println("$TAG: LLM navigate: ${e.message}"); null }
+
+            // Fallback: if the LLM found nothing in the map, retry ONCE with
+            // the camera image so it can visually identify what the user
+            // meant (e.g. "the glass door"). This is gated by the same
+            // navigate cooldown so we can't loop.
+            if (result != null && result.targetObjectId == null &&
+                result.targetWorldX == null && result.targetWorldZ == null) {
+                val snap = llmLastYuv
+                if (snap != null) {
+                    val b64 = LlmImageEncoder.yuvToBase64Jpeg(
+                        snap.y, snap.u, snap.v,
+                        snap.yStride, snap.uvStride, snap.uvPixStride,
+                        snap.width, snap.height,
+                        quality = LlmAssistantConfig.VISION_JPEG_QUALITY
+                    )
+                    if (b64 != null) {
+                        val retry = try {
+                            assistant.navigate(text, pose.tx(), pose.tz(), latestHeading, b64)
+                        } catch (e: Exception) { println("$TAG: LLM navigate retry: ${e.message}"); null }
+                        if (retry != null) result = retry
+                    }
+                }
+            }
+
+            llmGuard.endNavigate()
+
             runOnUiThread {
                 llmUi?.showLoading(false)
                 if (result == null) {
                     llmUi?.toast("Could not plan route.")
                     return@runOnUiThread
                 }
-                llmUi?.showReply(result.spoken)
-                announcer?.speak(result.spoken)
+                val cleanSpoken = TtsSanitizer.clean(result.spoken)
+                if (cleanSpoken.isNotBlank()) {
+                    llmUi?.showReply(cleanSpoken)
+                    announcer?.speak(cleanSpoken)
+                }
 
                 val dest = resolveLlmDestination(result)
                 if (dest == null) {
-                    announcer?.speak("I couldn't find a matching destination on the map yet. Keep scanning and try again.")
+                    announcer?.speak("I couldn't find a matching destination yet. Keep scanning and try again.")
                     return@runOnUiThread
                 }
                 startLlmNavigationTo(dest)
@@ -529,16 +575,53 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         maybeRunVisionUpdate()
     }
 
+    /**
+     * Vision-update scheduler. Called every frame the shared-camera listener
+     * hands us a YUV snapshot, but the [LlmCallGuard] short-circuits cheaply
+     * so this almost always returns immediately. The call is only made when:
+     *   • assistant is configured,
+     *   • previous call finished + cooldown elapsed,
+     *   • user moved/turned enough OR session is idle-refresh overdue,
+     *   • resulting JPEG differs meaningfully from the last one.
+     * Results merge back into [semanticMap] so the orange button can use them.
+     */
     private fun maybeRunVisionUpdate() {
-        // Disabled background YOLO/LLM vision pushing.
-        // User explicitly requested LLM queries only on green button tap.
+        val assistant = llmAssistant ?: return
+        val pose = latestPose ?: return
+        val snap = llmLastYuv ?: return
+        val now = System.currentTimeMillis()
+        if (!llmGuard.shouldStartVision(now, pose.tx(), pose.tz(), latestHeading)) return
+
+        llmExecutor.execute {
+            val b64 = LlmImageEncoder.yuvToBase64Jpeg(
+                snap.y, snap.u, snap.v,
+                snap.yStride, snap.uvStride, snap.uvPixStride,
+                snap.width, snap.height,
+                quality = LlmAssistantConfig.VISION_JPEG_QUALITY
+            ) ?: return@execute
+
+            val jpegSize = (b64.length * 3) / 4  // approx. bytes from base64 length
+            if (!llmGuard.commitVisionStart(now, pose.tx(), pose.tz(), latestHeading, jpegSize)) {
+                return@execute  // similar frame, user stationary → skip the call
+            }
+
+            val result = try {
+                assistant.visionUpdate(b64, pose.tx(), pose.tz(), latestHeading)
+            } catch (e: Exception) { println("$TAG: LLM vision: ${e.message}"); null }
+            finally { llmGuard.endVision() }
+
+            if (result != null) applyVisionResult(result, pose)
+        }
     }
 
     /**
-     * Merge LLM vision observations into the semantic map by projecting each
-     * (direction, distance_bucket) into approximate world coordinates in
-     * front/left/right/back of the user, then calling semanticMap.addObject
-     * (which de-duplicates nearby entries of the same type).
+     * Merge LLM vision observations into the semantic map. Each observation
+     * is projected from (direction, distance bucket) into world coords and
+     * then given a stable id derived from the label + quantised grid cell so
+     * re-observations deduplicate instead of spawning fresh entries.
+     *
+     * SemanticMapManager.addObject already fuses nearby same-type objects,
+     * so slight mis-projection on re-observation is tolerable.
      */
     private fun applyVisionResult(result: LlmVisionUpdate, pose: com.google.ar.core.Pose) {
         val userX = pose.tx(); val userZ = pose.tz()
@@ -561,9 +644,15 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             val tx = userX + kotlin.math.sin(worldBearing) * distance
             val tz = userZ - kotlin.math.cos(worldBearing) * distance
 
+            // Stable id: label + 1-metre grid cell. Re-observing "door" in the
+            // same ~1m patch will update the existing entry instead of adding.
+            val cellX = kotlin.math.floor(tx.toDouble()).toInt()
+            val cellZ = kotlin.math.floor(tz.toDouble()).toInt()
+            val stableId = "llm_vis_${obs.label.lowercase().replace(' ', '_')}_${cellX}_${cellZ}"
+
             val type = ObjectType.fromLabel(obs.label)
             val obj = SemanticObject(
-                id = "llm_vis_${now}_${obs.label.hashCode()}",
+                id = stableId,
                 type = type,
                 category = obs.label,
                 position = Point3D(tx, pose.ty(), tz),
@@ -571,7 +660,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
                 confidence = 0.6f,
                 firstSeen = now,
                 lastSeen = now,
-                observations = 1,
+                observations = 2,  // ≥2 so NavigationManager.selectDestination accepts it
                 localizationMethod = "llm_vision"
             )
             semanticMap.addObject(obj)
@@ -594,7 +683,15 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         try { surfaceView.onPause() } catch (_: Exception) {}
         // Clear channel handlers so stale callbacks don't fire on destroyed activity
         try { navChannel?.setMethodCallHandler(null) } catch (_: Exception) {}
-        try { mapChannel?.setMethodCallHandler(null) } catch (_: Exception) {}
+        // Restore MainActivity's baseline map-channel handler so the
+        // PerformanceDashboard still works after AR closes.
+        try {
+            val engine = FlutterEngineCache.getInstance().get("slam_engine")
+            if (engine != null) MainActivity.installBaselineMapChannel(applicationContext, engine)
+            else mapChannel?.setMethodCallHandler(null)
+        } catch (_: Exception) {
+            try { mapChannel?.setMethodCallHandler(null) } catch (_: Exception) {}
+        }
         methodChannel = null
         navChannel = null
         mapChannel = null

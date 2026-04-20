@@ -32,16 +32,47 @@ object LlmAssistantConfig {
     const val MAX_TOKENS = 800
     const val TEMPERATURE = 0.2
 
-    /** Minimum interval between vision-based map update calls (ms). */
-    const val VISION_UPDATE_INTERVAL_MS = 20_000L
+    /** JPEG quality for images sent to the LLM. Lower → smaller, cheaper. */
+    const val VISION_JPEG_QUALITY = 55
 
     /** Radius around the user to include in serialized context (metres). */
     const val CONTEXT_RADIUS_M = 10.0f
 
     /** Max objects to describe in one prompt (keeps token use bounded). */
-    const val MAX_CONTEXT_OBJECTS = 40
+    const val MAX_CONTEXT_OBJECTS = 30
 
     val enabled: Boolean get() = apiKey.isNotBlank() && model.isNotBlank()
+}
+
+/**
+ * Heuristic that decides whether an Ask-button question should ship the
+ * camera image to the LLM. Questions about what's visible → yes; questions
+ * answerable from the map alone (distance, direction, counts) → no.
+ *
+ * Kept local (no LLM call) so it's free and instantaneous.
+ */
+object AskNeedsImageClassifier {
+    private val visualKeywords = listOf(
+        "see", "look", "visible", "in front", "ahead",
+        "color", "colour", "shape", "describe", "read",
+        "sign", "text on", "what's this", "what is this",
+        "looks like", "appearance", "picture", "image",
+        "show me", "identify"
+    )
+    private val mapOnlyKeywords = listOf(
+        "how far", "distance", "nearest", "farthest", "how many",
+        "count", "which direction", "where is", "where's",
+        "closest", "behind me", "to my left", "to my right"
+    )
+
+    fun needsImage(userText: String): Boolean {
+        val lower = userText.lowercase()
+        // Map-only questions trump — if user asks "where is the door", no image.
+        if (mapOnlyKeywords.any { lower.contains(it) }) return false
+        if (visualKeywords.any { lower.contains(it) }) return true
+        // Default: don't attach image. Cheaper.
+        return false
+    }
 }
 
 /** The three LLM flows the app supports. */
@@ -204,15 +235,6 @@ class LlmAssistant(
 ) {
     private val TAG = "LlmAssistant"
 
-    // Pending vision-update throttle
-    @Volatile private var lastVisionMs = 0L
-
-    fun shouldRunVisionUpdate(now: Long): Boolean =
-        LlmAssistantConfig.enabled &&
-        now - lastVisionMs >= LlmAssistantConfig.VISION_UPDATE_INTERVAL_MS
-
-    fun markVisionRun(now: Long) { lastVisionMs = now }
-
     // ── Public flows ──────────────────────────────────────────────────────────
 
     /** Free-form question about the environment. Runs on the caller thread. */
@@ -227,9 +249,16 @@ class LlmAssistant(
         val system = """
             You are an AR navigation assistant. The user is inside a building
             and has a phone streaming a semantic map of their surroundings.
-            Answer the user's question concisely, using ONLY the environment
-            data provided and the visual image supplied. If the answer isn't derivable from the data, say so.
-            Respond as a JSON object: {"answer": "<your spoken reply>"}.
+            Answer the user's question concisely in one or two sentences using
+            ONLY the environment data provided (and the camera image, if one
+            is attached). If the answer cannot be derived, say so briefly.
+
+            Output exactly one JSON object: {"answer": "<plain spoken reply>"}
+            Rules for the "answer" value:
+              • Plain natural sentences only.
+              • No markdown, bullets, code, emojis, or bracketed meta-text.
+              • No prefixes like "Answer:" or "Assistant:".
+              • Under 60 words.
         """.trimIndent()
 
         val user = """
@@ -244,30 +273,40 @@ class LlmAssistant(
         return LlmQueryResult(answer = answer, raw = raw)
     }
 
-    /** "Guide me to X" — LLM chooses the best matching object id. */
+    /**
+     * "Guide me to X" — LLM chooses the best matching object id. By default
+     * no image is attached (map + labels are enough for most requests); pass
+     * [base64Image] to retry with vision when the first pass returns no
+     * target_id.
+     */
     fun navigate(
         userText: String,
-        userX: Float, userZ: Float, headingRad: Float
+        userX: Float, userZ: Float, headingRad: Float,
+        base64Image: String? = null
     ): LlmNavigateResult? {
         if (!LlmAssistantConfig.enabled) return null
 
         val env = LlmContextBuilder.buildEnvironmentText(userX, userZ, headingRad, semanticMap, mapBuilder)
         val system = """
             You are an AR navigation planner. The user wants to be guided to
-            a destination. Choose the single best matching object from the
-            NEARBY_OBJECTS list by matching its type/text/room against the
-            user's request. Prefer higher observation counts and appropriate
-            qualifiers (nearest, farthest, left, right).
+            a destination. Choose the single best matching object from
+            NEARBY_OBJECTS by matching its type, text, or room number against
+            the user's request. Prefer higher observation counts and apply
+            qualifiers like nearest, farthest, left, right.
 
-            Respond ONLY with a JSON object of the form:
+            Output exactly one JSON object:
             {
               "target_id": "<id from NEARBY_OBJECTS, or null>",
               "target_x": <world x float or null>,
               "target_z": <world z float or null>,
-              "spoken": "<short confirmation to speak aloud>"
+              "spoken": "<short plain confirmation to speak aloud>"
             }
-            If nothing matches, set target_id/target_x/target_z to null and
-            explain briefly in "spoken".
+
+            Rules for "spoken":
+              • Plain natural sentence, under 25 words.
+              • No markdown, emojis, brackets, or prefixes.
+            If no candidate fits, set target_id/target_x/target_z to null and
+            briefly explain in "spoken" (e.g. "I don't see a fire exit yet").
         """.trimIndent()
 
         val user = """
@@ -277,7 +316,7 @@ class LlmAssistant(
             DESTINATION_REQUEST: $userText
         """.trimIndent()
 
-        val raw = callApi(system, user, includeImage = null) ?: return null
+        val raw = callApi(system, user, includeImage = base64Image) ?: return null
         val obj = safeJson(raw) ?: JSONObject()
         val targetId = obj.optString("target_id").takeIf { it.isNotBlank() && it != "null" }
         val targetX  = obj.optDouble("target_x", Double.NaN).takeIf { !it.isNaN() }?.toFloat()
@@ -300,17 +339,22 @@ class LlmAssistant(
         val env = LlmContextBuilder.buildEnvironmentText(userX, userZ, headingRad, semanticMap, mapBuilder)
         val system = """
             You are a vision module for an AR navigation app. Given a live
-            camera image and the current semantic map, report what objects
-            are visible that are navigation-relevant (doors, stairs, chairs,
-            signs, hallways, exits, people, obstacles). Output JSON:
+            camera image, list navigation-relevant objects (doors, stairs,
+            chairs, tables, signs, hallways, exits, people, obstacles). Skip
+            decorations, ceiling tiles, floor patterns, small clutter.
+
+            Output exactly one JSON object, no prose outside it:
             {
-              "summary": "<one sentence scene description>",
+              "summary": "<<= 12 words describing the scene>",
               "observed": [
-                {"label": "...", "direction": "front|left|right|back",
+                {"label": "<lowercase noun>",
+                 "direction": "front|left|right|back",
                  "distance": "near|mid|far"}
               ]
             }
-            Keep the list focused on navigation cues. Ignore decorations.
+            At most 8 items. Use the lowest-confidence item's label rather
+            than inventing objects. If the image is blurry/useless, return
+            observed: [].
         """.trimIndent()
 
         val user = "CURRENT_MAP:\n$env"
