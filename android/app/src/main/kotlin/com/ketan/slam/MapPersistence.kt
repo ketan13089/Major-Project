@@ -32,7 +32,8 @@ class MapPersistence(private val context: Context) {
     companion object {
         private const val TAG = "MapPersistence"
         private const val MAP_DIR = "saved_maps"
-        private const val FORMAT_VERSION = 2
+        /** Bumped to 3 when the per-map performance snapshot was added. */
+        private const val FORMAT_VERSION = 3
     }
 
     private fun mapsDir(): File {
@@ -125,6 +126,17 @@ class MapPersistence(private val context: Context) {
                 bcArr.put(entry)
             }
             json.put("breadcrumbs", bcArr)
+
+            // Performance snapshot — frozen at save time so each saved map
+            // carries its own metrics (viewable per-map in the dashboard).
+            try {
+                val perfFlat = PerformanceTracker.snapshot().toFlatMap()
+                val perfJson = JSONObject()
+                for ((k, v) in perfFlat) perfJson.put(k, v)
+                json.put("performance", perfJson)
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to embed performance snapshot: ${e.message}")
+            }
 
             val sanitized = name.replace(Regex("[^a-zA-Z0-9_-]"), "_")
             val file = File(mapsDir(), "${sanitized}.json")
@@ -260,10 +272,36 @@ class MapPersistence(private val context: Context) {
                 "objectCount" to json.optInt("objectCount", 0),
                 "durationSec" to json.optInt("durationSec", 0),
                 "wallCount" to json.optInt("wallCount", 0),
-                "resolution" to json.optDouble("resolution", 0.20)
+                "resolution" to json.optDouble("resolution", 0.20),
+                "hasPerformance" to json.has("performance")
             )
         } catch (e: Exception) {
             Log.w(TAG, "Failed to read metadata for $name: ${e.message}")
+            null
+        }
+    }
+
+    /**
+     * Read the embedded performance snapshot saved with this map. Returns
+     * null if the map was saved before FORMAT_VERSION 3 (pre-performance).
+     */
+    fun getMapPerformance(name: String): Map<String, Any>? {
+        return try {
+            val sanitized = name.replace(Regex("[^a-zA-Z0-9_-]"), "_")
+            val file = File(mapsDir(), "${sanitized}.json")
+            if (!file.exists()) return null
+            val json = JSONObject(file.readText())
+            val perf = json.optJSONObject("performance") ?: return null
+            val result = mutableMapOf<String, Any>()
+            val keys = perf.keys()
+            while (keys.hasNext()) {
+                val k = keys.next()
+                val v = perf.get(k)
+                result[k] = v
+            }
+            result
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to read performance for $name: ${e.message}")
             null
         }
     }

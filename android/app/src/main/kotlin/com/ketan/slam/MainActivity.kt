@@ -32,19 +32,13 @@ class MainActivity : FlutterActivity() {
         fun installBaselineMapChannel(context: android.content.Context, engine: FlutterEngine) {
             MethodChannel(engine.dartExecutor.binaryMessenger, "com.ketan.slam/map")
                 .setMethodCallHandler { call, result ->
+                    // Per-map performance is served on MAP_STORE_CHANNEL
+                    // (see 'getMapPerformance' / 'exportMapPerformance' below).
+                    // Anything requiring a live AR session fails friendly.
                     when (call.method) {
-                        "getPerformanceMetrics" -> {
-                            // Safe even if no AR session has ever run — returns zeroed snapshot.
-                            result.success(PerformanceTracker.snapshot().toFlatMap())
-                        }
-                        "exportPerformanceReport" -> {
-                            val path = PerformanceTracker.exportJson(context)
-                            if (path != null) result.success(mapOf("path" to path))
-                            else result.error("EXPORT_FAILED", "Failed to export report", null)
-                        }
-                        // Anything that requires the live AR session is unavailable here.
                         "saveMap", "loadMap", "listMaps", "deleteMap",
-                        "triggerEmergency" -> {
+                        "triggerEmergency", "getPerformanceMetrics",
+                        "exportPerformanceReport" -> {
                             result.error("AR_NOT_RUNNING",
                                 "AR session is not active. Open the AR scan first.", null)
                         }
@@ -132,6 +126,39 @@ class MainActivity : FlutterActivity() {
                     val meta = persistence.getMapMetadata(name)
                     if (meta != null) result.success(meta)
                     else result.error("NOT_FOUND", "No saved map: $name", null)
+                }
+                "getMapPerformance" -> {
+                    val name = call.argument<String>("name") ?: ""
+                    val perf = persistence.getMapPerformance(name)
+                    // null = map has no embedded perf snapshot (legacy save).
+                    // Return an empty map so Flutter can show the empty state
+                    // without treating it as an error.
+                    result.success(perf ?: emptyMap<String, Any>())
+                }
+                "exportMapPerformance" -> {
+                    val name = call.argument<String>("name") ?: ""
+                    val perf = persistence.getMapPerformance(name)
+                    if (perf.isNullOrEmpty()) {
+                        result.error("NO_METRICS",
+                            "No performance data saved for this map.", null)
+                    } else try {
+                        val dir = File(filesDir, "performance_reports")
+                        if (!dir.exists()) dir.mkdirs()
+                        val ts = System.currentTimeMillis()
+                        val safeName = name.replace(Regex("[^a-zA-Z0-9_-]"), "_")
+                        val file = File(dir, "perf_${safeName}_${ts}.json")
+                        val json = JSONObject().apply {
+                            put("map", name)
+                            put("exportedAt", ts)
+                            val data = JSONObject()
+                            for ((k, v) in perf) data.put(k, v)
+                            put("metrics", data)
+                        }
+                        file.writeText(json.toString(2))
+                        result.success(mapOf("path" to file.absolutePath))
+                    } catch (e: Exception) {
+                        result.error("EXPORT_FAILED", e.message, null)
+                    }
                 }
                 // Legacy: keep listMaps for backward compat with IndoorMapViewer
                 "listMaps" -> {

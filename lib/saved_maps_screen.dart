@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'accessibility_service.dart';
+import 'performance_dashboard.dart';
 
 class SavedMapInfo {
   final String name;
@@ -114,8 +115,14 @@ class _SavedMapsScreenState extends State<SavedMapsScreen> with VolumeButtonNavi
       focusables.add(FocusableElement(
         id: 'map_$i',
         label: '${map.name.replaceAll('_', ' ')}. ${map.formattedTimestamp}',
-        hint: 'Area ${map.areaM2.toStringAsFixed(0)} square meters, ${map.objectCount} objects. Double tap to open, long press to delete.',
+        hint: 'Area ${map.areaM2.toStringAsFixed(0)} square meters, ${map.objectCount} objects. Double tap to open, long press to select.',
         onActivate: () => _openMap(map),
+      ));
+      focusables.add(FocusableElement(
+        id: 'perf_$i',
+        label: 'Performance for ${map.name.replaceAll('_', ' ')}',
+        hint: 'Double tap to view performance metrics for this scan.',
+        onActivate: () => _openPerformance(map),
       ));
     }
 
@@ -198,6 +205,15 @@ class _SavedMapsScreenState extends State<SavedMapsScreen> with VolumeButtonNavi
 
   void _openMap(SavedMapInfo map) {
     Navigator.pushNamed(context, '/map', arguments: map.name);
+  }
+
+  void _openPerformance(SavedMapInfo map) {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => PerformanceDashboard(mapName: map.name),
+      ),
+    );
   }
 
   @override
@@ -393,8 +409,23 @@ class _SavedMapsScreenState extends State<SavedMapsScreen> with VolumeButtonNavi
                       ],
                     ),
                   ),
-                  if (!_isSelectionMode)
+                  if (!_isSelectionMode) ...[
+                    Semantics(
+                      button: true,
+                      label: 'View performance metrics for ${map.name.replaceAll('_', ' ')}',
+                      child: InkWell(
+                        borderRadius: BorderRadius.circular(20),
+                        onTap: () => _openPerformance(map),
+                        child: Padding(
+                          padding: const EdgeInsets.all(6),
+                          child: Icon(Icons.analytics_rounded,
+                              size: 20, color: const Color(0xFFD97706)),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 2),
                     Icon(Icons.chevron_right_rounded, size: 20, color: textSec),
+                  ],
                 ]),
                 const SizedBox(height: 12),
                 Row(children: [

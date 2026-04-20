@@ -2,7 +2,6 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'indoor_map_viewer.dart';
 import 'saved_maps_screen.dart';
-import 'performance_dashboard.dart';
 import 'accessibility_service.dart';
 
 void main() {
@@ -42,8 +41,6 @@ class MyApp extends StatelessWidget {
             );
           case '/saved-maps':
             return MaterialPageRoute(builder: (_) => const SavedMapsScreen());
-          case '/performance':
-            return MaterialPageRoute(builder: (_) => const PerformanceDashboard());
           default:
             return MaterialPageRoute(builder: (_) => const HomePage());
         }
@@ -83,14 +80,8 @@ class _HomePageState extends State<HomePage> with VolumeButtonNavigationMixin {
       FocusableElement(
         id: 'saved_maps',
         label: 'Saved Maps',
-        hint: 'View and manage your previously saved maps',
+        hint: 'View and manage your previously saved maps. Each map carries its own performance metrics.',
         onActivate: () => Navigator.pushNamed(context, '/saved-maps'),
-      ),
-      FocusableElement(
-        id: 'performance',
-        label: 'Performance Metrics',
-        hint: 'View real-time benchmarks and export reports',
-        onActivate: () => Navigator.pushNamed(context, '/performance'),
       ),
       FocusableElement(
         id: 'accessibility_toggle',
@@ -246,29 +237,9 @@ class _HomePageState extends State<HomePage> with VolumeButtonNavigationMixin {
 
               const SizedBox(height: 12),
 
-              AccessibleFocusable(
-                index: 2,
-                borderRadius: BorderRadius.circular(16),
-                child: Semantics(
-                  button: true,
-                  label: 'Performance Metrics. View real-time benchmarks and export reports.',
-                  child: _ActionCard(
-                    title: 'Performance Metrics',
-                    subtitle: 'Real-time benchmarks & export reports',
-                    icon: Icons.analytics_rounded,
-                    gradientColors: const [Color(0xFFD97706), Color(0xFFB45309)],
-                    surface: surface, textPri: textPri,
-                    textSec: textSec, border: border,
-                    onTap: () => Navigator.pushNamed(context, '/performance'),
-                  ),
-                ),
-              ),
-
-              const SizedBox(height: 12),
-
               // ── Accessibility Toggle ──
               AccessibleFocusable(
-                index: 3,
+                index: 2,
                 borderRadius: BorderRadius.circular(16),
                 child: Semantics(
                   button: true,

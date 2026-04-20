@@ -501,23 +501,34 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
 
             llmGuard.endNavigate()
 
+            // Null-case early exit runs on UI thread; the heavy planning path
+            // runs on the background executor below to avoid ANR.
+            if (result == null) {
+                runOnUiThread {
+                    llmUi?.showLoading(false)
+                    llmUi?.toast("Could not plan route.")
+                }
+                return@execute
+            }
+
+            val cleanSpoken = TtsSanitizer.clean(result.spoken)
+            val dest = resolveLlmDestination(result)
+
             runOnUiThread {
                 llmUi?.showLoading(false)
-                if (result == null) {
-                    llmUi?.toast("Could not plan route.")
-                    return@runOnUiThread
-                }
-                val cleanSpoken = TtsSanitizer.clean(result.spoken)
                 if (cleanSpoken.isNotBlank()) {
                     llmUi?.showReply(cleanSpoken)
                     announcer?.speak(cleanSpoken)
                 }
-
-                val dest = resolveLlmDestination(result)
                 if (dest == null) {
                     announcer?.speak("I couldn't find a matching destination yet. Keep scanning and try again.")
-                    return@runOnUiThread
                 }
+            }
+
+            if (dest != null) {
+                // A* + grid copy can take hundreds of ms on large maps — stay
+                // on the background thread so the UI doesn't stall and the
+                // Android ANR watchdog doesn't kill the activity.
                 startLlmNavigationTo(dest)
             }
         }
