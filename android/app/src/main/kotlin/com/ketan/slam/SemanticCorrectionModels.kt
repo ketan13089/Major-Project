@@ -65,19 +65,18 @@ object SemanticCorrectionConfig {
     @Volatile var AI_SEMANTIC_CORRECTOR_ENABLED = false
 
     /** Minimum interval between correction API calls. */
-    const val AI_SEMANTIC_INTERVAL_MS = 8000L
+    const val AI_SEMANTIC_INTERVAL_MS = 15000L
 
     /** HTTP timeout for API calls. */
     const val AI_SEMANTIC_TIMEOUT_MS = 15_000
 
-    /** OpenRouter endpoint. */
-    const val AI_ENDPOINT_URL = "https://openrouter.ai/api/v1/chat/completions"
+    /** Google AI Studio (Gemini) endpoint base. */
+    const val AI_ENDPOINT_BASE = "https://generativelanguage.googleapis.com/v1beta/models/"
 
-    /** Primary model — tries these in order on 429 rate limits. */
+    /** Model to use for semantic corrections. */
     val AI_MODELS = listOf(
-        "nvidia/nemotron-3-super-120b-a12b:free",
-        "google/gemma-4-26b-a4b-it:free",
-        "minimax/minimax-m2.5:free"
+        "gemini-3-flash-preview",
+        "gemini-2.0-flash" // Fallback
     )
 
     // Retry policy

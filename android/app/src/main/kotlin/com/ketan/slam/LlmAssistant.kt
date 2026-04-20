@@ -18,8 +18,8 @@ import kotlin.math.sqrt
  *
  *   Key and model id are pulled from BuildConfig at activity startup, which
  *   reads them from local.properties:
- *     llm.assistant.api.key  = sk-or-...
- *     llm.assistant.model    = z-ai/glm-4.6   (or whichever OpenRouter id)
+ *     gemini.api.key   = AIza...
+ *     gemini.model     = gemini-2.0-flash
  *
  *   See readme_for_llmAPI.md at the repo root.
  */
@@ -27,13 +27,13 @@ object LlmAssistantConfig {
     @Volatile var apiKey: String = ""
     @Volatile var model: String = ""
 
-    const val ENDPOINT_URL = "https://openrouter.ai/api/v1/chat/completions"
+    const val ENDPOINT_BASE = "https://generativelanguage.googleapis.com/v1beta/models/"
     const val TIMEOUT_MS = 20_000
     const val MAX_TOKENS = 800
     const val TEMPERATURE = 0.2
 
     /** Minimum interval between vision-based map update calls (ms). */
-    const val VISION_UPDATE_INTERVAL_MS = 12_000L
+    const val VISION_UPDATE_INTERVAL_MS = 20_000L
 
     /** Radius around the user to include in serialized context (metres). */
     const val CONTEXT_RADIUS_M = 10.0f
@@ -87,7 +87,7 @@ data class VisionObservation(
 
 /**
  * Converts a YUV_420_888 camera buffer into a base64 JPEG suitable for the
- * OpenRouter multimodal payload (chat/completions with image_url data URIs).
+ * Gemini multimodal payload (generateContent with inlineData).
  */
 object LlmImageEncoder {
     fun yuvToBase64Jpeg(
@@ -194,9 +194,9 @@ object LlmContextBuilder {
 /**
  * HTTP worker — one instance shared across all three flows.
  *
- * Request is always OpenRouter chat/completions with JSON response_format.
- * For vision updates, the user message includes an image_url content part
- * using a data: URI so no external hosting is needed.
+ * Request is always Google AI Studio (Gemini) generateContent with JSON
+ * responseMimeType. For vision updates, the user message includes an
+ * inlineData part so no external hosting is needed.
  */
 class LlmAssistant(
     private val semanticMap: SemanticMapManager,
@@ -218,7 +218,8 @@ class LlmAssistant(
     /** Free-form question about the environment. Runs on the caller thread. */
     fun query(
         userText: String,
-        userX: Float, userZ: Float, headingRad: Float
+        userX: Float, userZ: Float, headingRad: Float,
+        base64Image: String? = null
     ): LlmQueryResult? {
         if (!LlmAssistantConfig.enabled) return null
 
@@ -227,7 +228,7 @@ class LlmAssistant(
             You are an AR navigation assistant. The user is inside a building
             and has a phone streaming a semantic map of their surroundings.
             Answer the user's question concisely, using ONLY the environment
-            data provided. If the answer isn't derivable from the data, say so.
+            data provided and the visual image supplied. If the answer isn't derivable from the data, say so.
             Respond as a JSON object: {"answer": "<your spoken reply>"}.
         """.trimIndent()
 
@@ -238,7 +239,7 @@ class LlmAssistant(
             QUESTION: $userText
         """.trimIndent()
 
-        val raw = callApi(system, user, includeImage = null) ?: return null
+        val raw = callApi(system, user, includeImage = base64Image) ?: return null
         val answer = parseJsonField(raw, "answer") ?: raw.trim()
         return LlmQueryResult(answer = answer, raw = raw)
     }
@@ -334,12 +335,11 @@ class LlmAssistant(
 
     private fun callApi(system: String, user: String, includeImage: String?): String? {
         val body = buildRequestBody(system, user, includeImage)
-        val conn = (URL(LlmAssistantConfig.ENDPOINT_URL).openConnection() as HttpURLConnection)
+        val url = "${LlmAssistantConfig.ENDPOINT_BASE}${LlmAssistantConfig.model}:generateContent?key=${LlmAssistantConfig.apiKey}"
+        val conn = (URL(url).openConnection() as HttpURLConnection)
         return try {
             conn.requestMethod = "POST"
             conn.setRequestProperty("Content-Type", "application/json")
-            conn.setRequestProperty("Authorization", "Bearer ${LlmAssistantConfig.apiKey}")
-            conn.setRequestProperty("HTTP-Referer", "com.ketan.slam")
             conn.connectTimeout = LlmAssistantConfig.TIMEOUT_MS
             conn.readTimeout = LlmAssistantConfig.TIMEOUT_MS
             conn.doOutput = true
@@ -352,10 +352,12 @@ class LlmAssistant(
             }
             val resp = BufferedReader(InputStreamReader(conn.inputStream)).use { it.readText() }
             val root = JSONObject(resp)
-            val choices = root.optJSONArray("choices") ?: return null
-            if (choices.length() == 0) return null
-            val message = choices.getJSONObject(0).optJSONObject("message") ?: return null
-            message.optString("content", "")
+            val candidates = root.optJSONArray("candidates") ?: return null
+            if (candidates.length() == 0) return null
+            val content = candidates.getJSONObject(0).optJSONObject("content") ?: return null
+            val parts = content.optJSONArray("parts") ?: return null
+            if (parts.length() == 0) return null
+            parts.getJSONObject(0).optString("text", "")
         } catch (e: Exception) {
             println("$TAG: ${e.message}")
             null
@@ -366,28 +368,33 @@ class LlmAssistant(
 
     private fun buildRequestBody(system: String, user: String, imageB64: String?): String {
         val root = JSONObject()
-        root.put("model", LlmAssistantConfig.model)
-        root.put("temperature", LlmAssistantConfig.TEMPERATURE)
-        root.put("max_tokens", LlmAssistantConfig.MAX_TOKENS)
-        root.put("response_format", JSONObject().put("type", "json_object"))
 
-        val messages = JSONArray()
-        messages.put(JSONObject().put("role", "system").put("content", system))
+        // System instruction (top-level in Gemini API)
+        root.put("systemInstruction", JSONObject()
+            .put("parts", JSONArray().put(JSONObject().put("text", system))))
 
-        val userMsg = JSONObject().put("role", "user")
+        // User content
+        val userParts = JSONArray()
+        userParts.put(JSONObject().put("text", user))
         if (imageB64 != null) {
-            // OpenRouter multimodal: content is an array of parts.
-            val parts = JSONArray()
-            parts.put(JSONObject().put("type", "text").put("text", user))
-            parts.put(JSONObject()
-                .put("type", "image_url")
-                .put("image_url", JSONObject().put("url", "data:image/jpeg;base64,$imageB64")))
-            userMsg.put("content", parts)
-        } else {
-            userMsg.put("content", user)
+            // Gemini multimodal: inlineData part
+            userParts.put(JSONObject()
+                .put("inlineData", JSONObject()
+                    .put("mimeType", "image/jpeg")
+                    .put("data", imageB64)))
         }
-        messages.put(userMsg)
-        root.put("messages", messages)
+        val contents = JSONArray()
+        contents.put(JSONObject()
+            .put("role", "user")
+            .put("parts", userParts))
+        root.put("contents", contents)
+
+        // Generation config
+        root.put("generationConfig", JSONObject()
+            .put("temperature", LlmAssistantConfig.TEMPERATURE)
+            .put("maxOutputTokens", LlmAssistantConfig.MAX_TOKENS)
+            .put("responseMimeType", "application/json"))
+
         return root.toString()
     }
 

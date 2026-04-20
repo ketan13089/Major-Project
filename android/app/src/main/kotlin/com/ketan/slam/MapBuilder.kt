@@ -761,13 +761,13 @@ class MapBuilder(val res: Float) {
     // ── Consistency enforcement ────────────────────────────────────────────────
 
     private fun enforceConsistency() {
-        // Pass 1: Remove truly isolated occupied cells (0 occupied neighbors).
-        // FIX 2: Was < 2, which removed valid wall endpoints. Now < 1 — only
-        // removes completely isolated single cells (noise), not wall segments.
+        // Pass 1: Prune noise by enforcing at least 2 neighbors for stability.
+        // This acts as a morphological erosion pass to clip off jagged wall
+        // boundaries and isolated clusters without destroying smooth walls.
         val toReset = mutableListOf<GridCell>()
         for ((cell, lo) in logOdds) {
             if (lo < LO_THRESH_OCC) continue
-            if (countOccupiedNeighbors(cell) < 1) toReset.add(cell)
+            if (countOccupiedNeighbors(cell) < 2) toReset.add(cell)
         }
         for (cell in toReset) {
             logOdds[cell] = 0f

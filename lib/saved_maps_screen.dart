@@ -69,6 +69,9 @@ class _SavedMapsScreenState extends State<SavedMapsScreen> with VolumeButtonNavi
   bool _loading = true;
   String? _error;
 
+  bool _isSelectionMode = false;
+  final Set<String> _selectedMaps = {};
+
   @override
   void initState() {
     super.initState();
@@ -147,12 +150,15 @@ class _SavedMapsScreenState extends State<SavedMapsScreen> with VolumeButtonNavi
     }
   }
 
-  Future<void> _deleteMap(SavedMapInfo map) async {
+  Future<void> _deleteSelectedMaps() async {
+    if (_selectedMaps.isEmpty) return;
+    
+    final count = _selectedMaps.length;
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: const Text('Delete Map'),
-        content: Text('Delete "${map.name}"? This cannot be undone.'),
+        title: const Text('Delete Maps'),
+        content: Text('Delete $count map${count == 1 ? '' : 's'}? This cannot be undone.'),
         actions: [
           TextButton(onPressed: () => Navigator.pop(ctx, false),
               child: const Text('Cancel')),
@@ -166,22 +172,27 @@ class _SavedMapsScreenState extends State<SavedMapsScreen> with VolumeButtonNavi
     );
     if (confirmed != true) return;
 
-    try {
-      await _ch.invokeMethod('deleteMap', {'name': map.name});
-      _loadMaps();
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Deleted "${map.name}"'),
-              duration: const Duration(seconds: 2)),
-        );
+    setState(() { _loading = true; });
+
+    int deleted = 0;
+    for (final mapName in _selectedMaps) {
+      try {
+        await _ch.invokeMethod('deleteMap', {'name': mapName});
+        deleted++;
+      } catch (e) {
+        debugPrint('Failed to delete $mapName: $e');
       }
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Failed to delete: $e'),
-              backgroundColor: const Color(0xFFDC2626)),
-        );
-      }
+    }
+
+    _isSelectionMode = false;
+    _selectedMaps.clear();
+    _loadMaps();
+
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Deleted $deleted map${deleted == 1 ? '' : 's'}'),
+            duration: const Duration(seconds: 2)),
+      );
     }
   }
 
@@ -203,14 +214,31 @@ class _SavedMapsScreenState extends State<SavedMapsScreen> with VolumeButtonNavi
       appBar: AppBar(
         backgroundColor: surface,
         elevation: 0,
-        leading: IconButton(
-          icon: Icon(Icons.arrow_back_rounded, color: textPri),
-          onPressed: () => Navigator.pop(context),
-        ),
-        title: Text('Saved Maps',
+        leading: _isSelectionMode
+            ? IconButton(
+                icon: Icon(Icons.close_rounded, color: textPri),
+                onPressed: () => setState(() {
+                  _isSelectionMode = false;
+                  _selectedMaps.clear();
+                }),
+              )
+            : IconButton(
+                icon: Icon(Icons.arrow_back_rounded, color: textPri),
+                onPressed: () => Navigator.pop(context),
+              ),
+        title: Text(
+            _isSelectionMode ? '${_selectedMaps.length} Selected' : 'Saved Maps',
             style: TextStyle(color: textPri, fontSize: 18,
                 fontWeight: FontWeight.w700)),
         centerTitle: false,
+        actions: _isSelectionMode
+            ? [
+                IconButton(
+                  icon: const Icon(Icons.delete_outline_rounded, color: Color(0xFFDC2626)),
+                  onPressed: _selectedMaps.isEmpty ? null : _deleteSelectedMaps,
+                )
+              ]
+            : null,
       ),
       body: _loading
           ? const Center(child: CircularProgressIndicator())
@@ -277,39 +305,78 @@ class _SavedMapsScreenState extends State<SavedMapsScreen> with VolumeButtonNavi
 
   Widget _mapCard(SavedMapInfo map, Color surface, Color textPri,
       Color textSec, Color border) {
+    
+    final isSelected = _selectedMaps.contains(map.name);
+    
     return Semantics(
       button: true,
       label: '${map.name}. ${map.formattedTimestamp}. '
           'Area ${map.areaM2.toStringAsFixed(0)} square meters, '
           '${map.objectCount} objects, duration ${map.formattedDuration}. '
-          'Tap to view, long press to delete.',
+          'Tap to view, long press to select.',
       child: Material(
         color: surface,
         borderRadius: BorderRadius.circular(14),
         child: InkWell(
           borderRadius: BorderRadius.circular(14),
-          onTap: () => _openMap(map),
-          onLongPress: () => _deleteMap(map),
+          onTap: () {
+            if (_isSelectionMode) {
+              setState(() {
+                if (isSelected) {
+                  _selectedMaps.remove(map.name);
+                  if (_selectedMaps.isEmpty) _isSelectionMode = false;
+                } else {
+                  _selectedMaps.add(map.name);
+                }
+              });
+            } else {
+              _openMap(map);
+            }
+          },
+          onLongPress: () {
+            if (!_isSelectionMode) {
+              HapticFeedback.lightImpact();
+              setState(() {
+                _isSelectionMode = true;
+                _selectedMaps.add(map.name);
+              });
+            }
+          },
           child: Container(
             padding: const EdgeInsets.all(16),
             decoration: BoxDecoration(
+              color: isSelected ? const Color(0xFF2563EB).withOpacity(0.08) : null,
               borderRadius: BorderRadius.circular(14),
-              border: Border.all(color: border),
+              border: Border.all(
+                  color: isSelected ? const Color(0xFF2563EB) : border,
+                  width: isSelected ? 2 : 1),
             ),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Row(children: [
-                  Container(
-                    padding: const EdgeInsets.all(8),
-                    decoration: BoxDecoration(
-                      color: const Color(0xFF059669).withOpacity(0.1),
-                      borderRadius: BorderRadius.circular(10),
+                  if (_isSelectionMode)
+                    Container(
+                      margin: const EdgeInsets.only(right: 12),
+                      width: 24, height: 24,
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        color: isSelected ? const Color(0xFF2563EB) : Colors.transparent,
+                        border: isSelected ? null : Border.all(color: textSec.withOpacity(0.5), width: 2),
+                      ),
+                      child: isSelected ? const Icon(Icons.check, size: 16, color: Colors.white) : null,
+                    )
+                  else
+                    Container(
+                      padding: const EdgeInsets.all(8),
+                      margin: const EdgeInsets.only(right: 12),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF059669).withOpacity(0.1),
+                        borderRadius: BorderRadius.circular(10),
+                      ),
+                      child: const Icon(Icons.map_rounded, size: 20,
+                          color: Color(0xFF059669)),
                     ),
-                    child: const Icon(Icons.map_rounded, size: 20,
-                        color: Color(0xFF059669)),
-                  ),
-                  const SizedBox(width: 12),
                   Expanded(
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
@@ -326,7 +393,8 @@ class _SavedMapsScreenState extends State<SavedMapsScreen> with VolumeButtonNavi
                       ],
                     ),
                   ),
-                  Icon(Icons.chevron_right_rounded, size: 20, color: textSec),
+                  if (!_isSelectionMode)
+                    Icon(Icons.chevron_right_rounded, size: 20, color: textSec),
                 ]),
                 const SizedBox(height: 12),
                 Row(children: [

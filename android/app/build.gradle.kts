@@ -37,20 +37,15 @@ android {
         versionCode = 1
         versionName = "1.0"
 
+        // Google AI Studio (Gemini) — single key used by both the LLM
+        // assistant and the semantic correction engine.
         buildConfigField(
-            "String", "OPENROUTER_API_KEY",
-            "\"${localProps.getProperty("openrouter.api.key", "")}\""
-        )
-
-        // LLM Assistant (query + navigation) — separate key + model id so it
-        // can be swapped independently of the semantic corrector.
-        buildConfigField(
-            "String", "LLM_ASSISTANT_API_KEY",
-            "\"${localProps.getProperty("llm.assistant.api.key", "")}\""
+            "String", "GEMINI_API_KEY",
+            "\"${localProps.getProperty("gemini.api.key", "")}\""
         )
         buildConfigField(
-            "String", "LLM_ASSISTANT_MODEL",
-            "\"${localProps.getProperty("llm.assistant.model", "")}\""
+            "String", "GEMINI_MODEL",
+            "\"${localProps.getProperty("gemini.model", "gemini-2.0-flash")}\""
         )
     }
 

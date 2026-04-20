@@ -8,29 +8,29 @@ The AR app has an LLM assistant with three flows:
 | Navigate        | "Guide me to" FAB (🧭) | Push-to-talk → LLM picks a target → turn-by-turn TTS   |
 | Vision update   | Automatic (every ~12 s)| Sends a JPEG + map to LLM; observations merged back    |
 
-All three hit the same OpenRouter endpoint with JSON `response_format`.
+All three hit the Google AI Studio (Gemini) endpoint with JSON `responseMimeType`.
 
 ## 1. Fill in the API key and model id
 
-Open (or create) the file:
+Get a free API key from [Google AI Studio](https://aistudio.google.com/apikey).
+
+Open the file:
 
 ```
-/Users/omvarma/Desktop/ketan/Major-Project/android/local.properties
+android/local.properties
 ```
 
-Add two lines (alongside any existing `sdk.dir=`, `openrouter.api.key=`, etc.):
+Add two lines (alongside any existing `sdk.dir=`, etc.):
 
 ```properties
-llm.assistant.api.key=sk-or-v1-...
-llm.assistant.model=z-ai/glm-4.6v
+gemini.api.key=AIza...
+gemini.model=gemini-2.0-flash
 ```
 
 Notes:
-- The key is a standard OpenRouter key starting with `sk-or-...`.
-- `z-ai/glm-4.6v` is the multimodal GLM 4.6 — it's what this project uses
-  because the vision-update flow needs image input. If you later swap to a
-  text-only model (e.g. `z-ai/glm-4.7`), bump `VISION_UPDATE_INTERVAL_MS` to
-  a very high value in `LlmAssistant.kt` so the image calls stop firing.
+- The key is a Google AI Studio key starting with `AIza...`.
+- `gemini-2.0-flash` is the default multimodal model — it supports both
+  text and image inputs which is needed for the vision-update flow.
 - `local.properties` is already gitignored. Never commit the key.
 - If either line is blank the assistant stays disabled at runtime and the
   FABs show a toast explaining that.
@@ -61,7 +61,8 @@ The Gradle build reads `local.properties` and injects both values into
 | `android/app/src/main/kotlin/com/ketan/slam/LlmAssistantUi.kt`  | Two FABs, loading spinner, reply card — all added to the existing AR root layout |
 | `android/app/src/main/kotlin/com/ketan/slam/NavigationManager.kt` | Added `navigateToExplicit(dest, ...)` so the LLM can hand off a pre-chosen destination for turn-by-turn TTS guidance |
 | `android/app/src/main/kotlin/com/ketan/slam/ArActivity.kt`      | Wires up the three pieces: initializes `LlmAssistantConfig` from BuildConfig, attaches UI, dispatches voice → LLM → TTS, and publishes camera YUV snapshots for the periodic vision update |
-| `android/app/build.gradle.kts`                                  | Adds `LLM_ASSISTANT_API_KEY` and `LLM_ASSISTANT_MODEL` `buildConfigField`s |
+| `android/app/build.gradle.kts`                                  | Adds `GEMINI_API_KEY` and `GEMINI_MODEL` `buildConfigField`s |
+| `android/app/src/main/kotlin/com/ketan/slam/SemanticCorrectionEngine.kt` | Semantic map correction also uses the same Gemini API key |
 
 ## 5. Tuning
 

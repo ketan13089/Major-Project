@@ -202,12 +202,11 @@ class SemanticCorrectionEngine(
             val requestBody = buildRequestBody(userPrompt, model)
 
             for (attempt in 1..maxRetries + 1) {
-                val conn = (URL(SemanticCorrectionConfig.AI_ENDPOINT_URL).openConnection() as HttpURLConnection)
+                val url = "${SemanticCorrectionConfig.AI_ENDPOINT_BASE}${model}:generateContent?key=${SemanticCorrectionConfig.apiKey}"
+                val conn = (URL(url).openConnection() as HttpURLConnection)
                 try {
                     conn.requestMethod = "POST"
                     conn.setRequestProperty("Content-Type", "application/json")
-                    conn.setRequestProperty("Authorization", "Bearer ${SemanticCorrectionConfig.apiKey}")
-                    conn.setRequestProperty("HTTP-Referer", "com.ketan.slam")
                     conn.connectTimeout = SemanticCorrectionConfig.AI_SEMANTIC_TIMEOUT_MS
                     conn.readTimeout = SemanticCorrectionConfig.AI_SEMANTIC_TIMEOUT_MS
                     conn.doOutput = true
@@ -219,11 +218,13 @@ class SemanticCorrectionEngine(
                     if (responseCode == 200) {
                         val response = BufferedReader(InputStreamReader(conn.inputStream)).use { it.readText() }
                         val responseJson = JSONObject(response)
-                        val choices = responseJson.optJSONArray("choices") ?: return null
-                        if (choices.length() == 0) return null
-                        val message = choices.getJSONObject(0).optJSONObject("message") ?: return null
+                        val candidates = responseJson.optJSONArray("candidates") ?: return null
+                        if (candidates.length() == 0) return null
+                        val content = candidates.getJSONObject(0).optJSONObject("content") ?: return null
+                        val parts = content.optJSONArray("parts") ?: return null
+                        if (parts.length() == 0) return null
                         println("$TAG: API success using $model (attempt $attempt)")
-                        return message.optString("content", null)
+                        return parts.getJSONObject(0).optString("text", null)
                     }
 
                     // Read error body for logging
@@ -284,21 +285,30 @@ class SemanticCorrectionEngine(
 
     private fun buildRequestBody(userPrompt: String, model: String): String {
         return JSONObject().apply {
-            put("model", model)
-            put("messages", JSONArray().apply {
-                put(JSONObject().apply {
-                    put("role", "system")
-                    put("content", SYSTEM_PROMPT)
-                })
-                put(JSONObject().apply {
-                    put("role", "user")
-                    put("content", userPrompt)
+            // System instruction (top-level in Gemini API)
+            put("systemInstruction", JSONObject().apply {
+                put("parts", JSONArray().apply {
+                    put(JSONObject().apply {
+                        put("text", SYSTEM_PROMPT)
+                    })
                 })
             })
-            put("temperature", 0.1)
-            put("max_tokens", 1024)
-            put("response_format", JSONObject().apply {
-                put("type", "json_object")
+            // User content
+            put("contents", JSONArray().apply {
+                put(JSONObject().apply {
+                    put("role", "user")
+                    put("parts", JSONArray().apply {
+                        put(JSONObject().apply {
+                            put("text", userPrompt)
+                        })
+                    })
+                })
+            })
+            // Generation config
+            put("generationConfig", JSONObject().apply {
+                put("temperature", 0.1)
+                put("maxOutputTokens", 1024)
+                put("responseMimeType", "application/json")
             })
         }.toString()
     }

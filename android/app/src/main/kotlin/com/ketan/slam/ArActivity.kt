@@ -288,9 +288,9 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         }
 
         // Initialize semantic AI corrector — key comes from BuildConfig (set in local.properties)
-        SemanticCorrectionConfig.apiKey = BuildConfig.OPENROUTER_API_KEY
+        SemanticCorrectionConfig.apiKey = BuildConfig.GEMINI_API_KEY
         if (SemanticCorrectionConfig.apiKey.isNotBlank() &&
-            SemanticCorrectionConfig.apiKey != "PASTE_YOUR_OPENROUTER_KEY_HERE") {
+            SemanticCorrectionConfig.apiKey != "PASTE_YOUR_GEMINI_KEY_HERE") {
             SemanticCorrectionConfig.AI_SEMANTIC_CORRECTOR_ENABLED = true
             semanticCorrectionEngine = SemanticCorrectionEngine(mapBuilder, semanticMap, RES)
             println("$TAG: Semantic AI corrector initialized")
@@ -299,13 +299,13 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         }
 
         // LLM Assistant — reads key + model from BuildConfig (local.properties).
-        LlmAssistantConfig.apiKey = BuildConfig.LLM_ASSISTANT_API_KEY
-        LlmAssistantConfig.model  = BuildConfig.LLM_ASSISTANT_MODEL
+        LlmAssistantConfig.apiKey = BuildConfig.GEMINI_API_KEY
+        LlmAssistantConfig.model  = BuildConfig.GEMINI_MODEL
         if (LlmAssistantConfig.enabled) {
             llmAssistant = LlmAssistant(semanticMap, mapBuilder)
             println("$TAG: LLM assistant initialized (model=${LlmAssistantConfig.model})")
         } else {
-            println("$TAG: LLM assistant disabled — set llm.assistant.api.key and llm.assistant.model in local.properties")
+            println("$TAG: LLM assistant disabled — set gemini.api.key and gemini.model in local.properties")
         }
 
         navigationManager = NavigationManager(
@@ -417,10 +417,22 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         val pose = latestPose ?: run {
             llmUi?.toast("Waiting for tracking — try again in a moment"); return
         }
+        val snap = llmLastYuv
+        
         llmUi?.showLoading(true)
         llmExecutor.execute {
+            // Encode the most recent YUV snapshot to Base64 to send the user's view 
+            // the exact moment they hit the green "Ask" button.
+            val b64 = snap?.let {
+                LlmImageEncoder.yuvToBase64Jpeg(
+                    it.y, it.u, it.v,
+                    it.yStride, it.uvStride, it.uvPixStride,
+                    it.width, it.height
+                )
+            }
+            
             val result = try {
-                assistant.query(text, pose.tx(), pose.tz(), latestHeading)
+                assistant.query(text, pose.tx(), pose.tz(), latestHeading, b64)
             } catch (e: Exception) { println("$TAG: LLM query: ${e.message}"); null }
             runOnUiThread {
                 llmUi?.showLoading(false)
@@ -518,24 +530,8 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     }
 
     private fun maybeRunVisionUpdate() {
-        val assistant = llmAssistant ?: return
-        val now = System.currentTimeMillis()
-        if (!assistant.shouldRunVisionUpdate(now)) return
-        val snap = llmLastYuv ?: return
-        val pose = latestPose ?: return
-        assistant.markVisionRun(now)
-
-        llmExecutor.execute {
-            val b64 = LlmImageEncoder.yuvToBase64Jpeg(
-                snap.y, snap.u, snap.v,
-                snap.yStride, snap.uvStride, snap.uvPixStride,
-                snap.width, snap.height
-            ) ?: return@execute
-            val result = try {
-                assistant.visionUpdate(b64, pose.tx(), pose.tz(), latestHeading)
-            } catch (e: Exception) { println("$TAG: LLM vision: ${e.message}"); null }
-            if (result != null) applyVisionResult(result, pose)
-        }
+        // Disabled background YOLO/LLM vision pushing.
+        // User explicitly requested LLM queries only on green button tap.
     }
 
     /**
@@ -1381,23 +1377,9 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             }
         }
 
-        // Strategy 6: Very high overall miss ratio → staring directly at white wall
-        val missRatio = if (totalPoints > 0) totalMisses.toFloat() / totalPoints else 0f
-        if (missRatio > 0.50f && (totalPoints - totalMisses) < 15) {
-            val distances = floatArrayOf(0.6f, 1.0f, 1.5f, 2.0f, 2.5f)
-            val angles = floatArrayOf(-0.4f, -0.2f, 0f, 0.2f, 0.4f)
-            for (dist in distances) {
-                for (angleOffset in angles) {
-                    val cos = kotlin.math.cos(angleOffset)
-                    val sin = kotlin.math.sin(angleOffset)
-                    val rotFwdX = fnx * cos - fnz * sin
-                    val rotFwdZ = fnx * sin + fnz * cos
-                    val wallX = camWx + rotFwdX * dist
-                    val wallZ = camWz + rotFwdZ * dist
-                    mapBuilder.markWhiteWall(wallX, wallZ)
-                }
-            }
-        }
+        // Strategy 6: Disabled.
+        // Radially spraying walls based on depth misses causes massive noise
+        // blobs in the map when depth fails.
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -1501,7 +1483,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         camera.getProjectionMatrix(projMatrix, 0, 0.1f, 100.0f)
         camera.getViewMatrix(viewMatrix, 0)
 
-        // Draw all tracked planes
+        // Draw tracked planes
         for (plane in sess.getAllTrackables(Plane::class.java)) {
             if (plane.trackingState != TrackingState.TRACKING) continue
             if (plane.subsumedBy != null) continue
@@ -1509,17 +1491,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             meshRenderer.drawPlane(plane, type, projMatrix, viewMatrix)
         }
 
-        // Draw inferred walls (white/featureless walls detected by miss patterns)
-        val inferredWalls = mapBuilder.getRecentInferredWalls()
-        if (inferredWalls.isNotEmpty()) {
-            meshRenderer.drawInferredWalls(
-                inferredWalls,
-                camera.pose.ty(),
-                mapBuilder.res,
-                projMatrix,
-                viewMatrix
-            )
-        }
+        // We no longer draw the small inferred wall pillars natively, as it clutters the UI
 
         // Draw ground-plane footprints under confirmed YOLO objects
         val floorY = camera.pose.ty() - 1.5f  // approximate floor
