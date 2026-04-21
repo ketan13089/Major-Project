@@ -1129,6 +1129,15 @@ class _MapPainter extends CustomPainter {
     canvas.drawRect(Rect.fromLTWH(0, 0, size.width, size.height),
         Paint()..color = _T.mapBg);
 
+    // Empty grid — paint only the background and compass, skip cell iteration.
+    // This guards against the brief init window where the Android side hasn't
+    // pushed a payload yet (gridW/H == 0 would make .clamp(0, -1) throw).
+    if (grid == null || gridW <= 0 || gridH <= 0) {
+      _drawGrid(canvas, size, origin);
+      _drawRobot(canvas, origin);
+      return;
+    }
+
     // Viewport culling — compute visible cell range to skip off-screen cells
     final int visCXMin = ((0 - origin.dx) / scale).floor().clamp(0, gridW - 1);
     final int visCXMax = ((size.width - origin.dx) / scale).ceil().clamp(0, gridW - 1);
