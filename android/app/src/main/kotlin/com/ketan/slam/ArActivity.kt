@@ -442,6 +442,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         llmUi?.showLoading(true)
         llmExecutor.execute {
             var result: LlmQueryResult? = null
+            var clean = ""
             try {
                 val b64 = if (needsImage && snap != null) {
                     LlmImageEncoder.yuvToBase64Jpeg(
@@ -455,6 +456,13 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
                 result = try {
                     assistant.query(text, pose.tx(), pose.tz(), latestHeading, b64)
                 } catch (e: Exception) { println("$TAG: LLM query: ${e.message}"); null }
+
+                // Sanitize on this thread so a regex/parsing blow-up can't crash
+                // the UI thread inside runOnUiThread.
+                result?.let {
+                    clean = try { TtsSanitizer.clean(it.answer) }
+                            catch (e: Throwable) { println("$TAG: TtsSanitizer: ${e.message}"); it.answer.trim() }
+                }
             } catch (e: Exception) {
                 println("$TAG: LLM query outer: ${e.message}")
             } finally {
@@ -462,17 +470,13 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
                 // Loader must ALWAYS hide, even if anything above threw.
                 runOnUiThread {
                     llmUi?.showLoading(false)
-                    val r = result
-                    if (r == null) {
+                    if (result == null) {
                         llmUi?.toast("Assistant unavailable. Check network or API key.")
+                    } else if (clean.isBlank()) {
+                        llmUi?.toast("Empty response from assistant.")
                     } else {
-                        val clean = TtsSanitizer.clean(r.answer)
-                        if (clean.isBlank()) {
-                            llmUi?.toast("Empty response from assistant.")
-                        } else {
-                            llmUi?.showReply(clean)
-                            announcer?.speak(clean)
-                        }
+                        llmUi?.showReply(clean)
+                        announcer?.speak(clean)
                     }
                 }
             }
@@ -526,7 +530,8 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
 
                 val r2 = result
                 if (r2 != null) {
-                    cleanSpoken = TtsSanitizer.clean(r2.spoken)
+                    cleanSpoken = try { TtsSanitizer.clean(r2.spoken) }
+                                  catch (e: Throwable) { println("$TAG: TtsSanitizer: ${e.message}"); r2.spoken.trim() }
                     dest = resolveLlmDestination(r2)
                 }
             } catch (e: Exception) {

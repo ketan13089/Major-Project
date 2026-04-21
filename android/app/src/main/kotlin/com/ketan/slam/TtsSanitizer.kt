@@ -30,14 +30,14 @@ object TtsSanitizer {
         "^\\s*(?:answer|assistant|system|response|reply|ai|bot|model)\\s*[:\\-]\\s*",
         RegexOption.IGNORE_CASE
     )
-    private val BRACKET_META = Regex("\\[(?:note|meta|system|assistant|tool|thinking|reasoning)[^\\]]*]", RegexOption.IGNORE_CASE)
+    private val BRACKET_META = Regex("\\[(?:note|meta|system|assistant|tool|thinking|reasoning)[^\\]]*\\]", RegexOption.IGNORE_CASE)
     private val PARENS_META  = Regex("\\((?:note|meta|reasoning|thought|internal)[^)]*\\)", RegexOption.IGNORE_CASE)
 
     // Emoji + symbol ranges we don't want TTS to read
     private val EMOJI_RANGES = Regex("[\\uD83C-\\uDBFF\\uDC00-\\uDFFF]|[\u2600-\u27BF]|[\uFE00-\uFE0F]")
 
     // Stray JSON fragments the model may emit before/after the answer
-    private val JSON_WRAPPER = Regex("^\\s*\\{[^{}]*\"answer\"\\s*:\\s*\"(.*?)\"[^{}]*}\\s*\$",
+    private val JSON_WRAPPER = Regex("^\\s*\\{[^{}]*\"answer\"\\s*:\\s*\"(.*?)\"[^{}]*\\}\\s*\$",
         RegexOption.DOT_MATCHES_ALL)
 
     private val MULTI_SPACE = Regex("\\s+")
