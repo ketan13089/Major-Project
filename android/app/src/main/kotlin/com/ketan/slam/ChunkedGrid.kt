@@ -30,24 +30,29 @@ package com.ketan.slam
  * matches the previous ConcurrentHashMap behaviour.
  */
 
-private const val CHUNK_BITS = 6
-private const val CHUNK_SIZE = 1 shl CHUNK_BITS  // 64
-private const val CHUNK_MASK = CHUNK_SIZE - 1     // 63
-private const val CELLS_PER_CHUNK = CHUNK_SIZE * CHUNK_SIZE  // 4096
+// The helpers below are marked `@PublishedApi internal` so that the public
+// `inline fun forEachCell` iterators can reference them. Kotlin forbids
+// public inline bodies from touching private declarations because the inline
+// code gets copied to every call site. Keeping them `internal` + `@PublishedApi`
+// means they're callable from inline code but aren't part of the public ABI.
+@PublishedApi internal const val CHUNK_BITS = 6
+@PublishedApi internal const val CHUNK_SIZE = 1 shl CHUNK_BITS  // 64
+@PublishedApi internal const val CHUNK_MASK = CHUNK_SIZE - 1     // 63
+@PublishedApi internal const val CELLS_PER_CHUNK = CHUNK_SIZE * CHUNK_SIZE  // 4096
 
 /** Pack (chunkX, chunkZ) into a single Long for the outer hashmap key. */
-private fun chunkKey(cx: Int, cz: Int): Long =
+@PublishedApi internal fun chunkKey(cx: Int, cz: Int): Long =
     (cx.toLong() shl 32) or (cz.toLong() and 0xFFFFFFFFL)
-private fun unpackCx(key: Long): Int = (key shr 32).toInt()
-private fun unpackCz(key: Long): Int = key.toInt()
+@PublishedApi internal fun unpackCx(key: Long): Int = (key shr 32).toInt()
+@PublishedApi internal fun unpackCz(key: Long): Int = key.toInt()
 
 /** In-chunk index from global (x, z). */
-private fun localIndex(x: Int, z: Int): Int =
+@PublishedApi internal fun localIndex(x: Int, z: Int): Int =
     ((z and CHUNK_MASK) shl CHUNK_BITS) or (x and CHUNK_MASK)
 
 /** Chunk-coordinate for a global cell coord. Uses arithmetic shift to
  *  handle negative coordinates correctly (floor division, not truncation). */
-private fun toChunk(v: Int): Int = v shr CHUNK_BITS
+@PublishedApi internal fun toChunk(v: Int): Int = v shr CHUNK_BITS
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Byte-valued grid (MapBuilder.grid)
@@ -55,12 +60,12 @@ private fun toChunk(v: Int): Int = v shr CHUNK_BITS
 
 /** Sentinel for "no value" in the byte grid. Cell types are 0..4, so 0xFF
  *  (-1 as signed byte) is safe as the absent marker. */
-private const val BYTE_ABSENT: Byte = -1
+@PublishedApi internal const val BYTE_ABSENT: Byte = -1
 
 class ChunkedByteGrid : MutableMap<GridCell, Byte> {
 
     /** Each chunk: ByteArray(4096) initialised to [BYTE_ABSENT]. */
-    private val chunks = java.util.concurrent.ConcurrentHashMap<Long, ByteArray>()
+    @PublishedApi internal val chunks = java.util.concurrent.ConcurrentHashMap<Long, ByteArray>()
     @Volatile private var cachedSize = 0
 
     private fun chunkOrNull(cx: Int, cz: Int): ByteArray? = chunks[chunkKey(cx, cz)]
@@ -174,25 +179,26 @@ class ChunkedByteGrid : MutableMap<GridCell, Byte> {
 
 class ChunkedFloatGrid : MutableMap<GridCell, Float> {
 
-    /** Parallel arrays per chunk: values + presence bitmap. */
-    private class Chunk {
-        val data = FloatArray(CELLS_PER_CHUNK)
-        val present = LongArray(CELLS_PER_CHUNK / 64)  // 64 longs = 4096 bits
+    /** Parallel arrays per chunk: values + presence bitmap.
+     *  `@PublishedApi internal` so inline `forEachCell` can read `data`/`present`. */
+    @PublishedApi internal class FloatChunk {
+        @JvmField val data = FloatArray(CELLS_PER_CHUNK)
+        @JvmField val present = LongArray(CELLS_PER_CHUNK / 64)  // 64 longs = 4096 bits
     }
 
-    private val chunks = java.util.concurrent.ConcurrentHashMap<Long, Chunk>()
+    @PublishedApi internal val chunks = java.util.concurrent.ConcurrentHashMap<Long, FloatChunk>()
     @Volatile private var cachedSize = 0
 
-    private fun chunkOrNull(cx: Int, cz: Int): Chunk? = chunks[chunkKey(cx, cz)]
-    private fun chunkOrAlloc(cx: Int, cz: Int): Chunk =
-        chunks.getOrPut(chunkKey(cx, cz)) { Chunk() }
+    private fun chunkOrNull(cx: Int, cz: Int): FloatChunk? = chunks[chunkKey(cx, cz)]
+    private fun chunkOrAlloc(cx: Int, cz: Int): FloatChunk =
+        chunks.getOrPut(chunkKey(cx, cz)) { FloatChunk() }
 
-    private fun isPresent(c: Chunk, idx: Int): Boolean {
+    private fun isPresent(c: FloatChunk, idx: Int): Boolean {
         val word = idx ushr 6
         val bit = idx and 63
         return (c.present[word] and (1L shl bit)) != 0L
     }
-    private fun markPresent(c: Chunk, idx: Int): Boolean {
+    private fun markPresent(c: FloatChunk, idx: Int): Boolean {
         val word = idx ushr 6
         val bit = idx and 63
         val mask = 1L shl bit
@@ -200,7 +206,7 @@ class ChunkedFloatGrid : MutableMap<GridCell, Float> {
         c.present[word] = c.present[word] or mask
         return true
     }
-    private fun markAbsent(c: Chunk, idx: Int): Boolean {
+    private fun markAbsent(c: FloatChunk, idx: Int): Boolean {
         val word = idx ushr 6
         val bit = idx and 63
         val mask = 1L shl bit
