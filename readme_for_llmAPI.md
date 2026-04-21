@@ -6,7 +6,7 @@ The AR app has an LLM assistant with three flows:
 |-----------------|------------------------|--------------------------------------------------------|
 | Query           | "Ask" FAB (💬)          | Push-to-talk → LLM answers a question about the scene |
 | Navigate        | "Guide me to" FAB (🧭) | Push-to-talk → LLM picks a target → turn-by-turn TTS   |
-| Vision update   | Automatic (every ~12 s)| Sends a JPEG + map to LLM; observations merged back    |
+| Vision update   | Optional automatic loop | Sends a JPEG + map to LLM; observations merged back    |
 
 All three hit the Google AI Studio (Gemini) endpoint with JSON `responseMimeType`.
 
@@ -25,6 +25,12 @@ Add two lines (alongside any existing `sdk.dir=`, etc.):
 ```properties
 gemini.api.key=AIza...
 gemini.model=gemini-2.0-flash
+# Optional: only enable automatic vision updates if you want background image
+# calls. The green/orange buttons can still attach images on demand.
+gemini.vision.enabled=false
+# Optional: only enable the background semantic corrector if you want it to
+# spend the same Gemini quota as the assistant buttons.
+gemini.semantic.enabled=false
 ```
 
 Notes:
@@ -34,6 +40,10 @@ Notes:
 - `local.properties` is already gitignored. Never commit the key.
 - If either line is blank the assistant stays disabled at runtime and the
   FABs show a toast explaining that.
+- Automatic vision updates are opt-in because they run in the background and
+  can use quota while you are trying to use the assistant buttons.
+- The semantic corrector is opt-in because it runs in the background and can
+  otherwise rate-limit the green/orange assistant calls on the same key.
 
 ## 2. Rebuild
 
@@ -49,8 +59,8 @@ The Gradle build reads `local.properties` and injects both values into
 
 - Tap the green 💬 FAB → say "What do you see around me?"
 - Tap the orange 🧭 FAB → say "Guide me to the nearest door."
-- Walk around — every ~12 seconds the app sends a frame to the LLM and
-  merges any new objects it identifies into the semantic map.
+- If `gemini.vision.enabled=true`, walk around and the app periodically sends
+  a frame to the LLM and merges any new objects into the semantic map.
 
 ## 4. Where the integration lives
 

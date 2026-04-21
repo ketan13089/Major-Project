@@ -76,6 +76,10 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
 
         // Map rebuild interval (ms)
         private const val REBUILD_INTERVAL_MS = 2000L
+
+        // Live map payload window radius (cells) sent to Flutter.
+        // 40 cells at 0.20m = 8m in each direction (81x81 window total).
+        private const val LIVE_MAP_WINDOW_RADIUS_CELLS = 40
     }
 
     // ── Views ─────────────────────────────────────────────────────────────────
@@ -174,6 +178,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     private val llmExecutor: java.util.concurrent.ExecutorService =
         Executors.newSingleThreadExecutor()
     private val llmGuard = LlmCallGuard()
+    private var pendingMicPermissionAction: (() -> Unit)? = null
     // Latest YUV snapshot (re-published from the shared-camera listener) for
     // vision updates. We copy these once per listener tick, not per frame.
     @Volatile private var llmLastYuv: LlmYuvSnapshot? = null
@@ -213,7 +218,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
                 when (call.method) {
                     "startVoiceNav"  -> {
                         if (hasMicPerm()) navigationManager?.startVoiceCommand()
-                        else reqMicPerm()
+                        else reqMicPerm { navigationManager?.startVoiceCommand() }
                         result.success(null)
                     }
                     "stopNavigation" -> { navigationManager?.stopNavigation(); result.success(null) }
@@ -290,21 +295,24 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
 
         // Initialize semantic AI corrector — key comes from BuildConfig (set in local.properties)
         SemanticCorrectionConfig.apiKey = BuildConfig.GEMINI_API_KEY
-        if (SemanticCorrectionConfig.apiKey.isNotBlank() &&
+        if (BuildConfig.GEMINI_SEMANTIC_CORRECTOR_ENABLED &&
+            SemanticCorrectionConfig.apiKey.isNotBlank() &&
             SemanticCorrectionConfig.apiKey != "PASTE_YOUR_GEMINI_KEY_HERE") {
             SemanticCorrectionConfig.AI_SEMANTIC_CORRECTOR_ENABLED = true
             semanticCorrectionEngine = SemanticCorrectionEngine(mapBuilder, semanticMap, RES)
             println("$TAG: Semantic AI corrector initialized")
         } else {
-            println("$TAG: Semantic AI corrector disabled (no API key in local.properties)")
+            SemanticCorrectionConfig.AI_SEMANTIC_CORRECTOR_ENABLED = false
+            println("$TAG: Semantic AI corrector disabled")
         }
 
         // LLM Assistant — reads key + model from BuildConfig (local.properties).
         LlmAssistantConfig.apiKey = BuildConfig.GEMINI_API_KEY
         LlmAssistantConfig.model  = BuildConfig.GEMINI_MODEL
+        LlmAssistantConfig.visionUpdatesEnabled = BuildConfig.GEMINI_VISION_UPDATES_ENABLED
         if (LlmAssistantConfig.enabled) {
             llmAssistant = LlmAssistant(semanticMap, mapBuilder)
-            println("$TAG: LLM assistant initialized (model=${LlmAssistantConfig.model})")
+            println("$TAG: LLM assistant initialized (model=${LlmAssistantConfig.model}, visionUpdates=${LlmAssistantConfig.visionUpdatesEnabled})")
         } else {
             println("$TAG: LLM assistant disabled — set gemini.api.key and gemini.model in local.properties")
         }
@@ -402,7 +410,12 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     // ─────────────────────────────────────────────────────────────────────────
 
     private fun attachLlmUi() {
-        llmUi = LlmAssistantUi(this, rootLayout) { flow, transcript ->
+        llmUi = LlmAssistantUi(
+            activity = this,
+            root = rootLayout,
+            hasMicPermission = { hasMicPerm() },
+            requestMicPermission = { onGranted -> reqMicPerm(onGranted) }
+        ) { flow, transcript ->
             when (flow) {
                 LlmTaskKind.QUERY    -> runLlmQuery(transcript)
                 LlmTaskKind.NAVIGATE -> runLlmNavigate(transcript)
@@ -597,6 +610,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
      * Results merge back into [semanticMap] so the orange button can use them.
      */
     private fun maybeRunVisionUpdate() {
+        if (!LlmAssistantConfig.visionUpdatesEnabled) return
         val assistant = llmAssistant ?: return
         val pose = latestPose ?: return
         val snap = llmLastYuv ?: return
@@ -839,8 +853,11 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     private fun reqCamPerm() = ActivityCompat.requestPermissions(
         this, arrayOf(Manifest.permission.CAMERA), CAM_PERM)
 
-    private fun reqMicPerm() = ActivityCompat.requestPermissions(
-        this, arrayOf(Manifest.permission.RECORD_AUDIO), MIC_PERM)
+    private fun reqMicPerm(onGranted: (() -> Unit)? = null) {
+        pendingMicPermissionAction = onGranted
+        ActivityCompat.requestPermissions(
+            this, arrayOf(Manifest.permission.RECORD_AUDIO), MIC_PERM)
+    }
 
     override fun onRequestPermissionsResult(rc: Int, p: Array<out String>, results: IntArray) {
         super.onRequestPermissionsResult(rc, p, results)
@@ -855,7 +872,12 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             }
             MIC_PERM -> {
                 if (results.isNotEmpty() && results[0] == PackageManager.PERMISSION_GRANTED) {
-                    navigationManager?.startVoiceCommand()
+                    val action = pendingMicPermissionAction
+                    pendingMicPermissionAction = null
+                    action?.invoke()
+                } else {
+                    pendingMicPermissionAction = null
+                    Toast.makeText(this, "Microphone permission required.", Toast.LENGTH_SHORT).show()
                 }
             }
         }
@@ -1898,24 +1920,37 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             "gridResolution" to RES.toDouble(), "objects" to emptyList<Any>()
         )
 
-        // Use cached bounds from MapBuilder instead of iterating all keys
-        val gMinX = mapBuilder.minGX; val gMaxX = mapBuilder.maxGX
-        val gMinZ = mapBuilder.minGZ; val gMaxZ = mapBuilder.maxGZ
-        val w = gMaxX - gMinX + 1; val h = gMaxZ - gMinZ + 1
+        // Send only a fixed local window around the user, not full map bounds.
+        // This caps payload size in large hallways and reduces Flutter channel load.
+        val robotGlobalGX = mapBuilder.worldToGrid(curPos.x)
+        val robotGlobalGZ = mapBuilder.worldToGrid(curPos.z)
+        val radius = LIVE_MAP_WINDOW_RADIUS_CELLS
+        val gMinX = robotGlobalGX - radius
+        val gMaxX = robotGlobalGX + radius
+        val gMinZ = robotGlobalGZ - radius
+        val gMaxZ = robotGlobalGZ + radius
+        val w = gMaxX - gMinX + 1
+        val h = gMaxZ - gMinZ + 1
 
         val bytes = ByteArray(w * h)
         localGrid.forEach { (cell, type) ->
+            if (cell.x < gMinX || cell.x > gMaxX || cell.z < gMinZ || cell.z > gMaxZ) return@forEach
             val idx = (cell.z - gMinZ) * w + (cell.x - gMinX)
             if (idx in bytes.indices) bytes[idx] = type
         }
 
-        val objects = semanticMap.getAllObjects().map { obj ->
+        val objects = semanticMap.getAllObjects().mapNotNull { obj ->
+            val objGX = mapBuilder.worldToGrid(obj.position.x)
+            val objGZ = mapBuilder.worldToGrid(obj.position.z)
+            val localX = objGX - gMinX
+            val localZ = objGZ - gMinZ
+            if (localX !in 0 until w || localZ !in 0 until h) return@mapNotNull null
             val m = mutableMapOf<String, Any>(
                 "id"       to obj.id,       "type"       to obj.type.name,
                 "label"    to obj.category, "confidence" to obj.confidence,
                 "x"        to obj.position.x, "y" to obj.position.y, "z" to obj.position.z,
-                "gridX"    to (mapBuilder.worldToGrid(obj.position.x) - gMinX),
-                "gridZ"    to (mapBuilder.worldToGrid(obj.position.z) - gMinZ),
+                "gridX"    to localX,
+                "gridZ"    to localZ,
                 "observations" to obj.observations
             )
             obj.textContent?.let { m["textContent"] = it }
@@ -1923,8 +1958,11 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             m as Map<String, Any>
         }
 
-        val navPath = navigationManager?.currentSession?.path?.map { wp ->
-            mapOf("x" to (wp.gridX - gMinX), "z" to (wp.gridZ - gMinZ))
+        val navPath = navigationManager?.currentSession?.path?.mapNotNull { wp ->
+            val localX = wp.gridX - gMinX
+            val localZ = wp.gridZ - gMinZ
+            if (localX !in 0 until w || localZ !in 0 until h) return@mapNotNull null
+            mapOf("x" to localX, "z" to localZ)
         } ?: emptyList<Any>()
 
         return mapOf(
@@ -1932,8 +1970,8 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             "gridWidth"      to w,      "gridHeight"     to h,
             "gridResolution" to RES.toDouble(),
             "originX"        to gMinX,  "originZ"        to gMinZ,
-            "robotGridX"     to (mapBuilder.worldToGrid(curPos.x) - gMinX),
-            "robotGridZ"     to (mapBuilder.worldToGrid(curPos.z) - gMinZ),
+            "robotGridX"     to (robotGlobalGX - gMinX),
+            "robotGridZ"     to (robotGlobalGZ - gMinZ),
             "objects"        to objects,
             "navPath"        to navPath
         )
@@ -1979,10 +2017,13 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     }
 
     private fun onMicTapped() {
-        if (!hasMicPerm()) { reqMicPerm(); return }
         if (navigationManager?.state == NavigationState.NAVIGATING) {
             navigationManager?.stopNavigation()
         } else {
+            if (!hasMicPerm()) {
+                reqMicPerm { navigationManager?.startVoiceCommand() }
+                return
+            }
             navigationManager?.startVoiceCommand()
         }
     }

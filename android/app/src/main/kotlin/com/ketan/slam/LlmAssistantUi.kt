@@ -16,7 +16,7 @@ import android.widget.Toast
  * loading spinner, and the transient reply card. Wires voice input to the
  * right LLM flow and hands results back to the caller.
  *
- *   val ui = LlmAssistantUi(activity, root) { flow, transcript ->
+ *   val ui = LlmAssistantUi(activity, root, hasMicPermission, requestMicPermission) { flow, transcript ->
  *       // dispatch to LlmAssistant on a background thread
  *   }
  *
@@ -26,6 +26,8 @@ import android.widget.Toast
 class LlmAssistantUi(
     private val activity: Activity,
     private val root: FrameLayout,
+    private val hasMicPermission: () -> Boolean,
+    private val requestMicPermission: (onGranted: () -> Unit) -> Unit,
     /** Called on the UI thread when the user finishes speaking. */
     private val onUserSpoke: (flow: LlmTaskKind, transcript: String) -> Unit
 ) {
@@ -118,7 +120,12 @@ class LlmAssistantUi(
 
     private fun trigger(flow: LlmTaskKind) {
         if (!LlmAssistantConfig.enabled) {
-            toast("LLM assistant not configured. Add llm.assistant.api.key to local.properties.")
+            toast("LLM assistant not configured. Add gemini.api.key to local.properties.")
+            return
+        }
+        if (!hasMicPermission()) {
+            toast("Microphone permission needed for voice input.")
+            requestMicPermission { trigger(flow) }
             return
         }
         pendingFlow = flow

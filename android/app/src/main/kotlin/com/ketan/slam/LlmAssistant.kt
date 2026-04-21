@@ -26,6 +26,7 @@ import kotlin.math.sqrt
 object LlmAssistantConfig {
     @Volatile var apiKey: String = ""
     @Volatile var model: String = ""
+    @Volatile var visionUpdatesEnabled: Boolean = false
 
     const val ENDPOINT_BASE = "https://generativelanguage.googleapis.com/v1beta/models/"
     const val TIMEOUT_MS = 20_000

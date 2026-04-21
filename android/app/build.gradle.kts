@@ -10,6 +10,14 @@ plugins {
 val localProps = Properties()
 rootProject.file("local.properties").takeIf { it.exists() }
     ?.inputStream()?.use { localProps.load(it) }
+val geminiSemanticEnabled = localProps
+    .getProperty("gemini.semantic.enabled", "false")
+    .trim()
+    .equals("true", ignoreCase = true)
+val geminiVisionEnabled = localProps
+    .getProperty("gemini.vision.enabled", "false")
+    .trim()
+    .equals("true", ignoreCase = true)
 
 android {
     namespace = "com.ketan.slam"
@@ -46,6 +54,14 @@ android {
         buildConfigField(
             "String", "GEMINI_MODEL",
             "\"${localProps.getProperty("gemini.model", "gemini-2.0-flash")}\""
+        )
+        buildConfigField(
+            "boolean", "GEMINI_SEMANTIC_CORRECTOR_ENABLED",
+            geminiSemanticEnabled.toString()
+        )
+        buildConfigField(
+            "boolean", "GEMINI_VISION_UPDATES_ENABLED",
+            geminiVisionEnabled.toString()
         )
     }
 
