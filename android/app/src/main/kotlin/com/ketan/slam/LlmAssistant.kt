@@ -27,8 +27,9 @@ object LlmAssistantConfig {
     @Volatile var apiKey: String = ""
     @Volatile var model: String = ""
     @Volatile var visionUpdatesEnabled: Boolean = false
+    @Volatile var endpointBase: String =
+        "https://generativelanguage.googleapis.com/v1beta/models/"
 
-    const val ENDPOINT_BASE = "https://generativelanguage.googleapis.com/v1beta/models/"
     const val TIMEOUT_MS = 20_000
     const val MAX_TOKENS = 800
     const val TEMPERATURE = 0.2
@@ -378,31 +379,55 @@ class LlmAssistant(
 
     // ── HTTP ──────────────────────────────────────────────────────────────────
 
+    /** True if the configured endpoint uses the OpenAI-style chat completions
+     *  schema (OpenRouter, OpenAI, etc.). False → Gemini generateContent. */
+    private fun isOpenAiStyle(): Boolean {
+        val endpoint = LlmAssistantConfig.endpointBase.lowercase()
+        return endpoint.contains("openrouter") ||
+               endpoint.contains("openai") ||
+               endpoint.contains("/chat/completions")
+    }
+
     private fun callApi(system: String, user: String, includeImage: String?): String? {
-        val body = buildRequestBody(system, user, includeImage)
-        val url = "${LlmAssistantConfig.ENDPOINT_BASE}${LlmAssistantConfig.model}:generateContent?key=${LlmAssistantConfig.apiKey}"
-        val conn = (URL(url).openConnection() as HttpURLConnection)
+        val openAiStyle = isOpenAiStyle()
+        val endpoint = LlmAssistantConfig.endpointBase
+        val url = if (openAiStyle) {
+            // OpenRouter/OpenAI: fixed endpoint, auth via Bearer header
+            if (endpoint.endsWith("/chat/completions")) endpoint
+            else endpoint.trimEnd('/') + "/chat/completions"
+        } else {
+            // Gemini: model baked into URL, key as query param
+            "${endpoint.trimEnd('/')}/${LlmAssistantConfig.model}:generateContent?key=${LlmAssistantConfig.apiKey}"
+        }
+
+        val conn: HttpURLConnection = try {
+            URL(url).openConnection() as HttpURLConnection
+        } catch (e: Exception) {
+            println("$TAG: open connection: ${e.message}")
+            return null
+        }
+
         return try {
             conn.requestMethod = "POST"
             conn.setRequestProperty("Content-Type", "application/json")
+            if (openAiStyle) {
+                conn.setRequestProperty("Authorization", "Bearer ${LlmAssistantConfig.apiKey}")
+            }
             conn.connectTimeout = LlmAssistantConfig.TIMEOUT_MS
             conn.readTimeout = LlmAssistantConfig.TIMEOUT_MS
             conn.doOutput = true
+
+            val body = buildRequestBody(system, user, includeImage, openAiStyle)
             OutputStreamWriter(conn.outputStream).use { it.write(body) }
 
-            if (conn.responseCode != 200) {
+            val code = conn.responseCode
+            if (code != 200) {
                 val err = try { conn.errorStream?.bufferedReader()?.readText() ?: "" } catch (_: Exception) { "" }
-                println("$TAG: HTTP ${conn.responseCode} $err")
+                println("$TAG: HTTP $code $err")
                 return null
             }
             val resp = BufferedReader(InputStreamReader(conn.inputStream)).use { it.readText() }
-            val root = JSONObject(resp)
-            val candidates = root.optJSONArray("candidates") ?: return null
-            if (candidates.length() == 0) return null
-            val content = candidates.getJSONObject(0).optJSONObject("content") ?: return null
-            val parts = content.optJSONArray("parts") ?: return null
-            if (parts.length() == 0) return null
-            parts.getJSONObject(0).optString("text", "")
+            if (openAiStyle) parseOpenAiResponse(resp) else parseGeminiResponse(resp)
         } catch (e: Exception) {
             println("$TAG: ${e.message}")
             null
@@ -411,35 +436,79 @@ class LlmAssistant(
         }
     }
 
-    private fun buildRequestBody(system: String, user: String, imageB64: String?): String {
-        val root = JSONObject()
+    private fun parseGeminiResponse(resp: String): String? {
+        val root = JSONObject(resp)
+        val candidates = root.optJSONArray("candidates") ?: return null
+        if (candidates.length() == 0) return null
+        val content = candidates.getJSONObject(0).optJSONObject("content") ?: return null
+        val parts = content.optJSONArray("parts") ?: return null
+        if (parts.length() == 0) return null
+        return parts.getJSONObject(0).optString("text", "")
+    }
 
-        // System instruction (top-level in Gemini API)
+    private fun parseOpenAiResponse(resp: String): String? {
+        val root = JSONObject(resp)
+        val choices = root.optJSONArray("choices") ?: return null
+        if (choices.length() == 0) return null
+        val message = choices.getJSONObject(0).optJSONObject("message") ?: return null
+        return message.optString("content", "").takeIf { it.isNotBlank() }
+    }
+
+    private fun buildRequestBody(
+        system: String, user: String, imageB64: String?, openAiStyle: Boolean
+    ): String {
+        return if (openAiStyle) buildOpenAiBody(system, user, imageB64)
+        else buildGeminiBody(system, user, imageB64)
+    }
+
+    private fun buildGeminiBody(system: String, user: String, imageB64: String?): String {
+        val root = JSONObject()
         root.put("systemInstruction", JSONObject()
             .put("parts", JSONArray().put(JSONObject().put("text", system))))
 
-        // User content
         val userParts = JSONArray()
         userParts.put(JSONObject().put("text", user))
         if (imageB64 != null) {
-            // Gemini multimodal: inlineData part
             userParts.put(JSONObject()
                 .put("inlineData", JSONObject()
                     .put("mimeType", "image/jpeg")
                     .put("data", imageB64)))
         }
         val contents = JSONArray()
-        contents.put(JSONObject()
-            .put("role", "user")
-            .put("parts", userParts))
+        contents.put(JSONObject().put("role", "user").put("parts", userParts))
         root.put("contents", contents)
 
-        // Generation config
         root.put("generationConfig", JSONObject()
             .put("temperature", LlmAssistantConfig.TEMPERATURE)
             .put("maxOutputTokens", LlmAssistantConfig.MAX_TOKENS)
             .put("responseMimeType", "application/json"))
+        return root.toString()
+    }
 
+    private fun buildOpenAiBody(system: String, user: String, imageB64: String?): String {
+        val root = JSONObject()
+        root.put("model", LlmAssistantConfig.model)
+        root.put("temperature", LlmAssistantConfig.TEMPERATURE)
+        root.put("max_tokens", LlmAssistantConfig.MAX_TOKENS)
+        root.put("response_format", JSONObject().put("type", "json_object"))
+
+        val messages = JSONArray()
+        messages.put(JSONObject().put("role", "system").put("content", system))
+
+        val userMessage = JSONObject().put("role", "user")
+        if (imageB64 != null) {
+            val parts = JSONArray()
+            parts.put(JSONObject().put("type", "text").put("text", user))
+            parts.put(JSONObject()
+                .put("type", "image_url")
+                .put("image_url", JSONObject()
+                    .put("url", "data:image/jpeg;base64,$imageB64")))
+            userMessage.put("content", parts)
+        } else {
+            userMessage.put("content", user)
+        }
+        messages.put(userMessage)
+        root.put("messages", messages)
         return root.toString()
     }
 

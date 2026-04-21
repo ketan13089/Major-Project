@@ -45,16 +45,25 @@ android {
         versionCode = 1
         versionName = "1.0"
 
-        // Google AI Studio (Gemini) — single key used by both the LLM
-        // assistant and the semantic correction engine.
-        buildConfigField(
-            "String", "GEMINI_API_KEY",
-            "\"${localProps.getProperty("gemini.api.key", "")}\""
+        // LLM assistant key + model. We accept either the legacy `gemini.*`
+        // names or the newer `llm.assistant.*` names so existing
+        // local.properties files keep working. The first non-blank value wins.
+        val llmApiKey = listOf(
+            localProps.getProperty("llm.assistant.api.key", ""),
+            localProps.getProperty("gemini.api.key", "")
+        ).firstOrNull { it.isNotBlank() } ?: ""
+        val llmModel = listOf(
+            localProps.getProperty("llm.assistant.model", ""),
+            localProps.getProperty("gemini.model", "")
+        ).firstOrNull { it.isNotBlank() } ?: "gemini-2.0-flash"
+        val llmEndpoint = localProps.getProperty(
+            "llm.assistant.endpoint",
+            "https://generativelanguage.googleapis.com/v1beta/models/"
         )
-        buildConfigField(
-            "String", "GEMINI_MODEL",
-            "\"${localProps.getProperty("gemini.model", "gemini-2.0-flash")}\""
-        )
+
+        buildConfigField("String", "GEMINI_API_KEY", "\"$llmApiKey\"")
+        buildConfigField("String", "GEMINI_MODEL", "\"$llmModel\"")
+        buildConfigField("String", "LLM_ENDPOINT_BASE", "\"$llmEndpoint\"")
         buildConfigField(
             "boolean", "GEMINI_SEMANTIC_CORRECTOR_ENABLED",
             geminiSemanticEnabled.toString()

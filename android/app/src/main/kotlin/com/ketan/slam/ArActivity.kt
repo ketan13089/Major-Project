@@ -309,6 +309,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         // LLM Assistant — reads key + model from BuildConfig (local.properties).
         LlmAssistantConfig.apiKey = BuildConfig.GEMINI_API_KEY
         LlmAssistantConfig.model  = BuildConfig.GEMINI_MODEL
+        LlmAssistantConfig.endpointBase = BuildConfig.LLM_ENDPOINT_BASE
         LlmAssistantConfig.visionUpdatesEnabled = BuildConfig.GEMINI_VISION_UPDATES_ENABLED
         if (LlmAssistantConfig.enabled) {
             llmAssistant = LlmAssistant(semanticMap, mapBuilder)
@@ -440,31 +441,38 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
 
         llmUi?.showLoading(true)
         llmExecutor.execute {
-            val b64 = if (needsImage && snap != null) {
-                LlmImageEncoder.yuvToBase64Jpeg(
-                    snap.y, snap.u, snap.v,
-                    snap.yStride, snap.uvStride, snap.uvPixStride,
-                    snap.width, snap.height,
-                    quality = LlmAssistantConfig.VISION_JPEG_QUALITY
-                )
-            } else null
+            var result: LlmQueryResult? = null
+            try {
+                val b64 = if (needsImage && snap != null) {
+                    LlmImageEncoder.yuvToBase64Jpeg(
+                        snap.y, snap.u, snap.v,
+                        snap.yStride, snap.uvStride, snap.uvPixStride,
+                        snap.width, snap.height,
+                        quality = LlmAssistantConfig.VISION_JPEG_QUALITY
+                    )
+                } else null
 
-            val result = try {
-                assistant.query(text, pose.tx(), pose.tz(), latestHeading, b64)
-            } catch (e: Exception) { println("$TAG: LLM query: ${e.message}"); null }
-            finally { llmGuard.endAsk() }
-
-            runOnUiThread {
-                llmUi?.showLoading(false)
-                if (result == null) {
-                    llmUi?.toast("Assistant unavailable. Check network or API key.")
-                } else {
-                    val clean = TtsSanitizer.clean(result.answer)
-                    if (clean.isBlank()) {
-                        llmUi?.toast("Empty response from assistant.")
+                result = try {
+                    assistant.query(text, pose.tx(), pose.tz(), latestHeading, b64)
+                } catch (e: Exception) { println("$TAG: LLM query: ${e.message}"); null }
+            } catch (e: Exception) {
+                println("$TAG: LLM query outer: ${e.message}")
+            } finally {
+                llmGuard.endAsk()
+                // Loader must ALWAYS hide, even if anything above threw.
+                runOnUiThread {
+                    llmUi?.showLoading(false)
+                    val r = result
+                    if (r == null) {
+                        llmUi?.toast("Assistant unavailable. Check network or API key.")
                     } else {
-                        llmUi?.showReply(clean)
-                        announcer?.speak(clean)
+                        val clean = TtsSanitizer.clean(r.answer)
+                        if (clean.isBlank()) {
+                            llmUi?.toast("Empty response from assistant.")
+                        } else {
+                            llmUi?.showReply(clean)
+                            announcer?.speak(clean)
+                        }
                     }
                 }
             }
@@ -484,57 +492,61 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
 
         llmUi?.showLoading(true)
         llmExecutor.execute {
-            // First attempt: text-only (map is usually enough).
-            var result = try {
-                assistant.navigate(text, pose.tx(), pose.tz(), latestHeading)
-            } catch (e: Exception) { println("$TAG: LLM navigate: ${e.message}"); null }
+            var result: LlmNavigateResult? = null
+            var dest: SemanticObject? = null
+            var cleanSpoken = ""
+            try {
+                // First attempt: text-only (map is usually enough).
+                result = try {
+                    assistant.navigate(text, pose.tx(), pose.tz(), latestHeading)
+                } catch (e: Exception) { println("$TAG: LLM navigate: ${e.message}"); null }
 
-            // Fallback: if the LLM found nothing in the map, retry ONCE with
-            // the camera image so it can visually identify what the user
-            // meant (e.g. "the glass door"). This is gated by the same
-            // navigate cooldown so we can't loop.
-            if (result != null && result.targetObjectId == null &&
-                result.targetWorldX == null && result.targetWorldZ == null) {
-                val snap = llmLastYuv
-                if (snap != null) {
-                    val b64 = LlmImageEncoder.yuvToBase64Jpeg(
-                        snap.y, snap.u, snap.v,
-                        snap.yStride, snap.uvStride, snap.uvPixStride,
-                        snap.width, snap.height,
-                        quality = LlmAssistantConfig.VISION_JPEG_QUALITY
-                    )
-                    if (b64 != null) {
-                        val retry = try {
-                            assistant.navigate(text, pose.tx(), pose.tz(), latestHeading, b64)
-                        } catch (e: Exception) { println("$TAG: LLM navigate retry: ${e.message}"); null }
-                        if (retry != null) result = retry
+                // Fallback: if the LLM found nothing in the map, retry ONCE with
+                // the camera image so it can visually identify what the user
+                // meant (e.g. "the glass door").
+                val r = result
+                if (r != null && r.targetObjectId == null &&
+                    r.targetWorldX == null && r.targetWorldZ == null) {
+                    val snap = llmLastYuv
+                    if (snap != null) {
+                        val b64 = LlmImageEncoder.yuvToBase64Jpeg(
+                            snap.y, snap.u, snap.v,
+                            snap.yStride, snap.uvStride, snap.uvPixStride,
+                            snap.width, snap.height,
+                            quality = LlmAssistantConfig.VISION_JPEG_QUALITY
+                        )
+                        if (b64 != null) {
+                            val retry = try {
+                                assistant.navigate(text, pose.tx(), pose.tz(), latestHeading, b64)
+                            } catch (e: Exception) { println("$TAG: LLM navigate retry: ${e.message}"); null }
+                            if (retry != null) result = retry
+                        }
                     }
                 }
-            }
 
-            llmGuard.endNavigate()
-
-            // Null-case early exit runs on UI thread; the heavy planning path
-            // runs on the background executor below to avoid ANR.
-            if (result == null) {
+                val r2 = result
+                if (r2 != null) {
+                    cleanSpoken = TtsSanitizer.clean(r2.spoken)
+                    dest = resolveLlmDestination(r2)
+                }
+            } catch (e: Exception) {
+                println("$TAG: LLM navigate outer: ${e.message}")
+            } finally {
+                llmGuard.endNavigate()
+                // Loader must ALWAYS hide, even if anything above threw.
                 runOnUiThread {
                     llmUi?.showLoading(false)
-                    llmUi?.toast("Could not plan route.")
-                }
-                return@execute
-            }
-
-            val cleanSpoken = TtsSanitizer.clean(result.spoken)
-            val dest = resolveLlmDestination(result)
-
-            runOnUiThread {
-                llmUi?.showLoading(false)
-                if (cleanSpoken.isNotBlank()) {
-                    llmUi?.showReply(cleanSpoken)
-                    announcer?.speak(cleanSpoken)
-                }
-                if (dest == null) {
-                    announcer?.speak("I couldn't find a matching destination yet. Keep scanning and try again.")
+                    if (result == null) {
+                        llmUi?.toast("Could not plan route.")
+                    } else {
+                        if (cleanSpoken.isNotBlank()) {
+                            llmUi?.showReply(cleanSpoken)
+                            announcer?.speak(cleanSpoken)
+                        }
+                        if (dest == null) {
+                            announcer?.speak("I couldn't find a matching destination yet. Keep scanning and try again.")
+                        }
+                    }
                 }
             }
 
@@ -542,7 +554,8 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
                 // A* + grid copy can take hundreds of ms on large maps — stay
                 // on the background thread so the UI doesn't stall and the
                 // Android ANR watchdog doesn't kill the activity.
-                startLlmNavigationTo(dest)
+                try { startLlmNavigationTo(dest) }
+                catch (e: Exception) { println("$TAG: LLM startNav: ${e.message}") }
             }
         }
     }
