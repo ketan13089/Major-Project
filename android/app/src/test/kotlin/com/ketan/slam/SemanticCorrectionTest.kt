@@ -24,6 +24,17 @@ class SemanticCorrectionTest {
         SemanticCorrectionConfig.AI_SEMANTIC_CORRECTOR_ENABLED = false
     }
 
+    /** Raise log-odds on a single cell by rasterising a 1-cell vertical wall
+     *  plane through [MapBuilder.integratePlane]. Replaces the older
+     *  `markHitOccupied` helper that was removed from MapBuilder. */
+    private fun stampWall(wx: Float, wz: Float) {
+        builder.integratePlane(PlaneSnapshot(
+            PlaneType.VERTICAL_WALL,
+            listOf(wx to wz, wx + 0.5f to wz),
+            planeId = wx.toInt() * 31 + wz.toInt()
+        ))
+    }
+
     // ── ObjectAffordance mapping ─────────────────────────────────────────────
 
     @Test
@@ -148,7 +159,7 @@ class SemanticCorrectionTest {
     fun `floor prior decreases logOdds bounded by L_MIN`() {
         val gx = 15; val gz = 15
         // First make it occupied
-        builder.markHitOccupied(gx * res, gz * res)
+        stampWall(gx * res, gz * res)
         val loBefore = builder.logOdds[GridCell(gx, gz)]!!
         assertTrue("Cell should start positive", loBefore > 0f)
 
@@ -169,7 +180,7 @@ class SemanticCorrectionTest {
     fun `door prior does NOT clear cells above LO threshold`() {
         val gx = 20; val gz = 20
         // Build up very strong wall evidence (above DOOR_WALL_LO_THRESHOLD = 2.0)
-        for (i in 0..10) builder.markHitOccupied(gx * res, gz * res)
+        for (i in 0..10) stampWall(gx * res, gz * res)
         val loBefore = builder.logOdds[GridCell(gx, gz)]!!
         assertTrue("Cell should have high logOdds", loBefore >= 2.0f)
 
@@ -183,7 +194,7 @@ class SemanticCorrectionTest {
     fun `door prior clears cells below LO threshold`() {
         val gx = 25; val gz = 25
         // Build moderate wall evidence (below threshold)
-        builder.markHitOccupied(gx * res, gz * res)
+        stampWall(gx * res, gz * res)
         val loBefore = builder.logOdds[GridCell(gx, gz)]!!
         assertTrue("Cell should have moderate logOdds", loBefore > 0f)
         assertTrue("Cell should be below door threshold", loBefore < SemanticCorrectionConfig.DOOR_WALL_LO_THRESHOLD)
@@ -321,7 +332,7 @@ class SemanticCorrectionTest {
 
         // Normal map operations should work identically
         builder.incrementalUpdate(1.0f, 1.0f, 0f, 0f, 1f)
-        builder.markHitOccupied(3.0f, 3.0f)
+        stampWall(3.0f, 3.0f)
         builder.markObstacleFootprint(Point3D(5.0f, 0f, 5.0f), 0.25f)
 
         val totalCells = builder.grid.size

@@ -35,7 +35,6 @@ import com.google.ar.core.exceptions.UnavailableSdkTooOldException
 import com.google.ar.core.exceptions.UnavailableUserDeclinedInstallationException
 import io.flutter.embedding.engine.FlutterEngineCache
 import io.flutter.plugin.common.MethodChannel
-// import android.os.Vibrator  // FROZEN — hazard vibration disabled
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import javax.microedition.khronos.egl.EGLConfig
@@ -198,10 +197,6 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     // ── Object localization smoothing ────────────────────────────────────────
     private lateinit var localizationSmoother: LocalizationSmoother
 
-    // ── Hazard warning system ────────────────────────────────────────────────
-    private var hazardWarningSystem: HazardWarningSystem? = null
-    private val spatialAudio = SpatialAudioEngine()
-
     // ─────────────────────────────────────────────────────────────────────────
     // Lifecycle
     // ─────────────────────────────────────────────────────────────────────────
@@ -357,12 +352,6 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
 
         // Attach LLM assistant UI (Ask + Guide me to FABs + spinner + reply card).
         attachLlmUi()
-
-        // Hazard warning + spatial audio — FROZEN (disabled for now)
-        // @Suppress("DEPRECATION")
-        // val vibrator = getSystemService(VIBRATOR_SERVICE) as? Vibrator
-        // hazardWarningSystem = HazardWarningSystem(announcer!!, vibrator)
-        // spatialAudio.start()
 
         try { yoloDetector = YoloDetector(this); println("$TAG: YOLO ready") }
         catch (e: Exception) { println("$TAG: YOLO init failed: ${e.message}") }
@@ -741,8 +730,6 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         try { yoloDetector.close() } catch (_: Exception) {}
         try { textRecognizer.close() } catch (_: Exception) {}
         onboardingTutorial?.stop()
-        // spatialAudio.stop()  // FROZEN
-        hazardWarningSystem = null
         announcer?.shutdown(); announcer = null
         navigationManager?.destroy(); navigationManager = null
         poseTracker.destroy()
@@ -1273,8 +1260,6 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
                 semanticMap.removeStaleObjects()
                 localizationSmoother.removeStale(5000L)
             }
-            // Batched relation graph rebuild (only if dirty, max every 3s)
-            semanticMap.maybeRebuildGraph()
 
             // Navigation tick — throttled to 500ms; only copy grid when rebuild version changes
             val nm = navigationManager

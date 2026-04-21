@@ -594,49 +594,6 @@ class MapBuilder(val res: Float) {
         }
     }
 
-    // ── Depth-hit based map updates ───────────────────────────────────────────
-    // Called from ArActivity depth processing on the GL thread.
-
-    /**
-     * Mark a confirmed floor-level hit point as free space.
-     * Called when a hit-test returns a point at floor level (below camera by >1.2m).
-     */
-    fun markHitFree(wx: Float, wz: Float) {
-        val gx = worldToGrid(wx)
-        val gz = worldToGrid(wz)
-        updateLogOdds(gx, gz, L_FREE * 2f)
-    }
-
-    /**
-     * Mark a confirmed wall hit point as occupied WALL.
-     * Called when a hit-test returns a point near camera height or on a vertical plane.
-     */
-    fun markHitOccupied(wx: Float, wz: Float) {
-        val gx = worldToGrid(wx)
-        val gz = worldToGrid(wz)
-        updateLogOdds(gx, gz, L_OCCUPIED * 1.5f, wallHint = true)
-    }
-
-    /**
-     * Mark a confirmed obstacle (furniture) hit point as occupied OBSTACLE.
-     * Does NOT add to wallCells — renders as CELL_OBSTACLE (brown), not wall (dark).
-     */
-    fun markHitObstacle(wx: Float, wz: Float) {
-        val gx = worldToGrid(wx)
-        val gz = worldToGrid(wz)
-        updateLogOdds(gx, gz, L_OCCUPIED, wallHint = false)
-    }
-
-    /**
-     * Mark a depth-image-derived wall point. Slightly less confident than
-     * a direct hit-test wall (L_OCCUPIED * 1.0f vs 1.5f).
-     */
-    fun markDepthImageWall(wx: Float, wz: Float) {
-        val gx = worldToGrid(wx)
-        val gz = worldToGrid(wz)
-        updateLogOdds(gx, gz, L_OCCUPIED, wallHint = true)
-    }
-
     // ── Confidence-weighted dense depth methods ──────────────────────────────
 
     /**
@@ -718,17 +675,6 @@ class MapBuilder(val res: Float) {
     }
 
     /**
-     * Mark an inferred wall (from floor-boundary or motion analysis).
-     * Weak signal (L_OCCUPIED * 0.6f) — needs several confirming observations
-     * across frames to cross the occupied threshold.
-     */
-    fun markInferredWall(wx: Float, wz: Float) {
-        val gx = worldToGrid(wx)
-        val gz = worldToGrid(wz)
-        updateLogOdds(gx, gz, L_OCCUPIED * 0.6f, wallHint = true)
-    }
-
-    /**
      * Mark a cell as a white/featureless wall with stronger evidence.
      * Called when we have high confidence based on floor-hit + miss pattern:
      * floor is visible but ARCore can't track the wall above it.
@@ -738,34 +684,6 @@ class MapBuilder(val res: Float) {
         val gz = worldToGrid(wz)
         // Higher confidence than inferred wall (0.85 vs 0.6 multiplier)
         updateLogOdds(gx, gz, L_OCCUPIED * 0.85f, wallHint = true)
-        // Track for AR overlay rendering
-        synchronized(recentInferredWalls) {
-            recentInferredWalls.add(wx to wz)
-            // Keep only the most recent 100 inferred wall positions
-            while (recentInferredWalls.size > 100) {
-                recentInferredWalls.removeAt(0)
-            }
-        }
-    }
-
-    /** Recent inferred wall positions for AR overlay rendering */
-    private val recentInferredWalls = mutableListOf<Pair<Float, Float>>()
-
-    /**
-     * Get recently inferred wall positions (for AR overlay rendering).
-     * Returns up to 50 positions for performance reasons.
-     */
-    fun getRecentInferredWalls(): List<Pair<Float, Float>> {
-        synchronized(recentInferredWalls) {
-            return recentInferredWalls.takeLast(50).toList()
-        }
-    }
-
-    /** Clear old inferred wall positions (call periodically) */
-    fun clearOldInferredWalls() {
-        synchronized(recentInferredWalls) {
-            recentInferredWalls.clear()
-        }
     }
 
     // ── Private integration ────────────────────────────────────────────────────

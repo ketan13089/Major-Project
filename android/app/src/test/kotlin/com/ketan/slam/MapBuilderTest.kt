@@ -74,58 +74,36 @@ class MapBuilderTest {
         assertEquals("Last camera cell should be VISITED", 4, lastCell!!.toInt())
     }
 
-    // ── markHitFree / markHitOccupied ───────────────────────────────────────
-
-    @Test
-    fun `markHitFree creates free cell`() {
-        builder.markHitFree(1.0f, 1.0f)
-        // After marking, need to trigger deriveGrid — do via incrementalUpdate
-        builder.incrementalUpdate(0f, 0f, 0f, 0f, 1f)
-        val gx = builder.worldToGrid(1.0f)
-        val gz = builder.worldToGrid(1.0f)
-        val lo = builder.logOdds[GridCell(gx, gz)]
-        assertNotNull("Hit-free cell should have logOdds", lo)
-        assertTrue("Hit-free logOdds should be negative (free)", lo!! < 0f)
-    }
-
-    @Test
-    fun `markHitOccupied creates occupied cell`() {
-        builder.markHitOccupied(3.0f, 3.0f)
-        val gx = builder.worldToGrid(3.0f)
-        val gz = builder.worldToGrid(3.0f)
-        val lo = builder.logOdds[GridCell(gx, gz)]
-        assertNotNull("Hit-occupied cell should have logOdds", lo)
-        assertTrue("Hit-occupied logOdds should be positive", lo!! > 0f)
-    }
-
-    @Test
-    fun `repeated markHitOccupied increases confidence`() {
-        val wx = 5.0f; val wz = 5.0f
-        builder.markHitOccupied(wx, wz)
-        val gx = builder.worldToGrid(wx); val gz = builder.worldToGrid(wz)
-        val lo1 = builder.logOdds[GridCell(gx, gz)]!!
-
-        builder.markHitOccupied(wx, wz)
-        val lo2 = builder.logOdds[GridCell(gx, gz)]!!
-        assertTrue("Repeated occupied marks should increase logOdds ($lo1 → $lo2)", lo2 > lo1)
-    }
-
-    @Test
-    fun `markHitObstacle creates obstacle evidence`() {
-        builder.markHitObstacle(4.0f, 4.0f)
-        val gx = builder.worldToGrid(4.0f)
-        val gz = builder.worldToGrid(4.0f)
-        val lo = builder.logOdds[GridCell(gx, gz)]
-        assertNotNull("Hit-obstacle cell should have logOdds", lo)
-        assertTrue("Hit-obstacle logOdds should be positive", lo!! > 0f)
-    }
-
     // ── Log-odds clamping ───────────────────────────────────────────────────
+    // Drives log-odds via integratePlane which funnels through the same
+    // updateLogOdds path the production code uses.
+
+    private fun stampWall(wx: Float, wz: Float) {
+        // A 1-cell vertical "wall" polygon that rasterisePlaneAsWall accepts.
+        builder.integratePlane(PlaneSnapshot(
+            PlaneType.VERTICAL_WALL,
+            listOf(wx to wz, wx + 0.5f to wz),
+            planeId = wx.toInt() * 31 + wz.toInt()
+        ))
+    }
+
+    private fun stampFree(wx: Float, wz: Float) {
+        // A 1m × 1m horizontal plane centred on (wx, wz).
+        builder.integratePlane(PlaneSnapshot(
+            PlaneType.HORIZONTAL_FREE,
+            listOf(
+                wx - 0.5f to wz - 0.5f,
+                wx + 0.5f to wz - 0.5f,
+                wx + 0.5f to wz + 0.5f,
+                wx - 0.5f to wz + 0.5f
+            ),
+            planeId = wx.toInt() * 31 + wz.toInt() + 1
+        ))
+    }
 
     @Test
     fun `logOdds clamped to max`() {
-        // Mark many times to saturate
-        for (i in 0..50) builder.markHitOccupied(1.0f, 1.0f)
+        for (i in 0..50) stampWall(1.0f, 1.0f)
         val gx = builder.worldToGrid(1.0f); val gz = builder.worldToGrid(1.0f)
         val lo = builder.logOdds[GridCell(gx, gz)]!!
         assertTrue("LogOdds should be clamped (got $lo)", lo <= 4.0f)  // L_MAX = 3.5f
@@ -133,7 +111,7 @@ class MapBuilderTest {
 
     @Test
     fun `logOdds clamped to min`() {
-        for (i in 0..50) builder.markHitFree(2.0f, 2.0f)
+        for (i in 0..50) stampFree(2.0f, 2.0f)
         val gx = builder.worldToGrid(2.0f); val gz = builder.worldToGrid(2.0f)
         val lo = builder.logOdds[GridCell(gx, gz)]!!
         assertTrue("LogOdds should be clamped negative (got $lo)", lo >= -5.0f)  // L_MIN = -4.0f
@@ -204,7 +182,7 @@ class MapBuilderTest {
     @Test
     fun `rebuild applies decay to occupied cells`() {
         // Mark an occupied cell only once (low observation count → fast decay)
-        builder.markHitOccupied(10.0f, 10.0f)
+        stampWall(10.0f, 10.0f)
         val gx = builder.worldToGrid(10.0f); val gz = builder.worldToGrid(10.0f)
         val loBefore = builder.logOdds[GridCell(gx, gz)]!!
 
@@ -227,7 +205,7 @@ class MapBuilderTest {
     @Test
     fun `lightRebuild decays poorly observed cells`() {
         // Add a weakly-observed occupied cell
-        builder.markHitOccupied(5.0f, 5.0f)
+        stampWall(5.0f, 5.0f)
         val gx = builder.worldToGrid(5.0f); val gz = builder.worldToGrid(5.0f)
         val loBefore = builder.logOdds[GridCell(gx, gz)] ?: 0f
 
@@ -253,9 +231,9 @@ class MapBuilderTest {
 
     @Test
     fun `observation count increments on repeated marks`() {
-        builder.markHitOccupied(3.0f, 3.0f)
-        builder.markHitOccupied(3.0f, 3.0f)
-        builder.markHitOccupied(3.0f, 3.0f)
+        stampWall(3.0f, 3.0f)
+        stampWall(3.0f, 3.0f)
+        stampWall(3.0f, 3.0f)
         val counts = builder.observationCountSnapshot()
         val gx = builder.worldToGrid(3.0f); val gz = builder.worldToGrid(3.0f)
         val count = counts[GridCell(gx, gz)] ?: 0

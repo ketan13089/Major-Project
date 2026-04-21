@@ -28,13 +28,6 @@ class SemanticMapManager {
     /** Callback invoked when a stale object is removed — used by MapBuilder to clear footprints. */
     var onObjectRemoved: ((SemanticObject) -> Unit)? = null
 
-    // Feature 2.1: Object relationship graph (internal system use only)
-    val relationGraph = ObjectRelationGraph()
-    // Throttle relation graph rebuild — O(n²) is too expensive on every mutation
-    private var lastGraphRebuildMs = 0L
-    private var graphDirty = false
-    private val GRAPH_REBUILD_INTERVAL_MS = 3000L
-
     // ── Add ───────────────────────────────────────────────────────────────────
     // Returns false when merged into an existing object, true when a new entry
     // was created.
@@ -67,7 +60,6 @@ class SemanticMapManager {
                         objectsById[existing.id] = merged
                         nearbyObjects.remove(existing)
                         nearbyObjects.add(merged)
-                        markGraphDirty()
                         return false
                     }
                 }
@@ -76,7 +68,6 @@ class SemanticMapManager {
             // No duplicate found — insert as new
             spatialGrid.getOrPut(cell) { mutableListOf() }.add(obj)
             objectsById[obj.id] = obj
-            markGraphDirty()
             return true
         }
     }
@@ -92,7 +83,6 @@ class SemanticMapManager {
             // Insert updated entry
             objectsById[obj.id] = obj
             spatialGrid.getOrPut(toGridCell(obj.position)) { mutableListOf() }.add(obj)
-            markGraphDirty()
         }
     }
 
@@ -108,23 +98,6 @@ class SemanticMapManager {
                 // Notify MapBuilder to clear this object's obstacle footprint
                 onObjectRemoved?.invoke(obj)
             }
-        }
-    }
-
-    /** Mark the relation graph as needing a rebuild (batched, not immediate). */
-    private fun markGraphDirty() {
-        graphDirty = true
-    }
-
-    /** Rebuild the relation graph if dirty and enough time has passed. */
-    fun maybeRebuildGraph() {
-        if (!graphDirty) return
-        val now = System.currentTimeMillis()
-        if (now - lastGraphRebuildMs < GRAPH_REBUILD_INTERVAL_MS) return
-        synchronized(this) {
-            lastGraphRebuildMs = now
-            graphDirty = false
-            relationGraph.rebuild(objectsById.values.toList())
         }
     }
 
