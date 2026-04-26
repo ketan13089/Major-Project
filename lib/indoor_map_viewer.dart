@@ -67,6 +67,9 @@ class _T {
   // Nav path (voice navigation route) — green
   static const mapNavPath = Color(0xFF10B981);
 
+  // Camera trail polyline — a distinct teal stroke drawn over visited cells
+  static const mapTrail   = Color(0xFF0EA5E9);
+
   // Robot position
   static const mapRobot   = Color(0xFF2563EB);
 }
@@ -154,6 +157,7 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
   int originX = 0, originZ = 0;
   int robotGX = 0, robotGZ = 0;
   List<MapObject> objects = [];
+  List<({int x, int z})> cameraTrail = [];
   double posX = 0, posZ = 0, heading = 0;
   double compassBearing = 0;   // true-north bearing in degrees from device sensors
   int totalObjects = 0;
@@ -401,11 +405,14 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
       // Track if objects changed to avoid expensive focusable re-registration
       final oldObjectCount = objects.length;
 
+      final newTrail = _parseTrail(args['cameraTrail']);
+
       setState(() {
         grid = ng; gridW = newW; gridH = newH; gridRes = newRes;
         originX = newOX; originZ = newOZ;
         robotGX = newRGX; robotGZ = newRGZ;
         objects = newObjs; totalObjects = newObjs.length;
+        cameraTrail = newTrail;
         _navPathCells = _parseNavPath(args['navPath'], newW, newH);
         _cachedAreaSqM = area;
         if (needBfs) {
@@ -442,6 +449,18 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
       final nx = (e['x'] as num?)?.toInt() ?? -1;
       final nz = (e['z'] as num?)?.toInt() ?? -1;
       if (nx >= 0 && nx < w && nz >= 0 && nz < h) out.add(nz * w + nx);
+    }
+    return out;
+  }
+
+  List<({int x, int z})> _parseTrail(dynamic raw) {
+    if (raw is! List) return [];
+    final out = <({int x, int z})>[];
+    for (final e in raw) {
+      if (e is! Map) continue;
+      final nx = (e['x'] as num?)?.toInt();
+      final nz = (e['z'] as num?)?.toInt();
+      if (nx != null && nz != null) out.add((x: nx, z: nz));
     }
     return out;
   }
@@ -744,6 +763,7 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
                   grid: grid, gridW: gridW, gridH: gridH, gridRes: gridRes,
                   objects: objects, pathCells: pathCells,
                   navPathCells: _navPathCells,
+                  cameraTrail: cameraTrail,
                   selectedObj: _selObj,
                   robotGX: robotGX, robotGZ: robotGZ, heading: heading,
                   compassBearing: compassBearing,
@@ -1034,7 +1054,8 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
           ]),
           const SizedBox(height: 12),
           _legendRow(_T.mapFloor,    'Floor (passable)',    'White — open walkable area'),
-          _legendRow(_T.mapVisited,  'Camera path',         'Light blue — scanned trajectory'),
+          _legendRow(_T.mapVisited,  'Visited cells',        'Light blue — scanned floor area'),
+          _legendRow(_T.mapTrail,   'Camera trail',         'Teal line — exact path taken'),
           _legendRow(_T.mapWall,     'Wall',                'Dark — detected vertical surface'),
           _legendRow(_T.mapObstacle, 'Obstacle',            'Brown — object footprint'),
           _legendRow(_T.mapPath,     'Route to object',     'Blue — selected object path'),
@@ -1090,6 +1111,7 @@ class _MapPainter extends CustomPainter {
   final List<MapObject> objects;
   final Set<int> pathCells;
   final Set<int> navPathCells;
+  final List<({int x, int z})> cameraTrail;
   final int? selectedObj;
   final int robotGX, robotGZ;
   final double heading, compassBearing, scale;
@@ -1100,6 +1122,7 @@ class _MapPainter extends CustomPainter {
     required this.grid, required this.gridW, required this.gridH,
     required this.gridRes, required this.objects,
     required this.pathCells, required this.navPathCells,
+    required this.cameraTrail,
     required this.selectedObj,
     required this.robotGX, required this.robotGZ,
     required this.heading, required this.compassBearing,
@@ -1148,6 +1171,7 @@ class _MapPainter extends CustomPainter {
     _drawFloorAndVisited(canvas, origin, visCXMin, visCXMax, visCZMin, visCZMax);
     _drawNavPath(canvas, origin);
     _drawBfsPath(canvas, origin);
+    _drawCameraTrail(canvas, origin);
     _drawObstacles(canvas, origin, visCXMin, visCXMax, visCZMin, visCZMax);
     _drawWalls(canvas, origin, visCXMin, visCXMax, visCZMin, visCZMax);
     _drawObjects(canvas, origin);
@@ -1268,6 +1292,39 @@ class _MapPainter extends CustomPainter {
           Rect.fromLTWH(origin.dx + cx * cp, origin.dy + cz * cp, cp, cp),
           paint);
     }
+  }
+
+  void _drawCameraTrail(Canvas canvas, Offset origin) {
+    if (cameraTrail.length < 2) return;
+    final half = scale / 2;
+    // Stroke width scales with zoom but stays readable at all levels
+    final sw = (scale * 0.18).clamp(1.5, 5.0);
+    final paint = Paint()
+      ..color = _T.mapTrail.withOpacity(0.75)
+      ..strokeWidth = sw
+      ..strokeCap = StrokeCap.round
+      ..strokeJoin = StrokeJoin.round
+      ..style = PaintingStyle.stroke;
+
+    final path = Path();
+    final first = cameraTrail.first;
+    path.moveTo(origin.dx + first.x * scale + half,
+                origin.dy + first.z * scale + half);
+    for (int i = 1; i < cameraTrail.length; i++) {
+      final pt = cameraTrail[i];
+      path.lineTo(origin.dx + pt.x * scale + half,
+                  origin.dy + pt.z * scale + half);
+    }
+    canvas.drawPath(path, paint);
+
+    // Start dot — marks where the session began
+    final startPt = cameraTrail.first;
+    canvas.drawCircle(
+      Offset(origin.dx + startPt.x * scale + half,
+             origin.dy + startPt.z * scale + half),
+      (sw * 1.5).clamp(2.5, 6.0),
+      Paint()..color = _T.mapTrail.withOpacity(0.9),
+    );
   }
 
   void _drawObjects(Canvas canvas, Offset origin) {
@@ -1481,7 +1538,7 @@ class _MapPainter extends CustomPainter {
   @override
   bool shouldRepaint(_MapPainter o) =>
       grid != o.grid || objects != o.objects || pathCells != o.pathCells ||
-          navPathCells != o.navPathCells ||
+          navPathCells != o.navPathCells || cameraTrail != o.cameraTrail ||
           robotGX != o.robotGX || robotGZ != o.robotGZ ||
           heading != o.heading || compassBearing != o.compassBearing ||
           scale != o.scale ||
