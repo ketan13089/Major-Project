@@ -140,8 +140,16 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     private var lastDepthProcessMs = 0L          // throttle dense depth + confidence
     private var lastWallInferMs  = 0L           // throttle motion-based wall inference
 
-    // Pre-allocated buffer for depth unprojection
-    private val depthWorldBuf = FloatArray(3)
+    // Pre-allocated input buffer for depth unprojection (reused every sample)
+    private val depthLocalBuf = FloatArray(3)
+
+    // Pre-allocated column-tracking arrays for white wall inference (reused every depth frame)
+    private var depthCols = 0
+    private var colMisses   = IntArray(0)
+    private var colWallHits = IntArray(0)
+    private var colFloorHits = IntArray(0)
+    private var colFloorWx  = FloatArray(0)
+    private var colFloorWz  = FloatArray(0)
 
     // Raw depth capability check — cached after first attempt
     @Volatile private var rawDepthSupported: Boolean? = null
@@ -1339,14 +1347,23 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             val step = 4  // dense sampling: every 4 pixels
             var wallHitCount = 0
 
-            // Per-column tracking for white wall inference
+            // Per-column tracking for white wall inference — reuse pre-allocated arrays,
+            // growing them only when depth image width changes (rare).
             val cols = w / step
-            val colMisses = IntArray(cols)
-            val colWallHits = IntArray(cols)
-            val colFloorHits = IntArray(cols)
-            // Store floor hit world positions per column for white wall marking
-            val colFloorWx = FloatArray(cols)
-            val colFloorWz = FloatArray(cols)
+            if (cols != depthCols) {
+                depthCols    = cols
+                colMisses    = IntArray(cols)
+                colWallHits  = IntArray(cols)
+                colFloorHits = IntArray(cols)
+                colFloorWx   = FloatArray(cols)
+                colFloorWz   = FloatArray(cols)
+            } else {
+                colMisses.fill(0)
+                colWallHits.fill(0)
+                colFloorHits.fill(0)
+                colFloorWx.fill(0f)
+                colFloorWz.fill(0f)
+            }
 
             // Forward direction for white wall inference
             val q = pose.rotationQuaternion
@@ -1384,8 +1401,9 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
                     val localX = ((u - dcx) * depthM) / dfx
                     val localY = ((v - dcy) * depthM) / dfy
 
-                    // Transform to world space via camera pose
-                    val world = pose.transformPoint(floatArrayOf(localX, localY, -depthM))
+                    // Transform to world space via camera pose (reuse pre-allocated input buffer)
+                    depthLocalBuf[0] = localX; depthLocalBuf[1] = localY; depthLocalBuf[2] = -depthM
+                    val world = pose.transformPoint(depthLocalBuf)
                     val wx = world[0]
                     val wz = world[2]
                     val relY = world[1] - cameraY
