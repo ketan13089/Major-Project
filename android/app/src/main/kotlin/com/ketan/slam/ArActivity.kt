@@ -118,7 +118,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     // ── Detection ─────────────────────────────────────────────────────────────
     private lateinit var yoloDetector: YoloDetector
     private lateinit var textRecognizer: TextRecognizer
-    private val confirmationGate = DetectionConfirmationGate(requiredHits = 3, windowMs = 5_000L)
+    private val confirmationGate = DetectionConfirmationGate(requiredHits = 1, windowMs = 5_000L)
     private val detectionExecutor = Executors.newSingleThreadExecutor()
     private val detecting = AtomicBoolean(false)
     private var lastDetectMs = 0L
@@ -162,8 +162,8 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     @Volatile private var cachedNavGrid: HashMap<GridCell, Byte>? = null
     @Volatile private var cachedObsCounts: Map<GridCell, Int>? = null
     @Volatile private var cachedNavGridVersion = -1L   // track rebuild version to avoid redundant copies
-    // Stale object removal: every 5s, not every frame
-    private var lastStaleCheckMs = 0L
+    // Localization smoother cleanup: every 5s, not every frame
+    private var lastSmootherCleanupMs = 0L
     // Drift check cache: avoid redundant anchor iteration
     @Volatile private var cachedDrift = 0f
     private var lastDriftCheckMs = 0L
@@ -278,15 +278,6 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         slamEngine  = SlamEngine()
         semanticMap = SemanticMapManager()
         mapPersistence = MapPersistence(this)
-
-        // Wire up stale-object cleanup → footprint clearing (only for obstacle types)
-        semanticMap.onObjectRemoved = { obj ->
-            val affordance = ObjectAffordance.forType(obj.type)
-            if (affordance == ObjectAffordance.FLOOR_OBSTACLE) {
-                val halfM = ObjectLocalizer.footprintHalfMetres(obj.category)
-                mapBuilder.clearObstacleFootprint(obj.position, halfM)
-            }
-        }
 
         // Initialize semantic AI corrector — key comes from BuildConfig (set in local.properties)
         SemanticCorrectionConfig.apiKey = BuildConfig.GEMINI_API_KEY
@@ -1254,10 +1245,9 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
                 latestHeading
             )
 
-            // Stale object removal — every 5s, not every frame
-            if (now - lastStaleCheckMs >= 5000L) {
-                lastStaleCheckMs = now
-                semanticMap.removeStaleObjects()
+            // Clean only transient localization smoothing state; semantic map objects persist once added.
+            if (now - lastSmootherCleanupMs >= 5000L) {
+                lastSmootherCleanupMs = now
                 localizationSmoother.removeStale(5000L)
             }
 
@@ -1759,7 +1749,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             }
             TextClassification.GENERAL -> {
                 // Store as generic text sign if sufficiently confident
-                if (textDet.confidence >= 0.5f) {
+                if (textDet.confidence > 0.50f) {
                     mergeOrAddText(textDet, wp, ObjectType.TEXT_SIGN, null)
                 }
             }

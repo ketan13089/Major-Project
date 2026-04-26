@@ -211,7 +211,7 @@ class MapPersistence(private val context: Context) {
             val objArr = json.getJSONArray("objects")
             for (i in 0 until objArr.length()) {
                 val obj = deserializeObject(objArr.getJSONObject(i))
-                if (obj != null) semanticMap.addObject(obj)
+                if (obj != null) semanticMap.addObject(obj, enforceConfidenceGate = false)
             }
 
             // Restore breadcrumbs

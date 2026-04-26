@@ -49,7 +49,11 @@ class DetectionConfirmationGate(
                     confirmed += YoloDetector.Detection(match.label, match.bestConf, RectF(match.box))
                 }
             } else {
-                candidates += Candidate(det.label, RectF(det.boundingBox), 1, det.confidence, now)
+                val candidate = Candidate(det.label, RectF(det.boundingBox), 1, det.confidence, now)
+                candidates += candidate
+                if (candidate.count >= requiredHits) {
+                    confirmed += YoloDetector.Detection(candidate.label, candidate.bestConf, RectF(candidate.box))
+                }
             }
         }
         return confirmed
@@ -81,7 +85,7 @@ class YoloDetector(context: Context) {
     companion object {
         private const val TAG = "YoloDetector"
         private const val INPUT_SIZE = 640
-        private const val CONFIDENCE_THRESHOLD = 0.45f  // was 0.60f
+        private const val CONFIDENCE_THRESHOLD = 0.50f
         private const val IOU_THRESHOLD = 0.45f
         private const val MODEL_FILE = "indoor_nav_best_float16.tflite"
 
@@ -188,7 +192,7 @@ class YoloDetector(context: Context) {
         for (i in 0 until n) {
             var maxC = 0f; var best = 0
             for (c in 0 until numClasses) { val v = output[4+c][i]; if (v > maxC) { maxC = v; best = c } }
-            if (maxC < CONFIDENCE_THRESHOLD) continue
+            if (maxC <= CONFIDENCE_THRESHOLD) continue
             val box = xywh2xyxy(output[0][i], output[1][i], output[2][i], output[3][i]) ?: continue
             if (isPlausible(box)) r += Detection(labels[best], maxC, box)
         }
@@ -200,7 +204,7 @@ class YoloDetector(context: Context) {
         for (i in 0 until n) {
             var maxC = 0f; var best = 0
             for (c in 0 until numClasses) { val v = output[i][4+c]; if (v > maxC) { maxC = v; best = c } }
-            if (maxC < CONFIDENCE_THRESHOLD) continue
+            if (maxC <= CONFIDENCE_THRESHOLD) continue
             val box = xywh2xyxy(output[i][0], output[i][1], output[i][2], output[i][3]) ?: continue
             if (isPlausible(box)) r += Detection(labels[best], maxC, box)
         }

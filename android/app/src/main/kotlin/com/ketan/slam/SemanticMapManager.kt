@@ -18,21 +18,19 @@ class SemanticMapManager {
     companion object {
         private const val CELL_SIZE = 1.0f
         private const val DUPLICATE_DISTANCE = 1.2f   // raised to match ArActivity merge radius
-        private const val STALE_TIME_MS = 30000L
-        private const val MIN_OBSERVATIONS = 3
+        private const val MIN_ADD_CONFIDENCE = 0.50f
     }
 
     private val spatialGrid = ConcurrentHashMap<GridCell, MutableList<SemanticObject>>()
     private val objectsById  = ConcurrentHashMap<String, SemanticObject>()
 
-    /** Callback invoked when a stale object is removed — used by MapBuilder to clear footprints. */
-    var onObjectRemoved: ((SemanticObject) -> Unit)? = null
-
     // ── Add ───────────────────────────────────────────────────────────────────
     // Returns false when merged into an existing object, true when a new entry
     // was created.
-    fun addObject(obj: SemanticObject): Boolean {
+    fun addObject(obj: SemanticObject, enforceConfidenceGate: Boolean = true): Boolean {
         synchronized(this) {
+            if (enforceConfidenceGate && obj.confidence <= MIN_ADD_CONFIDENCE) return false
+
             val cell = toGridCell(obj.position)
 
             // Search neighbouring cells for a duplicate of the same type
@@ -83,21 +81,6 @@ class SemanticMapManager {
             // Insert updated entry
             objectsById[obj.id] = obj
             spatialGrid.getOrPut(toGridCell(obj.position)) { mutableListOf() }.add(obj)
-        }
-    }
-
-    // ── Remove stale low-confidence objects ───────────────────────────────────
-    fun removeStaleObjects() {
-        synchronized(this) {
-            val now = System.currentTimeMillis()
-            val stale = objectsById.values
-                .filter { (now - it.lastSeen) > STALE_TIME_MS && it.observations < MIN_OBSERVATIONS }
-            stale.forEach { obj ->
-                objectsById.remove(obj.id)
-                spatialGrid[toGridCell(obj.position)]?.remove(obj)
-                // Notify MapBuilder to clear this object's obstacle footprint
-                onObjectRemoved?.invoke(obj)
-            }
         }
     }
 
