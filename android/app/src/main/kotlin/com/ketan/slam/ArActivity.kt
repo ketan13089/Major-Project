@@ -163,7 +163,12 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         val confidence: Float
     )
     private val pendingCandidates = HashMap<String, PendingCandidate>()
-    private val VISIBILITY_GATE_MS = 3_000L
+    // Lowered from 3s. With YOLO at ~900ms intervals plus the confirmation
+    // gate (1 hit) plus the smoother (1 hit, was 2), a 1.5s gate still gives
+    // at least one extra confirming detection on the same object before
+    // committing it to the semantic map, while keeping the visible delay
+    // short enough that users perceive the object as "added when seen".
+    private val VISIBILITY_GATE_MS = 1_500L
 
     // ── Flutter ───────────────────────────────────────────────────────────────
     private var methodChannel: MethodChannel? = null
@@ -1735,32 +1740,56 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
                 observations = n,
                 localizationMethod = method ?: existing.localizationMethod
             ))
-        } else {
-            // New candidate — enforce 3-second visibility gate
-            val gx = mapBuilder.worldToGrid(wp.x); val gz = mapBuilder.worldToGrid(wp.z)
-            val candidateId = "${det.label}_${gx}_${gz}"
-            val now = System.currentTimeMillis()
-            val candidate = pendingCandidates[candidateId]
-            if (candidate == null) {
-                pendingCandidates[candidateId] = PendingCandidate(now, wp, det.confidence)
-            } else if (now - candidate.firstSeenMs >= VISIBILITY_GATE_MS) {
-                pendingCandidates.remove(candidateId)
-                semanticMap.addObject(SemanticObject(
+            return
+        }
+
+        // New candidate — visibility-gated. Look up the pending candidate
+        // by label and *nearby* grid cell (within 1 cell) so a small position
+        // wobble between frames doesn't reset the timer with a fresh key.
+        val gx = mapBuilder.worldToGrid(wp.x)
+        val gz = mapBuilder.worldToGrid(wp.z)
+        val now = System.currentTimeMillis()
+
+        var matchedKey: String? = null
+        for (dz in -1..1) for (dx in -1..1) {
+            val k = "${det.label}_${gx + dx}_${gz + dz}"
+            if (pendingCandidates.containsKey(k)) { matchedKey = k; break }
+        }
+        val candidateId = matchedKey ?: "${det.label}_${gx}_${gz}"
+        val candidate = pendingCandidates[candidateId]
+
+        if (candidate == null) {
+            pendingCandidates[candidateId] = PendingCandidate(now, wp, det.confidence)
+            return
+        }
+        if (now - candidate.firstSeenMs >= VISIBILITY_GATE_MS) {
+            pendingCandidates.remove(candidateId)
+            val added = semanticMap.addObject(
+                SemanticObject(
                     id          = candidateId,
                     type        = ObjectType.fromLabel(det.label),
                     category    = det.label,
                     position    = wp,
-                    boundingBox = BoundingBox2D(det.boundingBox.left, det.boundingBox.top,
+                    boundingBox = BoundingBox2D(
+                        det.boundingBox.left, det.boundingBox.top,
                         det.boundingBox.right, det.boundingBox.bottom),
                     confidence  = maxOf(candidate.confidence, det.confidence),
                     firstSeen   = candidate.firstSeenMs,
                     lastSeen    = now,
                     localizationMethod = method
-                ))
-            } else {
-                // Still within gate window — update best confidence seen so far
-                pendingCandidates[candidateId] = candidate.copy(confidence = maxOf(candidate.confidence, det.confidence))
-            }
+                )
+            )
+            println("$TAG: object ${if (added) "added" else "merged"}: " +
+                    "$candidateId @ (${"%.2f".format(wp.x)}, ${"%.2f".format(wp.z)}) " +
+                    "conf=${"%.2f".format(maxOf(candidate.confidence, det.confidence))}")
+        } else {
+            // Still within gate window — update best confidence and refresh
+            // the position toward the latest observation so the eventual
+            // commit reflects the most recent (and usually best) localization.
+            pendingCandidates[candidateId] = candidate.copy(
+                confidence = maxOf(candidate.confidence, det.confidence),
+                position = wp,
+            )
         }
     }
 

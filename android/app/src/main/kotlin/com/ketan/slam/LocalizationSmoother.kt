@@ -14,11 +14,16 @@ import kotlin.math.roundToInt
 class LocalizationSmoother(private val gridRes: Float) {
 
     companion object {
-        private const val CONSISTENCY_DIST = 0.8f   // max distance between positions to be "consistent"
-        private const val MIN_HITS = 2              // minimum consistent positions before accepting
-        private const val BUFFER_WINDOW_MS = 5000L  // time window for consistency check
-        private const val ALPHA_HIT_TEST = 0.3f     // EMA alpha for hit-test positions
-        private const val ALPHA_FALLBACK = 0.15f    // EMA alpha for fallback positions
+        // Loosened so a first-time detection isn't silently dropped:
+        // CONSISTENCY_DIST raised to 1.2m to match ArActivity.MERGE_DIST and
+        // tolerate the realistic ±0.5m noise of fallback depth at 3-4m range.
+        // MIN_HITS lowered to 1 so the very first detection is admitted; EMA
+        // still smooths subsequent ones via [feed].
+        private const val CONSISTENCY_DIST = 1.2f
+        private const val MIN_HITS = 1
+        private const val BUFFER_WINDOW_MS = 5000L
+        private const val ALPHA_HIT_TEST = 0.3f
+        private const val ALPHA_FALLBACK = 0.15f
     }
 
     data class LocalizationResult(

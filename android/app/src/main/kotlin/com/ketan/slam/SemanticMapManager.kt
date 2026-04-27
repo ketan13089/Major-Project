@@ -18,7 +18,10 @@ class SemanticMapManager {
     companion object {
         private const val CELL_SIZE = 1.0f
         private const val DUPLICATE_DISTANCE = 1.2f   // raised to match ArActivity merge radius
-        private const val MIN_ADD_CONFIDENCE = 0.50f
+        // Aligned with YoloDetector.kt confidence threshold (0.45f).
+        // The previous 0.50f silently dropped detections in the 0.45-0.50
+        // band that had already passed inference + confirmation gates.
+        private const val MIN_ADD_CONFIDENCE = 0.45f
     }
 
     private val spatialGrid = ConcurrentHashMap<GridCell, MutableList<SemanticObject>>()
