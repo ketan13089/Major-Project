@@ -598,13 +598,17 @@ class MapBuilder(val res: Float) {
 
     /**
      * Unified confidence-weighted depth point integration.
-     * Replaces separate mark methods for dense depth processing.
      *
-     * Confidence weighting:
-     *   < 64  → skip (too noisy)
-     *   64-127  → 0.5x (weak evidence)
-     *   128-191 → 0.85x (good evidence)
-     *   192-255 → 1.2x (strong evidence)
+     * Combines two weights so noise can't flip a cell on one or two hits:
+     *  - Confidence (per-pixel ARCore confidence, 96..255)
+     *  - Distance falloff: weight ∝ 1 / (1 + (depth/2)²). ARCore raw depth
+     *    error grows roughly with depth² indoors, so far points contribute
+     *    less than near points by the same factor that makes them noisier.
+     *    1m → ~0.80, 2m → 0.50, 3m → ~0.31, 4m → 0.20.
+     *
+     * Combined multiplier is in [0, ~1.0]; the per-occupied delta is
+     * sized so a cell needs ≥3 confirming wall observations to cross
+     * LO_THRESH_OCC, eliminating single-frame false positives.
      *
      * Height classification (relY = point Y - camera Y):
      *   < -1.2m         → floor (free)
@@ -612,33 +616,39 @@ class MapBuilder(val res: Float) {
      *   -0.8m to 1.0m   → wall
      *   > 1.0m          → ceiling (ignore)
      */
-    fun markDepthPoint(wx: Float, wz: Float, confidence: Int, relY: Float) {
-        if (confidence < 64) return  // too noisy, skip
+    fun markDepthPoint(wx: Float, wz: Float, confidence: Int, relY: Float, depthM: Float) {
+        if (confidence < 96) return  // hard floor — caller already filters
 
-        val confMultiplier = when {
-            confidence < 128 -> 0.5f
-            confidence < 192 -> 0.85f
-            else             -> 1.2f
+        val confWeight = when {
+            confidence < 160 -> 0.55f
+            confidence < 208 -> 0.80f
+            else             -> 1.0f
         }
+        // Quadratic distance penalty — matches ARCore raw-depth noise growth.
+        val distWeight = 1f / (1f + (depthM * depthM) * 0.25f)
+        val w = confWeight * distWeight
 
         when {
             relY < -1.2f -> {
-                // Floor — mark as free
+                // Floor — mark as free. Free updates stay assertive because
+                // they're easily reversed by subsequent occupied evidence.
                 val gx = worldToGrid(wx)
                 val gz = worldToGrid(wz)
-                updateLogOdds(gx, gz, L_FREE * 2f * confMultiplier)
+                updateLogOdds(gx, gz, L_FREE * 1.5f * w)
             }
             relY in -1.2f..-0.8f -> {
-                // Furniture/obstacle level
+                // Furniture/obstacle level. Smaller per-hit delta so a few
+                // noisy points won't manifest as a phantom obstacle.
                 val gx = worldToGrid(wx)
                 val gz = worldToGrid(wz)
-                updateLogOdds(gx, gz, L_OCCUPIED * confMultiplier, wallHint = false)
+                updateLogOdds(gx, gz, L_OCCUPIED * 0.55f * w, wallHint = false)
             }
             relY in -0.8f..1.0f -> {
-                // Wall level
+                // Wall level. Same reduced delta — at full weight (w=1.0) it
+                // still takes ~3 confirming hits to cross LO_THRESH_OCC=1.5.
                 val gx = worldToGrid(wx)
                 val gz = worldToGrid(wz)
-                updateLogOdds(gx, gz, L_OCCUPIED * confMultiplier, wallHint = true)
+                updateLogOdds(gx, gz, L_OCCUPIED * 0.55f * w, wallHint = true)
             }
             // relY > 1.0f → ceiling, ignore
         }

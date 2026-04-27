@@ -1383,6 +1383,16 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             val fLen = sqrt(fwdX * fwdX + fwdZ * fwdZ).coerceAtLeast(0.001f)
             val fnx = fwdX / fLen; val fnz = fwdZ / fLen
 
+            // Noise-rejection gates:
+            //  - DEPTH_MAX_M: ARCore raw-depth error grows ~quadratically with
+            //    distance; beyond ~4m the signal is dominated by noise indoors.
+            //  - CONF_MIN: bucket 0-95 is unreliable on most devices and was
+            //    the dominant source of speckle in the grid.
+            //  - Median-of-4 outlier reject: discard a pixel whose depth is
+            //    >25% off the median of its 4 axis-neighbours (kills single-pixel
+            //    pepper noise that the confidence channel doesn't catch).
+            val DEPTH_MAX_MM = 4000
+            val CONF_MIN = 96
             for (v in step / 2 until h step step) {
                 for (u in step / 2 until w step step) {
                     val colIdx = u / step
@@ -1390,7 +1400,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
                     if (depthOffset + 1 >= depthBuf.capacity()) continue
 
                     val depthMm = depthBuf.getShort(depthOffset).toInt() and 0xFFFF
-                    if (depthMm == 0 || depthMm > 5000) {
+                    if (depthMm == 0 || depthMm > DEPTH_MAX_MM) {
                         // No depth data — count as miss for white wall inference
                         if (colIdx < cols) colMisses[colIdx]++
                         continue
@@ -1404,6 +1414,33 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
                         } else 255
                     } else {
                         255  // full trust for smoothed depth fallback
+                    }
+                    if (conf < CONF_MIN) {
+                        if (colIdx < cols) colMisses[colIdx]++
+                        continue
+                    }
+
+                    // 4-neighbour median outlier reject. Sample neighbours at the
+                    // SAME stride we iterate at so the test is actually local and
+                    // doesn't cross boundaries already validated this pass.
+                    val nL = if (u >= step) (depthBuf.getShort(v * depthRowStride + (u - step) * 2).toInt() and 0xFFFF) else 0
+                    val nR = if (u + step < w) (depthBuf.getShort(v * depthRowStride + (u + step) * 2).toInt() and 0xFFFF) else 0
+                    val nU = if (v >= step) (depthBuf.getShort((v - step) * depthRowStride + u * 2).toInt() and 0xFFFF) else 0
+                    val nD = if (v + step < h) (depthBuf.getShort((v + step) * depthRowStride + u * 2).toInt() and 0xFFFF) else 0
+                    var nbSum = 0; var nbCount = 0
+                    if (nL in 1..DEPTH_MAX_MM) { nbSum += nL; nbCount++ }
+                    if (nR in 1..DEPTH_MAX_MM) { nbSum += nR; nbCount++ }
+                    if (nU in 1..DEPTH_MAX_MM) { nbSum += nU; nbCount++ }
+                    if (nD in 1..DEPTH_MAX_MM) { nbSum += nD; nbCount++ }
+                    if (nbCount >= 2) {
+                        val nbMean = nbSum / nbCount
+                        // Tolerance scales with depth: depth quantum is ~1mm but
+                        // genuine error is roughly ±2.5% of distance.
+                        val tol = (nbMean * 0.25f).toInt().coerceAtLeast(80)
+                        if (kotlin.math.abs(depthMm - nbMean) > tol) {
+                            if (colIdx < cols) colMisses[colIdx]++
+                            continue
+                        }
                     }
 
                     val depthM = depthMm / 1000f
@@ -1419,8 +1456,8 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
                     val wz = world[2]
                     val relY = world[1] - cameraY
 
-                    // Unified confidence-weighted integration
-                    mapBuilder.markDepthPoint(wx, wz, conf, relY)
+                    // Unified confidence-weighted integration (distance-aware)
+                    mapBuilder.markDepthPoint(wx, wz, conf, relY, depthM)
 
                     // Track per-column stats for white wall inference
                     if (colIdx < cols) {
@@ -1430,14 +1467,16 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
                                 colFloorWx[colIdx] = wx
                                 colFloorWz[colIdx] = wz
                             }
-                            relY in -0.8f..1.0f && conf >= 64 -> {
+                            relY in -0.8f..1.0f -> {
                                 colWallHits[colIdx]++
                             }
                         }
                     }
 
-                    // Free-ray clearing for every 3rd high-confidence wall hit
-                    if (relY in -0.8f..1.0f && conf >= 128 && depthM > 0.5f) {
+                    // Free-ray clearing for every 3rd high-confidence wall hit.
+                    // Lifted near gate from 0.5m → 0.8m so the user's own
+                    // hand/body doesn't carve free space at arm's length.
+                    if (relY in -0.8f..1.0f && conf >= 160 && depthM > 0.8f) {
                         wallHitCount++
                         if (wallHitCount % 3 == 0) {
                             mapBuilder.markDepthFreeRay(camWx, camWz, wx, wz)
