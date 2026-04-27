@@ -3,6 +3,7 @@ import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'accessibility_service.dart';
+import 'global_voice.dart';
 import 'wcag_theme.dart';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -102,7 +103,84 @@ class IndoorMapViewer extends StatefulWidget {
 }
 
 class _IndoorMapViewerState extends State<IndoorMapViewer>
-    with TickerProviderStateMixin, VolumeButtonNavigationMixin {
+    with
+        TickerProviderStateMixin,
+        VolumeButtonNavigationMixin,
+        GlobalVoiceCommandsMixin {
+
+  @override
+  List<GlobalVoiceCommand> buildVoiceCommands(BuildContext context) {
+    final cmds = <GlobalVoiceCommand>[];
+    if (!_isReadOnly) {
+      cmds.add(GlobalVoiceCommand(
+        phrases: const ['start scan', 'open camera', 'start AR', 'begin scan'],
+        description: 'Open the AR camera to start scanning',
+        onMatch: _openAR,
+      ));
+      cmds.add(GlobalVoiceCommand(
+        phrases: const [
+          'start navigation',
+          'voice navigation',
+          'navigate',
+          'start guiding'
+        ],
+        description: 'Start voice-guided navigation',
+        onMatch: () {
+          if (_navState == 'NAVIGATING') return;
+          _navCh.invokeMethod('startVoiceNav');
+        },
+      ));
+      cmds.add(GlobalVoiceCommand(
+        phrases: const [
+          'stop navigation',
+          'cancel navigation',
+          'stop guiding'
+        ],
+        description: 'Stop the current voice navigation session',
+        onMatch: () => _navCh.invokeMethod('stopNavigation'),
+      ));
+    }
+    cmds.add(GlobalVoiceCommand(
+      phrases: const ['where am I', 'my position', 'current position'],
+      description: 'Announce your current position and area mapped',
+      onMatch: () => _accessibility.speak(
+        'Position: ${posX.toStringAsFixed(1)} by ${posZ.toStringAsFixed(1)} meters. '
+        'Facing ${_compassDirection()}. '
+        'Area mapped: ${_areaSqM.toStringAsFixed(1)} square meters. '
+        '$totalObjects object${totalObjects == 1 ? '' : 's'} detected.',
+      ),
+    ));
+    cmds.add(GlobalVoiceCommand(
+      phrases: const ['what objects', 'list objects', 'objects detected'],
+      description: 'List the detected objects',
+      onMatch: () {
+        if (objects.isEmpty) {
+          _accessibility.speak('No objects detected yet.');
+          return;
+        }
+        final names = objects.take(8).map(_displayLabel).join(', ');
+        _accessibility.speak(
+          '${objects.length} object${objects.length == 1 ? '' : 's'} detected: $names'
+          '${objects.length > 8 ? ', and more.' : '.'}',
+        );
+      },
+    ));
+    cmds.add(GlobalVoiceCommand(
+      phrases: const ['toggle legend', 'show legend', 'hide legend'],
+      description: 'Show or hide the map legend',
+      onMatch: () => setState(() => _showLegend = !_showLegend),
+    ));
+    cmds.add(GlobalVoiceCommand(
+      phrases: const ['reset view', 'recenter', 'center map'],
+      description: 'Reset zoom and center the map on you',
+      onMatch: () => setState(() {
+        pan = Offset.zero;
+        scale = 28.0;
+      }),
+    ));
+    return cmds;
+  }
+
   static const _ch    = MethodChannel('com.ketan.slam/ar');
   static const _navCh = MethodChannel('com.ketan.slam/nav');
   static const _mapStoreCh = MethodChannel('com.ketan.slam/map_store');
@@ -925,6 +1003,9 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
               ),
             ),
           ),
+          // Global voice command FAB — bottom-left so it doesn't collide
+          // with the destination-only AR voice nav FAB on the right.
+          const GlobalVoiceFab(left: 16, bottom: 16),
         ]),
       ),
     );

@@ -36,7 +36,8 @@
       "Bash(./gradlew :app:compileDebugKotlin -q)",
       "Bash(flutter --version)",
       "Bash(awk BEGIN{depth=0} {for\\(i=1;i<=length\\($0\\);i++\\){c=substr\\($0,i,1\\); if\\(c==\"{\"\\) depth++; else if\\(c==\"}\"\\) depth--}} END{print \"final depth:\", depth} *)",
-      "Bash(awk BEGIN{p=0;b=0} {for\\(i=1;i<=length\\($0\\);i++\\){c=substr\\($0,i,1\\); if\\(c==\"\\(\"\\) p++; else if\\(c==\"\\)\"\\) p--; if\\(c==\"[\"\\) b++; else if\\(c==\"]\"\\) b--}} END{print \"parens:\", p, \"brackets:\", b} *)"
+      "Bash(awk BEGIN{p=0;b=0} {for\\(i=1;i<=length\\($0\\);i++\\){c=substr\\($0,i,1\\); if\\(c==\"\\(\"\\) p++; else if\\(c==\"\\)\"\\) p--; if\\(c==\"[\"\\) b++; else if\\(c==\"]\"\\) b--}} END{print \"parens:\", p, \"brackets:\", b} *)",
+      "Bash(awk BEGIN{d=0;p=0;b=0} {for\\(i=1;i<=length\\($0\\);i++\\){c=substr\\($0,i,1\\); if\\(c==\"{\"\\) d++; else if\\(c==\"}\"\\) d--; if\\(c==\"\\(\"\\) p++; else if\\(c==\"\\)\"\\) p--; if\\(c==\"[\"\\) b++; else if\\(c==\"]\"\\) b--}} END{print \"braces:\", d, \"parens:\", p, \"brackets:\", b} *)"
     ]
   }
 }

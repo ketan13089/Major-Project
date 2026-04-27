@@ -17,6 +17,9 @@ class MainActivity : FlutterActivity() {
     private val MAP_CHANNEL = "com.ketan.slam/map"
     private val TTS_CHANNEL = "com.ketan.slam/tts"
     private val VOLUME_CHANNEL = "com.ketan.slam/volume_buttons"
+    private val GLOBAL_VOICE_CHANNEL = "com.ketan.slam/global_voice"
+
+    private var globalVoiceService: GlobalVoiceService? = null
 
     companion object {
         /**
@@ -172,6 +175,17 @@ class MainActivity : FlutterActivity() {
                 else -> result.notImplemented()
             }
         }
+
+        // Global voice command service — app-wide push-to-talk that returns
+        // raw transcripts. Distinct from the destination-only nav voice in
+        // ArActivity. Available on every Flutter screen.
+        val globalVoiceChannel = MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            GLOBAL_VOICE_CHANNEL,
+        )
+        globalVoiceService = GlobalVoiceService(this, globalVoiceChannel).also {
+            it.attach()
+        }
     }
 
     /**
@@ -286,6 +300,8 @@ class MainActivity : FlutterActivity() {
     }
 
     override fun onDestroy() {
+        globalVoiceService?.destroy()
+        globalVoiceService = null
         accessibilityHandler.shutdown()
         super.onDestroy()
     }

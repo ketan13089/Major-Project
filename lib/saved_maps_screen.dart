@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'accessibility_service.dart';
+import 'global_voice.dart';
 import 'performance_dashboard.dart';
 import 'wcag_theme.dart';
 
@@ -64,9 +65,48 @@ class SavedMapsScreen extends StatefulWidget {
 }
 
 class _SavedMapsScreenState extends State<SavedMapsScreen>
-    with VolumeButtonNavigationMixin {
+    with VolumeButtonNavigationMixin, GlobalVoiceCommandsMixin {
   static const _ch = MethodChannel('com.ketan.slam/map_store');
   final _accessibility = AccessibilityService();
+
+  @override
+  List<GlobalVoiceCommand> buildVoiceCommands(BuildContext context) {
+    final commands = <GlobalVoiceCommand>[];
+    commands.add(GlobalVoiceCommand(
+      phrases: const ['refresh', 'reload', 'reload maps'],
+      description: 'Reload the saved maps list',
+      onMatch: _loadMaps,
+    ));
+    if (_isSelectionMode) {
+      commands.add(GlobalVoiceCommand(
+        phrases: const ['delete selected', 'delete maps', 'remove selected'],
+        description: 'Delete the selected maps',
+        onMatch: _deleteSelectedMaps,
+      ));
+      commands.add(GlobalVoiceCommand(
+        phrases: const ['cancel selection', 'clear selection'],
+        description: 'Exit selection mode',
+        onMatch: () => setState(() {
+          _isSelectionMode = false;
+          _selectedMaps.clear();
+        }),
+      ));
+    }
+    if (_maps != null && _maps!.isNotEmpty) {
+      commands.add(GlobalVoiceCommand(
+        phrases: const ['open first', 'open latest', 'open most recent'],
+        description: 'Open the most recently saved map',
+        onMatch: () => _openMap(_maps!.first),
+      ));
+      commands.add(GlobalVoiceCommand(
+        phrases: const ['list maps', 'how many maps'],
+        description: 'Announce the number of saved maps',
+        onMatch: () => _accessibility.speak(
+            '${_maps!.length} saved map${_maps!.length == 1 ? '' : 's'}.'),
+      ));
+    }
+    return commands;
+  }
 
   List<SavedMapInfo>? _maps;
   bool _loading = true;
@@ -225,6 +265,7 @@ class _SavedMapsScreenState extends State<SavedMapsScreen>
     _isSelectionMode = false;
     _selectedMaps.clear();
     _loadMaps();
+    refreshVoiceCommands();
 
     if (mounted) {
       final msg = 'Deleted $deleted map${deleted == 1 ? '' : 's'}';
@@ -299,13 +340,16 @@ class _SavedMapsScreenState extends State<SavedMapsScreen>
             : null,
       ),
       body: WcagScaffoldFrame(
-        child: _loading
-            ? const Center(child: CircularProgressIndicator())
-            : _error != null
-                ? _errorState(p)
-                : (_maps == null || _maps!.isEmpty)
-                    ? _emptyState(p)
-                    : _mapList(p),
+        child: Stack(children: [
+          _loading
+              ? const Center(child: CircularProgressIndicator())
+              : _error != null
+                  ? _errorState(p)
+                  : (_maps == null || _maps!.isEmpty)
+                      ? _emptyState(p)
+                      : _mapList(p),
+          const GlobalVoiceFab(),
+        ]),
       ),
     );
   }

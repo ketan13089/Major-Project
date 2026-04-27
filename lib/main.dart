@@ -2,11 +2,76 @@ import 'package:flutter/material.dart';
 import 'indoor_map_viewer.dart';
 import 'saved_maps_screen.dart';
 import 'accessibility_service.dart';
+import 'global_voice.dart';
 import 'wcag_theme.dart';
+
+/// Global navigator key — used by global voice commands ("home", "back",
+/// "open map") so they can navigate without a BuildContext.
+final GlobalKey<NavigatorState> appNavigatorKey = GlobalKey<NavigatorState>();
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
+  _installBuiltInVoiceCommands();
   runApp(const MyApp());
+}
+
+/// Install the always-available voice commands. These work on every screen
+/// in addition to whatever each screen registers via [GlobalVoiceCommandsMixin].
+void _installBuiltInVoiceCommands() {
+  final acc = AccessibilityService();
+  GlobalVoiceController.instance.setBuiltIns([
+    GlobalVoiceCommand(
+      phrases: const ['home', 'go home', 'main menu'],
+      description: 'Return to the home screen',
+      onMatch: () {
+        appNavigatorKey.currentState
+            ?.popUntil((route) => route.isFirst);
+      },
+    ),
+    GlobalVoiceCommand(
+      phrases: const ['back', 'go back', 'previous'],
+      description: 'Go back to the previous screen',
+      onMatch: () {
+        appNavigatorKey.currentState?.maybePop();
+      },
+    ),
+    GlobalVoiceCommand(
+      phrases: const ['help', 'what can I say', 'commands', 'voice help'],
+      description: 'List available voice commands on this screen',
+      onMatch: () {
+        acc.speak(
+          GlobalVoiceController.instance.availableCommandsSummary(),
+          interrupt: true,
+        );
+      },
+    ),
+    GlobalVoiceCommand(
+      phrases: const ["what's here", 'where am I', 'current item'],
+      description: 'Read the currently focused item again',
+      onMatch: () {
+        final el = acc.currentFocusedElement;
+        if (el != null) {
+          final pos =
+              '${acc.currentFocusIndex + 1} of ${acc.focusableCount}';
+          acc.speak(
+            'Currently on ${el.label}. Position $pos. ${el.hint ?? ''}',
+          );
+        } else {
+          acc.speak('No item focused.');
+        }
+      },
+    ),
+    GlobalVoiceCommand(
+      phrases: const ['repeat', 'say that again'],
+      description: 'Repeat the last announcement',
+      onMatch: () {
+        final el = acc.currentFocusedElement;
+        if (el != null) {
+          acc.speak('${el.label}. ${el.hint ?? ''}', interrupt: true);
+        }
+      },
+    ),
+  ]);
 }
 
 class MyApp extends StatelessWidget {
@@ -16,6 +81,7 @@ class MyApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'Indoor Navigator',
+      navigatorKey: appNavigatorKey,
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(
@@ -58,7 +124,8 @@ class HomePage extends StatefulWidget {
   State<HomePage> createState() => _HomePageState();
 }
 
-class _HomePageState extends State<HomePage> with VolumeButtonNavigationMixin {
+class _HomePageState extends State<HomePage>
+    with VolumeButtonNavigationMixin, GlobalVoiceCommandsMixin {
   final _accessibility = AccessibilityService();
 
   @override
@@ -81,7 +148,8 @@ class _HomePageState extends State<HomePage> with VolumeButtonNavigationMixin {
       FocusableElement(
         id: 'saved_maps',
         label: 'Saved Maps',
-        hint: 'View and manage your previously saved maps. Each map carries its own performance metrics.',
+        hint:
+            'View and manage your previously saved maps. Each map carries its own performance metrics.',
         onActivate: () => Navigator.pushNamed(context, '/saved-maps'),
       ),
       FocusableElement(
@@ -94,10 +162,47 @@ class _HomePageState extends State<HomePage> with VolumeButtonNavigationMixin {
           _accessibility.toggle();
           setState(() {});
           _registerFocusables();
+          refreshVoiceCommands();
         },
         type: FocusableElementType.toggle,
       ),
     ], onFocusChanged: () => setState(() {}));
+  }
+
+  @override
+  List<GlobalVoiceCommand> buildVoiceCommands(BuildContext context) {
+    return [
+      GlobalVoiceCommand(
+        phrases: const ['open map', 'view map', 'show map', 'indoor map'],
+        description: 'Open the indoor map viewer',
+        onMatch: () => _openMapViewer(context),
+      ),
+      GlobalVoiceCommand(
+        phrases: const [
+          'saved maps',
+          'open saved maps',
+          'my maps',
+          'show saved'
+        ],
+        description: 'Open the saved maps list',
+        onMatch: () => Navigator.pushNamed(context, '/saved-maps'),
+      ),
+      GlobalVoiceCommand(
+        phrases: const [
+          'toggle accessibility',
+          'turn off accessibility',
+          'turn on accessibility',
+          'accessibility mode'
+        ],
+        description: 'Toggle accessibility mode on or off',
+        onMatch: () {
+          _accessibility.toggle();
+          setState(() {});
+          _registerFocusables();
+          refreshVoiceCommands();
+        },
+      ),
+    ];
   }
 
   @override
@@ -118,8 +223,9 @@ class _HomePageState extends State<HomePage> with VolumeButtonNavigationMixin {
     return Scaffold(
       backgroundColor: p.background,
       body: WcagScaffoldFrame(
-        child: SafeArea(
-          child: SingleChildScrollView(
+        child: Stack(children: [
+          SafeArea(
+            child: SingleChildScrollView(
             padding: const EdgeInsets.fromLTRB(20, 20, 20, 36),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -195,32 +301,13 @@ class _HomePageState extends State<HomePage> with VolumeButtonNavigationMixin {
                     ),
                   ),
                 ),
-                const SizedBox(height: 28),
-                WcagText(
-                  'Capabilities',
-                  size: WcagType.label,
-                  weight: WcagType.semibold,
-                  letterSpacing: -0.2,
-                ),
-                const SizedBox(height: 12),
-                Wrap(
-                  spacing: 8,
-                  runSpacing: 8,
-                  children: const [
-                    _CapChip(Icons.radar, 'Obstacle alerts'),
-                    _CapChip(Icons.hearing, 'Spatial audio'),
-                    _CapChip(Icons.mic, 'Voice commands'),
-                    _CapChip(Icons.stairs, 'Stair warnings'),
-                    _CapChip(Icons.sos, 'Emergency SOS'),
-                    _CapChip(Icons.undo, 'Guide me back'),
-                    _CapChip(Icons.save_alt, 'Save maps'),
-                    _CapChip(Icons.accessibility_new, 'TalkBack'),
-                  ],
-                ),
+                const SizedBox(height: 96),
               ],
             ),
           ),
         ),
+        const GlobalVoiceFab(),
+        ]),
       ),
     );
   }
@@ -234,13 +321,13 @@ class _Header extends StatelessWidget {
   Widget build(BuildContext context) {
     return Row(children: [
       Container(
-        padding: const EdgeInsets.all(10),
+        padding: const EdgeInsets.all(12),
         decoration: BoxDecoration(
           color: p.accentPrimary,
           borderRadius: BorderRadius.circular(14),
         ),
         child: Icon(Icons.explore_rounded,
-            size: 24, color: p.textOnAccent),
+            size: 32, color: p.textOnAccent),
       ),
       const SizedBox(width: 12),
       Column(crossAxisAlignment: CrossAxisAlignment.start, children: const [
@@ -269,13 +356,13 @@ class _HeroBanner extends StatelessWidget {
       ),
       child: Column(children: [
         Container(
-          padding: const EdgeInsets.all(14),
+          padding: const EdgeInsets.all(18),
           decoration: BoxDecoration(
             color: Colors.white.withOpacity(0.18),
-            borderRadius: BorderRadius.circular(16),
+            borderRadius: BorderRadius.circular(18),
           ),
           child: Icon(Icons.accessibility_new_rounded,
-              size: 36, color: p.textOnAccent),
+              size: 48, color: p.textOnAccent),
         ),
         const SizedBox(height: 16),
         WcagText(
@@ -333,14 +420,14 @@ class _ActionCard extends StatelessWidget {
           ),
           child: Row(children: [
             Container(
-              padding: const EdgeInsets.all(13),
+              padding: const EdgeInsets.all(16),
               decoration: BoxDecoration(
                 color: iconColor,
-                borderRadius: BorderRadius.circular(14),
+                borderRadius: BorderRadius.circular(16),
               ),
-              child: Icon(icon, size: 26, color: p.textOnAccent),
+              child: Icon(icon, size: 34, color: p.textOnAccent),
             ),
-            const SizedBox(width: 16),
+            const SizedBox(width: 18),
             Expanded(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
@@ -356,7 +443,7 @@ class _ActionCard extends StatelessWidget {
               ),
             ),
             Icon(Icons.arrow_forward_ios_rounded,
-                size: 16, color: p.textSecondary),
+                size: 20, color: p.textSecondary),
           ]),
         ),
       ),
@@ -364,29 +451,3 @@ class _ActionCard extends StatelessWidget {
   }
 }
 
-class _CapChip extends StatelessWidget {
-  final IconData icon;
-  final String text;
-  const _CapChip(this.icon, this.text);
-
-  @override
-  Widget build(BuildContext context) {
-    final p = WcagPalette.of(context);
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-      decoration: BoxDecoration(
-        color: p.surfaceRecessed,
-        borderRadius: BorderRadius.circular(10),
-        border: Border.all(color: p.border),
-      ),
-      child: Row(mainAxisSize: MainAxisSize.min, children: [
-        Icon(icon, size: 16, color: p.textSecondary),
-        const SizedBox(width: 6),
-        WcagText(text,
-            size: WcagType.caption,
-            emphasis: 'secondary',
-            weight: WcagType.medium),
-      ]),
-    );
-  }
-}

@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'global_voice.dart';
 import 'wcag_theme.dart';
 
 /// Per-map performance dashboard. Displays the performance metrics that were
@@ -32,7 +33,8 @@ extension on _Severity {
       };
 }
 
-class _PerformanceDashboardState extends State<PerformanceDashboard> {
+class _PerformanceDashboardState extends State<PerformanceDashboard>
+    with GlobalVoiceCommandsMixin {
   static const _mapStoreChannel = MethodChannel('com.ketan.slam/map_store');
 
   Map<String, dynamic> _metrics = {};
@@ -43,6 +45,50 @@ class _PerformanceDashboardState extends State<PerformanceDashboard> {
   void initState() {
     super.initState();
     _fetchMetrics();
+  }
+
+  @override
+  List<GlobalVoiceCommand> buildVoiceCommands(BuildContext context) {
+    return [
+      GlobalVoiceCommand(
+        phrases: const ['refresh', 'reload', 'reload metrics'],
+        description: 'Reload the performance metrics',
+        onMatch: _fetchMetrics,
+      ),
+      GlobalVoiceCommand(
+        phrases: const ['export', 'export report', 'save report'],
+        description: 'Export the metrics as a JSON report',
+        onMatch: _exportReport,
+      ),
+      GlobalVoiceCommand(
+        phrases: const ['summary', 'read summary', 'overview'],
+        description: 'Read a spoken summary of key metrics',
+        onMatch: _speakSummary,
+      ),
+    ];
+  }
+
+  void _speakSummary() {
+    if (_metrics.isEmpty) {
+      return;
+    }
+    final fps = (_metrics['avgFps'] as num?)?.toDouble() ?? 0;
+    final yolo = (_metrics['yoloAvgMs'] as num?)?.toDouble() ?? 0;
+    final drift = (_metrics['avgDrift'] as num?)?.toDouble() ?? 0;
+    final dur = (_metrics['sessionDurationSec'] as num?)?.toDouble() ?? 0;
+    final mins = (dur / 60).floor();
+    final secs = (dur % 60).floor();
+    final summary =
+        'Performance summary: average frame rate ${fps.toStringAsFixed(0)} '
+        'frames per second, YOLO latency ${yolo.toStringAsFixed(0)} milliseconds, '
+        'drift ${drift.toStringAsFixed(2)} meters, '
+        'session ${mins} minutes ${secs} seconds.';
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+          content:
+              WcagText(summary, size: WcagType.body, color: Colors.white),
+          duration: const Duration(seconds: 6)),
+    );
   }
 
   Future<void> _fetchMetrics() async {
@@ -141,13 +187,16 @@ class _PerformanceDashboardState extends State<PerformanceDashboard> {
         ],
       ),
       body: WcagScaffoldFrame(
-        child: _loading
-            ? const Center(child: CircularProgressIndicator())
-            : _errorMessage != null
-                ? _errorState(p)
-                : !hasMetrics
-                    ? _noMetricsState(p)
-                    : _metricsList(p),
+        child: Stack(children: [
+          _loading
+              ? const Center(child: CircularProgressIndicator())
+              : _errorMessage != null
+                  ? _errorState(p)
+                  : !hasMetrics
+                      ? _noMetricsState(p)
+                      : _metricsList(p),
+          const GlobalVoiceFab(),
+        ]),
       ),
     );
   }
