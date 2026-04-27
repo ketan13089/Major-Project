@@ -404,13 +404,13 @@ class _AccessibilityHelpDialogState extends State<AccessibilityHelpDialog> {
     _HelpItem(
       title: 'Voice Commands (any screen)',
       description:
-          'Every screen has a voice command button. With TalkBack, swipe to find "Voice command" and double-tap to speak. Try saying "home", "back", "open map", "saved maps", "help", or "what's here". Say "help" any time to hear the commands available on the current screen.',
+          "Every screen has a voice command button. With TalkBack, swipe to find \"Voice command\" and double-tap to speak. Try saying \"home\", \"back\", \"open map\", \"saved maps\", \"help\", or \"what's here\". Say \"help\" any time to hear the commands available on the current screen.",
       gesture: 'Voice command button',
     ),
     _HelpItem(
       title: 'Voice Navigation (map only)',
       description:
-          'In the map viewer, the right-side microphone button is destination-only. Tap it and say "take me to the nearest door" or "navigate to room 101" to start guided navigation.',
+          "In the map viewer, the right-side microphone button is destination-only. Tap it and say \"take me to the nearest door\" or \"navigate to room 101\" to start guided navigation.",
     ),
     _HelpItem(
       title: 'Tips',
