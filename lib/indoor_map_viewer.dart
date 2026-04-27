@@ -51,8 +51,9 @@ class _T {
   // Floor — clean white, clearly passable
   static const mapFloor   = Color(0xFFFFFFFF);
 
-  // Visited path — very light blue tint (camera trajectory)
-  static const mapVisited = Color(0xFFE8F0FE);
+  // Visited path (camera trajectory) — stronger blue so it remains visible
+  // even when zoomed out.
+  static const mapVisited = Color(0xFF60A5FA);
 
   // WALL — the most important colour. Dark gray like architectural drawings.
   // Must be very distinct from floor. Using a near-black warm gray.
@@ -1176,8 +1177,13 @@ class _MapPainter extends CustomPainter {
     if (g == null || gridW == 0) return;
     final cp = scale;
 
-    final pFloor   = Paint()..color = _T.mapFloor;
-    final pVisited = Paint()..color = _T.mapVisited;
+    final pFloor = Paint()..color = _T.mapFloor;
+    final pVisitedFill = Paint()..color = _T.mapVisited.withOpacity(0.65);
+    final pVisitedStroke = Paint()
+      ..color = _T.mapVisited
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = math.max(0.8, cp * 0.08);
+    final inset = (cp * 0.18).clamp(0.35, 2.0).toDouble();
 
     for (int cz = czMin; cz <= czMax; cz++) {
       for (int cx = cxMin; cx <= cxMax; cx++) {
@@ -1188,7 +1194,17 @@ class _MapPainter extends CustomPainter {
         final sx = origin.dx + cx * cp;
         final sz = origin.dy + cz * cp;
         final rect = Rect.fromLTWH(sx, sz, cp, cp);
-        canvas.drawRect(rect, v == cellVisited ? pVisited : pFloor);
+        canvas.drawRect(rect, pFloor);
+        if (v == cellVisited) {
+          final trailRect = Rect.fromLTWH(
+            sx + inset,
+            sz + inset,
+            math.max(1.0, cp - inset * 2),
+            math.max(1.0, cp - inset * 2),
+          );
+          canvas.drawRect(trailRect, pVisitedFill);
+          canvas.drawRect(trailRect, pVisitedStroke);
+        }
       }
     }
   }
