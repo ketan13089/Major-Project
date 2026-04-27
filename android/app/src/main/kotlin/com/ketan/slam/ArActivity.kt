@@ -154,6 +154,17 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     // Raw depth capability check — cached after first attempt
     @Volatile private var rawDepthSupported: Boolean? = null
 
+    // ── Object visibility gate (3-second rule) ────────────────────────────────
+    // Tracks candidate objects before they are committed to the semantic map.
+    // Key = stable candidate ID (same formula as confirmed object ID).
+    private data class PendingCandidate(
+        val firstSeenMs: Long,
+        val position: Point3D,
+        val confidence: Float
+    )
+    private val pendingCandidates = HashMap<String, PendingCandidate>()
+    private val VISIBILITY_GATE_MS = 3_000L
+
     // ── Flutter ───────────────────────────────────────────────────────────────
     private var methodChannel: MethodChannel? = null
     private var navChannel: MethodChannel? = null
@@ -1672,7 +1683,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             o.category == det.label && o.position.distance(wp) < MERGE_DIST
         }
         if (existing != null) {
-            // Weight recent observations more heavily to correct for drift
+            // Object already confirmed — merge immediately, no gate needed
             val n = existing.observations + 1
             val weight = (1f / sqrt(n.toFloat())).coerceIn(0.1f, 0.5f)
             semanticMap.updateObject(existing.copy(
@@ -1686,19 +1697,31 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
                 localizationMethod = method ?: existing.localizationMethod
             ))
         } else {
+            // New candidate — enforce 3-second visibility gate
             val gx = mapBuilder.worldToGrid(wp.x); val gz = mapBuilder.worldToGrid(wp.z)
-            semanticMap.addObject(SemanticObject(
-                id          = "${det.label}_${gx}_${gz}",
-                type        = ObjectType.fromLabel(det.label),
-                category    = det.label,
-                position    = wp,
-                boundingBox = BoundingBox2D(det.boundingBox.left, det.boundingBox.top,
-                    det.boundingBox.right, det.boundingBox.bottom),
-                confidence  = det.confidence,
-                firstSeen   = System.currentTimeMillis(),
-                lastSeen    = System.currentTimeMillis(),
-                localizationMethod = method
-            ))
+            val candidateId = "${det.label}_${gx}_${gz}"
+            val now = System.currentTimeMillis()
+            val candidate = pendingCandidates[candidateId]
+            if (candidate == null) {
+                pendingCandidates[candidateId] = PendingCandidate(now, wp, det.confidence)
+            } else if (now - candidate.firstSeenMs >= VISIBILITY_GATE_MS) {
+                pendingCandidates.remove(candidateId)
+                semanticMap.addObject(SemanticObject(
+                    id          = candidateId,
+                    type        = ObjectType.fromLabel(det.label),
+                    category    = det.label,
+                    position    = wp,
+                    boundingBox = BoundingBox2D(det.boundingBox.left, det.boundingBox.top,
+                        det.boundingBox.right, det.boundingBox.bottom),
+                    confidence  = maxOf(candidate.confidence, det.confidence),
+                    firstSeen   = candidate.firstSeenMs,
+                    lastSeen    = now,
+                    localizationMethod = method
+                ))
+            } else {
+                // Still within gate window — update best confidence seen so far
+                pendingCandidates[candidateId] = candidate.copy(confidence = maxOf(candidate.confidence, det.confidence))
+            }
         }
     }
 
@@ -1790,6 +1813,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         }
 
         if (existing != null) {
+            // Already confirmed — merge immediately
             val n = existing.observations + 1
             val weight = (1f / kotlin.math.sqrt(n.toFloat())).coerceIn(0.1f, 0.5f)
             semanticMap.updateObject(existing.copy(
@@ -1804,18 +1828,30 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
                 roomNumber = roomNum ?: existing.roomNumber
             ))
         } else {
+            // New candidate — enforce 3-second visibility gate
             val gx = mapBuilder.worldToGrid(wp.x); val gz = mapBuilder.worldToGrid(wp.z)
+            val candidateId = "${category}_${gx}_${gz}"
+            val now = System.currentTimeMillis()
+            val candidate = pendingCandidates[candidateId]
+            if (candidate == null) {
+                pendingCandidates[candidateId] = PendingCandidate(now, wp, textDet.confidence)
+                return
+            } else if (now - candidate.firstSeenMs < VISIBILITY_GATE_MS) {
+                pendingCandidates[candidateId] = candidate.copy(confidence = maxOf(candidate.confidence, textDet.confidence))
+                return
+            }
+            pendingCandidates.remove(candidateId)
             semanticMap.addObject(SemanticObject(
-                id = "${category}_${gx}_${gz}",
+                id = candidateId,
                 type = objType,
                 category = category,
                 position = wp,
                 boundingBox = BoundingBox2D(
                     textDet.boundingBox.left, textDet.boundingBox.top,
                     textDet.boundingBox.right, textDet.boundingBox.bottom),
-                confidence = textDet.confidence,
-                firstSeen = System.currentTimeMillis(),
-                lastSeen = System.currentTimeMillis(),
+                confidence = maxOf(candidate.confidence, textDet.confidence),
+                firstSeen = candidate.firstSeenMs,
+                lastSeen = now,
                 textContent = textDet.text,
                 roomNumber = roomNum
             ))
@@ -1976,6 +2012,21 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             mapOf("x" to localX, "z" to localZ)
         } ?: emptyList<Any>()
 
+        // Camera trail — downsample breadcrumbs to at most one point per grid cell
+        // to keep payload small. Points outside the current viewport are dropped.
+        val rawBreadcrumbs = poseTracker.getBreadcrumbs()
+        val trailPoints = mutableListOf<Map<String, Int>>()
+        var lastTrailGX = Int.MIN_VALUE; var lastTrailGZ = Int.MIN_VALUE
+        for (pt in rawBreadcrumbs) {
+            val tgx = mapBuilder.worldToGrid(pt.x)
+            val tgz = mapBuilder.worldToGrid(pt.z)
+            val lx = tgx - gMinX; val lz = tgz - gMinZ
+            if (lx !in 0 until w || lz !in 0 until h) continue
+            if (tgx == lastTrailGX && tgz == lastTrailGZ) continue
+            trailPoints.add(mapOf("x" to lx, "z" to lz))
+            lastTrailGX = tgx; lastTrailGZ = tgz
+        }
+
         return mapOf(
             "occupancyGrid"  to bytes,
             "gridWidth"      to w,      "gridHeight"     to h,
@@ -1984,7 +2035,8 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             "robotGridX"     to (robotGlobalGX - gMinX),
             "robotGridZ"     to (robotGlobalGZ - gMinZ),
             "objects"        to objects,
-            "navPath"        to navPath
+            "navPath"        to navPath,
+            "cameraTrail"    to trailPoints
         )
     }
 
