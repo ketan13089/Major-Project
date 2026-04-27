@@ -202,39 +202,42 @@ class GlobalVoiceController extends ChangeNotifier {
   }
 }
 
-/// 64dp WCAG-compliant push-to-talk FAB. Drop into a Stack on any screen
-/// (typically `Positioned(right: 16, bottom: 16)`).
+/// Full-width push-to-talk bar pinned to the bottom of the screen so a
+/// zero-vision user can find it by sliding a thumb to the bottom edge of
+/// the device — no aiming required.
+///
+/// Drop into a Stack on any screen — it positions itself with
+/// `Positioned(left: 0, right: 0, bottom: 0)`. The screen content above
+/// should leave ~96 dp of bottom padding so it isn't covered.
 ///
 /// State:
-///   idle       → mic icon, primary color
-///   listening  → mic-on icon, danger color (matches the AR voice nav
-///                pattern so the visual language is consistent)
-///   processing → spinner, accent
+///   idle       → mic icon + "Voice command" label, primary color
+///   listening  → mic-on icon + "Listening…" label, danger color
+///   processing → equalizer icon + "Processing…" label, warning color
+///
+/// Height: 88 dp (well above the WCAG 2.5.5 "Enhanced" 44 dp target),
+/// extended past the system gesture inset so the user can land anywhere
+/// in the bottom band without missing.
 class GlobalVoiceFab extends StatelessWidget {
-  /// Optional override of the default bottom inset (e.g. when the screen
-  /// already has a bottom bar that the FAB should sit above).
-  final double? bottom;
+  /// Total visible bar height in logical pixels (excluding safe-area inset).
+  /// Generous default so a low-vision user has plenty of target to land on.
+  final double height;
 
-  /// Right inset. Pass null *and* set [left] to position on the left edge.
-  final double? right;
-
-  /// Left inset. Mutually exclusive with [right].
-  final double? left;
-
-  const GlobalVoiceFab({super.key, this.bottom, this.right = 16, this.left});
+  const GlobalVoiceFab({super.key, this.height = 88});
 
   @override
   Widget build(BuildContext context) {
     final p = WcagPalette.of(context);
     final controller = GlobalVoiceController.instance;
+    final bottomInset = MediaQuery.of(context).padding.bottom;
     return Positioned(
-      right: left == null ? right : null,
-      left: left,
-      bottom: bottom ?? 16,
+      left: 0,
+      right: 0,
+      bottom: 0,
       child: Semantics(
         button: true,
-        label: 'Voice command. Tap and speak a command. '
-            'Say help to hear available commands.',
+        label: 'Voice command. Tap anywhere across the bottom of the screen '
+            'and speak a command. Say help to hear available commands.',
         excludeSemantics: true,
         child: AnimatedBuilder(
           animation: controller,
@@ -250,12 +253,15 @@ class GlobalVoiceFab extends StatelessWidget {
               GlobalVoiceState.processing => Icons.graphic_eq,
               GlobalVoiceState.idle => Icons.record_voice_over,
             };
+            final label = switch (state) {
+              GlobalVoiceState.listening => 'Listening…',
+              GlobalVoiceState.processing => 'Processing…',
+              GlobalVoiceState.idle => 'Voice command',
+            };
             return Material(
               color: color,
-              shape: const CircleBorder(),
-              elevation: 6,
+              elevation: 8,
               child: InkWell(
-                customBorder: const CircleBorder(),
                 onTap: () {
                   if (state == GlobalVoiceState.listening) {
                     controller.stopListening();
@@ -264,16 +270,43 @@ class GlobalVoiceFab extends StatelessWidget {
                   }
                 },
                 child: Container(
-                  width: 64,
-                  height: 64,
+                  width: double.infinity,
+                  height: height + bottomInset,
+                  padding: EdgeInsets.only(
+                    left: 24,
+                    right: 24,
+                    top: 12,
+                    bottom: 12 + bottomInset,
+                  ),
                   decoration: BoxDecoration(
-                    shape: BoxShape.circle,
-                    border: Border.all(
-                      color: p.textOnAccent,
-                      width: 2.5,
+                    border: Border(
+                      top: BorderSide(
+                        color: p.textOnAccent,
+                        width: 2.5,
+                      ),
                     ),
                   ),
-                  child: Icon(icon, color: p.textOnAccent, size: 30),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Icon(icon, color: p.textOnAccent, size: 36),
+                      const SizedBox(width: 14),
+                      Flexible(
+                        child: Text(
+                          label,
+                          textAlign: TextAlign.center,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            color: p.textOnAccent,
+                            fontSize: 20,
+                            fontWeight: FontWeight.w700,
+                            letterSpacing: 0.3,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
                 ),
               ),
             );

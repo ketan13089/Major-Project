@@ -257,7 +257,8 @@ class _PerformanceDashboardState extends State<PerformanceDashboard>
 
   Widget _metricsList(WcagPalette p) {
     return ListView(
-      padding: const EdgeInsets.fromLTRB(16, 8, 16, 32),
+      // Bottom padding leaves room for the full-width voice command bar.
+      padding: const EdgeInsets.fromLTRB(16, 8, 16, 112),
       children: [
         _SectionHeader('Session Overview', Icons.timer, p),
         _MetricCard(p, [

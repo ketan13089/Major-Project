@@ -414,7 +414,8 @@ class _SavedMapsScreenState extends State<SavedMapsScreen>
     return RefreshIndicator(
       onRefresh: _loadMaps,
       child: ListView.separated(
-        padding: const EdgeInsets.fromLTRB(16, 16, 16, 32),
+        // Bottom padding leaves room for the full-width voice command bar.
+        padding: const EdgeInsets.fromLTRB(16, 16, 16, 112),
         itemCount: _maps!.length,
         separatorBuilder: (_, __) => const SizedBox(height: 12),
         itemBuilder: (ctx, i) => _mapCard(_maps![i], p),

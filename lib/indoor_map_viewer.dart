@@ -623,13 +623,19 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
       body: WcagScaffoldFrame(
         child: SafeArea(
           child: Stack(children: [
-            Column(children: [
-              _topBar(p),
-              Expanded(child: _mapArea(p)),
-              if (objects.isNotEmpty) _objectRail(p),
-              if (!_isReadOnly) _bottomBar(p),
-            ]),
+            // Reserve room at the bottom so the full-width voice command
+            // bar doesn't cover the AR Scan button or object rail.
+            Padding(
+              padding: const EdgeInsets.only(bottom: 88),
+              child: Column(children: [
+                _topBar(p),
+                Expanded(child: _mapArea(p)),
+                if (objects.isNotEmpty) _objectRail(p),
+                if (!_isReadOnly) _bottomBar(p),
+              ]),
+            ),
             if (_showLegend) _legendSheet(p),
+            const GlobalVoiceFab(),
           ]),
         ),
       ),
@@ -960,7 +966,7 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
                 ),
               ),
             ),
-          // Voice nav button — large 64dp circle, well above the FAB minimum
+          // Voice nav button — large 64dp circle, well above the FAB minimum.
           if (!_isReadOnly) Positioned(
             right: 12,
             bottom: _navInstruction.isNotEmpty ? 130 : 80,
@@ -1003,9 +1009,6 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
               ),
             ),
           ),
-          // Global voice command FAB — bottom-left so it doesn't collide
-          // with the destination-only AR voice nav FAB on the right.
-          const GlobalVoiceFab(left: 16, bottom: 16),
         ]),
       ),
     );
