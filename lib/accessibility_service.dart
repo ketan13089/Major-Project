@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'wcag_theme.dart';
 
 /// Accessibility service for blind users.
 /// Provides TTS announcements, focus management, and haptic feedback.
@@ -198,20 +199,20 @@ enum FocusableElementType {
 // Accessibility wrapper widget with focus highlight
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Wraps a widget with accessibility focus highlight
+/// Wraps a widget with a WCAG-compliant focus indicator.
+/// Uses [WcagFocusRing] for the double-outline focus pattern (white inner +
+/// colored outer) so the ring stays visible against any background.
 class AccessibleFocusable extends StatelessWidget {
   final Widget child;
   final int index;
-  final Color focusColor;
-  final double focusBorderWidth;
+  final Color? focusColor;
   final BorderRadius? borderRadius;
 
   const AccessibleFocusable({
     Key? key,
     required this.child,
     required this.index,
-    this.focusColor = const Color(0xFF2563EB),
-    this.focusBorderWidth = 3.0,
+    this.focusColor,
     this.borderRadius,
   }) : super(key: key);
 
@@ -222,23 +223,10 @@ class AccessibleFocusable extends StatelessWidget {
       listenable: service,
       builder: (context, _) {
         final isFocused = service.enabled && service.currentFocusIndex == index;
-        return AnimatedContainer(
-          duration: const Duration(milliseconds: 150),
-          decoration: BoxDecoration(
-            borderRadius: borderRadius ?? BorderRadius.circular(12),
-            border: isFocused
-                ? Border.all(color: focusColor, width: focusBorderWidth)
-                : null,
-            boxShadow: isFocused
-                ? [
-                    BoxShadow(
-                      color: focusColor.withOpacity(0.3),
-                      blurRadius: 8,
-                      spreadRadius: 2,
-                    ),
-                  ]
-                : null,
-          ),
+        return WcagFocusRing(
+          focused: isFocused,
+          borderRadius: borderRadius,
+          color: focusColor,
           child: child,
         );
       },

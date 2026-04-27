@@ -1,19 +1,35 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'wcag_theme.dart';
 
 /// Per-map performance dashboard. Displays the performance metrics that were
 /// frozen into a saved map's JSON at save time.
-///
-/// There is no longer a "live" mode — live metrics accumulate in
-/// PerformanceTracker during an AR session; those are snapshotted into the
-/// map file on save and read back here.
 class PerformanceDashboard extends StatefulWidget {
-  /// Name of the saved map whose metrics to display.
   final String mapName;
   const PerformanceDashboard({super.key, required this.mapName});
 
   @override
   State<PerformanceDashboard> createState() => _PerformanceDashboardState();
+}
+
+/// Severity levels — used so that color is never the sole signal. Each level
+/// has a text label, an icon, and a color, satisfying WCAG 1.4.1 (Use of Color).
+enum _Severity { good, warn, bad, neutral }
+
+extension on _Severity {
+  String get label => switch (this) {
+        _Severity.good => 'Good',
+        _Severity.warn => 'Warning',
+        _Severity.bad => 'Critical',
+        _Severity.neutral => '',
+      };
+
+  IconData get icon => switch (this) {
+        _Severity.good => Icons.check_circle_rounded,
+        _Severity.warn => Icons.warning_amber_rounded,
+        _Severity.bad => Icons.error_rounded,
+        _Severity.neutral => Icons.circle,
+      };
 }
 
 class _PerformanceDashboardState extends State<PerformanceDashboard> {
@@ -30,19 +46,24 @@ class _PerformanceDashboardState extends State<PerformanceDashboard> {
   }
 
   Future<void> _fetchMetrics() async {
-    setState(() { _loading = true; _errorMessage = null; });
+    setState(() {
+      _loading = true;
+      _errorMessage = null;
+    });
     try {
-      final result = await _mapStoreChannel.invokeMethod(
-          'getMapPerformance', {'name': widget.mapName});
+      final result = await _mapStoreChannel
+          .invokeMethod('getMapPerformance', {'name': widget.mapName});
       if (!mounted) return;
       if (result is Map) {
-        final metrics = Map<String, dynamic>.from(result);
         setState(() {
-          _metrics = metrics;
+          _metrics = Map<String, dynamic>.from(result);
           _loading = false;
         });
       } else {
-        setState(() { _metrics = {}; _loading = false; });
+        setState(() {
+          _metrics = {};
+          _loading = false;
+        });
       }
     } catch (e) {
       if (!mounted) return;
@@ -55,19 +76,25 @@ class _PerformanceDashboardState extends State<PerformanceDashboard> {
 
   Future<void> _exportReport() async {
     try {
-      final result = await _mapStoreChannel.invokeMethod(
-          'exportMapPerformance', {'name': widget.mapName});
+      final result = await _mapStoreChannel
+          .invokeMethod('exportMapPerformance', {'name': widget.mapName});
       if (!mounted) return;
       if (result is Map) {
         final path = result['path'] as String?;
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Report saved: $path')),
+          SnackBar(
+            content: WcagText('Report saved: $path',
+                size: WcagType.body, color: Colors.white),
+          ),
         );
       }
     } catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Export failed: $e')),
+        SnackBar(
+          content: WcagText('Export failed: $e',
+              size: WcagType.body, color: Colors.white),
+        ),
       );
     }
   }
@@ -80,252 +107,326 @@ class _PerformanceDashboardState extends State<PerformanceDashboard> {
 
   @override
   Widget build(BuildContext context) {
-    final isDark = Theme.of(context).brightness == Brightness.dark;
-    final bg = isDark ? const Color(0xFF0F0F17) : const Color(0xFFF8F8FC);
-    final cardBg = isDark ? const Color(0xFF1A1A26) : Colors.white;
-    final textPri = isDark ? const Color(0xFFF3F4F6) : const Color(0xFF111827);
-    final textSec = isDark ? const Color(0xFF9CA3AF) : const Color(0xFF6B7280);
-    final border = isDark ? const Color(0xFF2A2A38) : const Color(0xFFE5E7EB);
-
+    final p = WcagPalette.of(context);
     final hasMetrics = _metrics.isNotEmpty;
 
     return Scaffold(
-      backgroundColor: bg,
+      backgroundColor: p.background,
       appBar: AppBar(
         title: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text('Performance Metrics',
-                style: TextStyle(color: textPri, fontSize: 17, fontWeight: FontWeight.w700)),
-            Text(widget.mapName.replaceAll('_', ' '),
-                style: TextStyle(color: textSec, fontSize: 11)),
+            WcagText('Performance Metrics',
+                size: WcagType.headline, weight: WcagType.bold),
+            WcagText(widget.mapName.replaceAll('_', ' '),
+                size: WcagType.caption, emphasis: 'secondary'),
           ],
         ),
-        backgroundColor: bg,
+        backgroundColor: p.background,
         elevation: 0,
-        iconTheme: IconThemeData(color: textPri),
+        iconTheme: IconThemeData(color: p.textPrimary),
         actions: [
           IconButton(
-            icon: Icon(Icons.refresh, color: textSec),
-            tooltip: 'Reload',
+            iconSize: 26,
+            icon: Icon(Icons.refresh, color: p.textSecondary),
+            tooltip: 'Reload metrics',
             onPressed: _fetchMetrics,
           ),
           IconButton(
-            icon: const Icon(Icons.save_alt, color: Color(0xFF2563EB)),
+            iconSize: 26,
+            icon: Icon(Icons.save_alt, color: p.accentPrimary),
             tooltip: 'Export JSON report',
             onPressed: hasMetrics ? _exportReport : null,
           ),
         ],
       ),
-      body: _loading
-          ? const Center(child: CircularProgressIndicator())
-          : _errorMessage != null
-              ? _errorState(textPri, textSec)
-              : !hasMetrics
-                  ? _noMetricsState(textPri, textSec)
-                  : _metricsList(cardBg, border, textPri, textSec),
+      body: WcagScaffoldFrame(
+        child: _loading
+            ? const Center(child: CircularProgressIndicator())
+            : _errorMessage != null
+                ? _errorState(p)
+                : !hasMetrics
+                    ? _noMetricsState(p)
+                    : _metricsList(p),
+      ),
     );
   }
 
-  Widget _errorState(Color textPri, Color textSec) => Center(
+  Widget _errorState(WcagPalette p) => Center(
         child: Padding(
           padding: const EdgeInsets.all(32),
           child: Column(mainAxisSize: MainAxisSize.min, children: [
-            Icon(Icons.error_outline_rounded, color: textSec, size: 48),
+            Icon(Icons.error_outline_rounded,
+                color: p.accentDanger, size: 56),
             const SizedBox(height: 16),
-            Text(_errorMessage ?? '',
-                style: TextStyle(color: textSec), textAlign: TextAlign.center),
+            WcagText(_errorMessage ?? '',
+                emphasis: 'secondary',
+                align: TextAlign.center,
+                size: WcagType.body),
             const SizedBox(height: 24),
-            ElevatedButton.icon(
-              onPressed: _fetchMetrics,
-              icon: const Icon(Icons.refresh),
-              label: const Text('Retry'),
+            SizedBox(
+              height: WcagSize.minTouch,
+              child: ElevatedButton.icon(
+                onPressed: _fetchMetrics,
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: p.accentPrimary,
+                  foregroundColor: p.textOnAccent,
+                  padding: const EdgeInsets.symmetric(horizontal: 24),
+                ),
+                icon: const Icon(Icons.refresh, size: 20),
+                label: WcagText('Retry',
+                    size: WcagType.label,
+                    weight: WcagType.semibold,
+                    color: p.textOnAccent),
+              ),
             ),
           ]),
         ),
       );
 
-  Widget _noMetricsState(Color textPri, Color textSec) => Center(
+  Widget _noMetricsState(WcagPalette p) => Center(
         child: Padding(
           padding: const EdgeInsets.all(32),
           child: Column(mainAxisSize: MainAxisSize.min, children: [
             Icon(Icons.insert_chart_outlined_rounded,
-                color: textSec.withOpacity(0.4), size: 64),
+                color: p.textTertiary, size: 64),
             const SizedBox(height: 20),
-            Text('No metrics available',
-                style: TextStyle(color: textPri, fontSize: 17, fontWeight: FontWeight.w600)),
+            WcagText('No metrics available',
+                size: WcagType.headline, weight: WcagType.semibold),
             const SizedBox(height: 8),
-            Text(
+            WcagText(
               'This map was saved before per-map performance tracking '
               'was added. Scan a new map to see its metrics.',
-              textAlign: TextAlign.center,
-              style: TextStyle(color: textSec, fontSize: 13, height: 1.4),
+              align: TextAlign.center,
+              size: WcagType.body,
+              emphasis: 'secondary',
+              height: 1.4,
             ),
           ]),
         ),
       );
 
-  Widget _metricsList(Color cardBg, Color border, Color textPri, Color textSec) {
+  Widget _metricsList(WcagPalette p) {
     return ListView(
       padding: const EdgeInsets.fromLTRB(16, 8, 16, 32),
       children: [
-        _SectionHeader('Session Overview', Icons.timer, textPri),
-        _MetricCard(cardBg, border, [
-          _MetricRow('Duration', _formatDuration(_d('sessionDurationSec')), textPri, textSec),
-          _MetricRow('Total Frames', '${_i('totalFrames')}', textPri, textSec),
+        _SectionHeader('Session Overview', Icons.timer, p),
+        _MetricCard(p, [
+          _MetricRow(
+              'Duration', _formatDuration(_d('sessionDurationSec')), p),
+          _MetricRow('Total Frames', '${_i('totalFrames')}', p),
         ]),
-
-        _SectionHeader('Frame Rate', Icons.speed, textPri),
-        _MetricCard(cardBg, border, [
-          _BigMetric('${_f1('avgFps')} FPS', 'Average', _fpsColor(_d('avgFps'))),
+        _SectionHeader('Frame Rate', Icons.speed, p),
+        _MetricCard(p, [
+          _BigMetric(
+            '${_f1('avgFps')} FPS',
+            'Average',
+            _fpsSeverity(_d('avgFps')),
+            p,
+          ),
           Row(children: [
-            Expanded(child: _MetricRow('Min', '${_f1('minFps')} FPS', textPri, textSec)),
-            Expanded(child: _MetricRow('Max', '${_f1('maxFps')} FPS', textPri, textSec)),
+            Expanded(child: _MetricRow('Min', '${_f1('minFps')} FPS', p)),
+            Expanded(child: _MetricRow('Max', '${_f1('maxFps')} FPS', p)),
           ]),
         ]),
-
-        _SectionHeader('YOLO Object Detection', Icons.visibility, textPri),
-        _MetricCard(cardBg, border, [
+        _SectionHeader('YOLO Object Detection', Icons.visibility, p),
+        _MetricCard(p, [
           Row(children: [
-            Expanded(child: _BigMetric('${_f1('yoloAvgMs')} ms', 'Avg Latency',
-                _latencyColor(_d('yoloAvgMs'), 200))),
-            Expanded(child: _BigMetric('${_i('totalDetections')}', 'Total Detections',
-                const Color(0xFF7C3AED))),
+            Expanded(
+                child: _BigMetric(
+                    '${_f1('yoloAvgMs')} ms',
+                    'Avg Latency',
+                    _latencySeverity(_d('yoloAvgMs'), 200),
+                    p)),
+            Expanded(
+                child: _BigMetric('${_i('totalDetections')}',
+                    'Total Detections', _Severity.neutral, p)),
           ]),
           Row(children: [
-            Expanded(child: _MetricRow('P95 Latency', '${_f1('yoloP95Ms')} ms', textPri, textSec)),
-            Expanded(child: _MetricRow('Max Latency', '${_f1('yoloMaxMs')} ms', textPri, textSec)),
+            Expanded(
+                child:
+                    _MetricRow('P95 Latency', '${_f1('yoloP95Ms')} ms', p)),
+            Expanded(
+                child:
+                    _MetricRow('Max Latency', '${_f1('yoloMaxMs')} ms', p)),
           ]),
           Row(children: [
-            Expanded(child: _MetricRow('Total Runs', '${_i('totalYoloRuns')}', textPri, textSec)),
-            Expanded(child: _MetricRow('Avg/Run', _f2('avgDetectionsPerRun'), textPri, textSec)),
+            Expanded(
+                child:
+                    _MetricRow('Total Runs', '${_i('totalYoloRuns')}', p)),
+            Expanded(
+                child: _MetricRow(
+                    'Avg/Run', _f2('avgDetectionsPerRun'), p)),
           ]),
           _MetricRow('Avg Confidence',
-              '${(_d('avgConfidence') * 100).toStringAsFixed(1)}%', textPri, textSec),
+              '${(_d('avgConfidence') * 100).toStringAsFixed(1)}%', p),
         ]),
-
-        _SectionHeader('OCR Text Recognition', Icons.text_fields, textPri),
-        _MetricCard(cardBg, border, [
+        _SectionHeader('OCR Text Recognition', Icons.text_fields, p),
+        _MetricCard(p, [
           Row(children: [
-            Expanded(child: _BigMetric('${_f1('ocrAvgMs')} ms', 'Avg Latency',
-                _latencyColor(_d('ocrAvgMs'), 500))),
-            Expanded(child: _BigMetric('${_i('totalTextDetections')}', 'Text Found',
-                const Color(0xFF059669))),
+            Expanded(
+                child: _BigMetric(
+                    '${_f1('ocrAvgMs')} ms',
+                    'Avg Latency',
+                    _latencySeverity(_d('ocrAvgMs'), 500),
+                    p)),
+            Expanded(
+                child: _BigMetric('${_i('totalTextDetections')}',
+                    'Text Found', _Severity.neutral, p)),
           ]),
           Row(children: [
-            Expanded(child: _MetricRow('P95 Latency', '${_f1('ocrP95Ms')} ms', textPri, textSec)),
-            Expanded(child: _MetricRow('Total Runs', '${_i('totalOcrRuns')}', textPri, textSec)),
+            Expanded(
+                child: _MetricRow('P95 Latency', '${_f1('ocrP95Ms')} ms', p)),
+            Expanded(
+                child: _MetricRow('Total Runs', '${_i('totalOcrRuns')}', p)),
           ]),
         ]),
-
-        _SectionHeader('Map Building', Icons.grid_on, textPri),
-        _MetricCard(cardBg, border, [
+        _SectionHeader('Map Building', Icons.grid_on, p),
+        _MetricCard(p, [
           Row(children: [
-            Expanded(child: _BigMetric('${_d('currentGridSize').toInt()}', 'Grid Cells',
-                const Color(0xFF2563EB))),
-            Expanded(child: _BigMetric('${_d('peakGridSize').toInt()}', 'Peak Cells',
-                const Color(0xFF6366F1))),
+            Expanded(
+                child: _BigMetric('${_d('currentGridSize').toInt()}',
+                    'Grid Cells', _Severity.neutral, p)),
+            Expanded(
+                child: _BigMetric('${_d('peakGridSize').toInt()}',
+                    'Peak Cells', _Severity.neutral, p)),
           ]),
           _CellBreakdownBar(
             free: _d('currentFreeCells'),
             walls: _d('currentWallCells'),
             obstacles: _d('currentObstacleCells'),
             visited: _d('currentVisitedCells'),
+            p: p,
           ),
           Row(children: [
-            Expanded(child: _MetricRow('Free', '${_d('currentFreeCells').toInt()}',
-                textPri, const Color(0xFF10B981))),
-            Expanded(child: _MetricRow('Walls', '${_d('currentWallCells').toInt()}',
-                textPri, const Color(0xFF374151))),
+            Expanded(
+                child: _MetricRow(
+                    'Free', '${_d('currentFreeCells').toInt()}', p)),
+            Expanded(
+                child: _MetricRow(
+                    'Walls', '${_d('currentWallCells').toInt()}', p)),
           ]),
           Row(children: [
-            Expanded(child: _MetricRow('Obstacles', '${_d('currentObstacleCells').toInt()}',
-                textPri, const Color(0xFFB45309))),
-            Expanded(child: _MetricRow('Visited', '${_d('currentVisitedCells').toInt()}',
-                textPri, const Color(0xFF2563EB))),
+            Expanded(
+                child: _MetricRow(
+                    'Obstacles', '${_d('currentObstacleCells').toInt()}', p)),
+            Expanded(
+                child: _MetricRow(
+                    'Visited', '${_d('currentVisitedCells').toInt()}', p)),
           ]),
-          const Divider(height: 16),
+          Divider(height: 16, color: p.border),
           Row(children: [
-            Expanded(child: _MetricRow('Full Rebuilds', '${_i('totalRebuilds')}', textPri, textSec)),
-            Expanded(child: _MetricRow('Avg Time', '${_f1('rebuildAvgMs')} ms', textPri, textSec)),
+            Expanded(
+                child: _MetricRow(
+                    'Full Rebuilds', '${_i('totalRebuilds')}', p)),
+            Expanded(
+                child:
+                    _MetricRow('Avg Time', '${_f1('rebuildAvgMs')} ms', p)),
           ]),
           Row(children: [
-            Expanded(child: _MetricRow('Light Rebuilds', '${_i('totalLightRebuilds')}', textPri, textSec)),
-            Expanded(child: _MetricRow('Avg Time', '${_f1('lightRebuildAvgMs')} ms', textPri, textSec)),
+            Expanded(
+                child: _MetricRow(
+                    'Light Rebuilds', '${_i('totalLightRebuilds')}', p)),
+            Expanded(
+                child: _MetricRow(
+                    'Avg Time', '${_f1('lightRebuildAvgMs')} ms', p)),
           ]),
-          _MetricRow('Max Rebuild', '${_f1('rebuildMaxMs')} ms', textPri, textSec),
+          _MetricRow('Max Rebuild', '${_f1('rebuildMaxMs')} ms', p),
         ]),
-
-        _SectionHeader('Localization', Icons.gps_fixed, textPri),
-        _MetricCard(cardBg, border, [
+        _SectionHeader('Localization', Icons.gps_fixed, p),
+        _MetricCard(p, [
           Row(children: [
-            Expanded(child: _BigMetric('${_f3('avgDrift')} m', 'Avg Drift',
-                _driftColor(_d('avgDrift')))),
-            Expanded(child: _BigMetric('${_i('totalKeyframes')}', 'Keyframes',
-                const Color(0xFF6366F1))),
+            Expanded(
+                child: _BigMetric('${_f3('avgDrift')} m', 'Avg Drift',
+                    _driftSeverity(_d('avgDrift')), p)),
+            Expanded(
+                child: _BigMetric('${_i('totalKeyframes')}', 'Keyframes',
+                    _Severity.neutral, p)),
           ]),
           Row(children: [
-            Expanded(child: _MetricRow('Max Drift', '${_f3('maxDrift')} m', textPri, textSec)),
-            Expanded(child: _MetricRow('Drift Rebuilds', '${_i('totalDriftRebuilds')}', textPri, textSec)),
-          ]),
-        ]),
-
-        _SectionHeader('Path Planning', Icons.route, textPri),
-        _MetricCard(cardBg, border, [
-          Row(children: [
-            Expanded(child: _BigMetric('${_f1('pathPlanAvgMs')} ms', 'Avg Latency',
-                _latencyColor(_d('pathPlanAvgMs'), 100))),
-            Expanded(child: _BigMetric(
-                _i('totalPathPlans') > 0
-                    ? '${((_i('totalPathPlans') - _i('failedPathPlans')) / _i('totalPathPlans') * 100).toStringAsFixed(0)}%'
-                    : 'N/A',
-                'Success Rate',
-                const Color(0xFF10B981))),
-          ]),
-          Row(children: [
-            Expanded(child: _MetricRow('Total Plans', '${_i('totalPathPlans')}', textPri, textSec)),
-            Expanded(child: _MetricRow('Failed', '${_i('failedPathPlans')}', textPri, textSec)),
-          ]),
-          Row(children: [
-            Expanded(child: _MetricRow('Avg Path Length', '${_f1('avgPathLength')} cells', textPri, textSec)),
-            Expanded(child: _MetricRow('Max Latency', '${_f1('pathPlanMaxMs')} ms', textPri, textSec)),
+            Expanded(
+                child: _MetricRow('Max Drift', '${_f3('maxDrift')} m', p)),
+            Expanded(
+                child: _MetricRow(
+                    'Drift Rebuilds', '${_i('totalDriftRebuilds')}', p)),
           ]),
         ]),
-
-        _SectionHeader('Object Tracking', Icons.category, textPri),
-        _MetricCard(cardBg, border, [
+        _SectionHeader('Path Planning', Icons.route, p),
+        _MetricCard(p, [
           Row(children: [
-            Expanded(child: _BigMetric('${_d('currentObjectCount').toInt()}', 'Current',
-                const Color(0xFF7C3AED))),
-            Expanded(child: _BigMetric('${_i('peakObjectCount')}', 'Peak',
-                const Color(0xFF6366F1))),
+            Expanded(
+                child: _BigMetric(
+                    '${_f1('pathPlanAvgMs')} ms',
+                    'Avg Latency',
+                    _latencySeverity(_d('pathPlanAvgMs'), 100),
+                    p)),
+            Expanded(
+                child: _BigMetric(
+                    _i('totalPathPlans') > 0
+                        ? '${((_i('totalPathPlans') - _i('failedPathPlans')) / _i('totalPathPlans') * 100).toStringAsFixed(0)}%'
+                        : 'N/A',
+                    'Success Rate',
+                    _Severity.good,
+                    p)),
+          ]),
+          Row(children: [
+            Expanded(
+                child:
+                    _MetricRow('Total Plans', '${_i('totalPathPlans')}', p)),
+            Expanded(
+                child:
+                    _MetricRow('Failed', '${_i('failedPathPlans')}', p)),
+          ]),
+          Row(children: [
+            Expanded(
+                child: _MetricRow('Avg Path Length',
+                    '${_f1('avgPathLength')} cells', p)),
+            Expanded(
+                child: _MetricRow(
+                    'Max Latency', '${_f1('pathPlanMaxMs')} ms', p)),
           ]),
         ]),
-
-        _SectionHeader('Navigation', Icons.navigation, textPri),
-        _MetricCard(cardBg, border, [
+        _SectionHeader('Object Tracking', Icons.category, p),
+        _MetricCard(p, [
           Row(children: [
-            Expanded(child: _BigMetric('${_i('totalNavSessions')}', 'Total Sessions',
-                const Color(0xFF2563EB))),
-            Expanded(child: _BigMetric('${_i('successfulNavSessions')}', 'Successful',
-                const Color(0xFF10B981))),
-          ]),
-          Row(children: [
-            Expanded(child: _MetricRow('Avg Duration', '${_f1('avgNavDurationSec')} s', textPri, textSec)),
-            Expanded(child: _MetricRow('Avg Replans', _f1('avgReplansPerSession'), textPri, textSec)),
+            Expanded(
+                child: _BigMetric('${_d('currentObjectCount').toInt()}',
+                    'Current', _Severity.neutral, p)),
+            Expanded(
+                child: _BigMetric('${_i('peakObjectCount')}', 'Peak',
+                    _Severity.neutral, p)),
           ]),
         ]),
-
-        _SectionHeader('Memory Usage', Icons.memory, textPri),
-        _MetricCard(cardBg, border, [
+        _SectionHeader('Navigation', Icons.navigation, p),
+        _MetricCard(p, [
           Row(children: [
-            Expanded(child: _BigMetric('${_f1('avgMemoryMb')} MB', 'Average',
-                _memoryColor(_d('avgMemoryMb')))),
-            Expanded(child: _BigMetric('${_f1('peakMemoryMb')} MB', 'Peak',
-                _memoryColor(_d('peakMemoryMb')))),
+            Expanded(
+                child: _BigMetric('${_i('totalNavSessions')}',
+                    'Total Sessions', _Severity.neutral, p)),
+            Expanded(
+                child: _BigMetric('${_i('successfulNavSessions')}',
+                    'Successful', _Severity.good, p)),
+          ]),
+          Row(children: [
+            Expanded(
+                child: _MetricRow('Avg Duration',
+                    '${_f1('avgNavDurationSec')} s', p)),
+            Expanded(
+                child: _MetricRow(
+                    'Avg Replans', _f1('avgReplansPerSession'), p)),
           ]),
         ]),
-
+        _SectionHeader('Memory Usage', Icons.memory, p),
+        _MetricCard(p, [
+          Row(children: [
+            Expanded(
+                child: _BigMetric('${_f1('avgMemoryMb')} MB', 'Average',
+                    _memorySeverity(_d('avgMemoryMb')), p)),
+            Expanded(
+                child: _BigMetric('${_f1('peakMemoryMb')} MB', 'Peak',
+                    _memorySeverity(_d('peakMemoryMb')), p)),
+          ]),
+        ]),
         const SizedBox(height: 16),
       ],
     );
@@ -337,25 +438,27 @@ class _PerformanceDashboardState extends State<PerformanceDashboard> {
     return m > 0 ? '${m}m ${s}s' : '${s}s';
   }
 
-  Color _fpsColor(double fps) =>
-      fps >= 25 ? const Color(0xFF10B981) :
-      fps >= 15 ? const Color(0xFFF59E0B) :
-      const Color(0xFFEF4444);
+  _Severity _fpsSeverity(double fps) =>
+      fps >= 25 ? _Severity.good : fps >= 15 ? _Severity.warn : _Severity.bad;
 
-  Color _latencyColor(double ms, double threshold) =>
-      ms <= threshold * 0.5 ? const Color(0xFF10B981) :
-      ms <= threshold ? const Color(0xFFF59E0B) :
-      const Color(0xFFEF4444);
+  _Severity _latencySeverity(double ms, double threshold) =>
+      ms <= threshold * 0.5
+          ? _Severity.good
+          : ms <= threshold
+              ? _Severity.warn
+              : _Severity.bad;
 
-  Color _driftColor(double drift) =>
-      drift <= 0.02 ? const Color(0xFF10B981) :
-      drift <= 0.05 ? const Color(0xFFF59E0B) :
-      const Color(0xFFEF4444);
+  _Severity _driftSeverity(double drift) => drift <= 0.02
+      ? _Severity.good
+      : drift <= 0.05
+          ? _Severity.warn
+          : _Severity.bad;
 
-  Color _memoryColor(double mb) =>
-      mb <= 200 ? const Color(0xFF10B981) :
-      mb <= 400 ? const Color(0xFFF59E0B) :
-      const Color(0xFFEF4444);
+  _Severity _memorySeverity(double mb) => mb <= 200
+      ? _Severity.good
+      : mb <= 400
+          ? _Severity.warn
+          : _Severity.bad;
 }
 
 // ── Reusable widgets ────────────────────────────────────────────────────────
@@ -363,86 +466,144 @@ class _PerformanceDashboardState extends State<PerformanceDashboard> {
 class _SectionHeader extends StatelessWidget {
   final String title;
   final IconData icon;
-  final Color textColor;
-  const _SectionHeader(this.title, this.icon, this.textColor);
+  final WcagPalette p;
+  const _SectionHeader(this.title, this.icon, this.p);
 
   @override
   Widget build(BuildContext context) => Padding(
-    padding: const EdgeInsets.only(top: 20, bottom: 8, left: 2),
-    child: Row(children: [
-      Icon(icon, size: 16, color: textColor.withOpacity(0.6)),
-      const SizedBox(width: 6),
-      Text(title, style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600,
-          color: textColor, letterSpacing: -0.2)),
-    ]),
-  );
+        padding: const EdgeInsets.only(top: 24, bottom: 10, left: 2),
+        child: Row(children: [
+          Icon(icon, size: 18, color: p.textSecondary),
+          const SizedBox(width: 8),
+          WcagText(title,
+              size: WcagType.label,
+              weight: WcagType.bold,
+              letterSpacing: -0.2),
+        ]),
+      );
 }
 
 class _MetricCard extends StatelessWidget {
-  final Color bg, border;
+  final WcagPalette p;
   final List<Widget> children;
-  const _MetricCard(this.bg, this.border, this.children);
+  const _MetricCard(this.p, this.children);
 
   @override
   Widget build(BuildContext context) => Container(
-    padding: const EdgeInsets.all(16),
-    decoration: BoxDecoration(
-      color: bg,
-      borderRadius: BorderRadius.circular(14),
-      border: Border.all(color: border),
-    ),
-    child: Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: children,
-    ),
-  );
+        padding: const EdgeInsets.all(16),
+        decoration: BoxDecoration(
+          color: p.surface,
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(color: p.border, width: 1.5),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: children,
+        ),
+      );
 }
 
 class _MetricRow extends StatelessWidget {
   final String label, value;
-  final Color labelColor, valueColor;
-  const _MetricRow(this.label, this.value, this.labelColor, this.valueColor);
+  final WcagPalette p;
+  const _MetricRow(this.label, this.value, this.p);
 
   @override
   Widget build(BuildContext context) => Padding(
-    padding: const EdgeInsets.symmetric(vertical: 3),
-    child: Row(
-      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-      children: [
-        Text(label, style: TextStyle(fontSize: 12, color: valueColor)),
-        Text(value, style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600,
-            color: labelColor)),
-      ],
-    ),
-  );
+        padding: const EdgeInsets.symmetric(vertical: 6),
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            Flexible(
+              child: WcagText(label,
+                  size: WcagType.caption,
+                  emphasis: 'secondary',
+                  weight: WcagType.medium),
+            ),
+            const SizedBox(width: 12),
+            WcagText(value,
+                size: WcagType.body, weight: WcagType.semibold),
+          ],
+        ),
+      );
 }
 
 class _BigMetric extends StatelessWidget {
   final String value, label;
-  final Color color;
-  const _BigMetric(this.value, this.label, this.color);
+  final _Severity severity;
+  final WcagPalette p;
+  const _BigMetric(this.value, this.label, this.severity, this.p);
+
+  Color _severityColor() => switch (severity) {
+        _Severity.good => p.accentSuccess,
+        _Severity.warn => p.accentWarning,
+        _Severity.bad => p.accentDanger,
+        _Severity.neutral => p.accentPrimary,
+      };
 
   @override
-  Widget build(BuildContext context) => Padding(
-    padding: const EdgeInsets.symmetric(vertical: 6),
-    child: Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Text(value, style: TextStyle(fontSize: 22, fontWeight: FontWeight.w700,
-            color: color, letterSpacing: -0.5)),
-        const SizedBox(height: 2),
-        Text(label, style: TextStyle(fontSize: 11,
-            color: color.withOpacity(0.7))),
-      ],
-    ),
-  );
+  Widget build(BuildContext context) {
+    final color = _severityColor();
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 8),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              if (severity != _Severity.neutral) ...[
+                Icon(severity.icon, size: 22, color: color),
+                const SizedBox(width: 6),
+              ],
+              Flexible(
+                child: WcagText(
+                  value,
+                  size: WcagType.display,
+                  weight: WcagType.bold,
+                  color: color,
+                  letterSpacing: -0.5,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 4),
+          Row(children: [
+            WcagText(label,
+                size: WcagType.caption,
+                emphasis: 'secondary',
+                weight: WcagType.medium),
+            if (severity != _Severity.neutral) ...[
+              const SizedBox(width: 6),
+              Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                decoration: BoxDecoration(
+                  color: color.withOpacity(0.15),
+                  borderRadius: BorderRadius.circular(6),
+                  border: Border.all(color: color, width: 1),
+                ),
+                child: WcagText(severity.label,
+                    size: WcagType.caption - 2,
+                    weight: WcagType.bold,
+                    color: color),
+              ),
+            ],
+          ]),
+        ],
+      ),
+    );
+  }
 }
 
 class _CellBreakdownBar extends StatelessWidget {
   final double free, walls, obstacles, visited;
+  final WcagPalette p;
   const _CellBreakdownBar({
-    required this.free, required this.walls,
-    required this.obstacles, required this.visited,
+    required this.free,
+    required this.walls,
+    required this.obstacles,
+    required this.visited,
+    required this.p,
   });
 
   @override
@@ -450,16 +611,16 @@ class _CellBreakdownBar extends StatelessWidget {
     final total = free + walls + obstacles + visited;
     if (total == 0) return const SizedBox(height: 8);
     return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 8),
+      padding: const EdgeInsets.symmetric(vertical: 10),
       child: ClipRRect(
         borderRadius: BorderRadius.circular(4),
         child: SizedBox(
-          height: 8,
+          height: 12,
           child: Row(children: [
-            _bar(free / total, const Color(0xFF10B981)),
-            _bar(visited / total, const Color(0xFF3B82F6)),
-            _bar(obstacles / total, const Color(0xFFB45309)),
-            _bar(walls / total, const Color(0xFF374151)),
+            _bar(free / total, p.accentSuccess),
+            _bar(visited / total, p.accentInfo),
+            _bar(obstacles / total, p.accentWarning),
+            _bar(walls / total, p.textPrimary),
           ]),
         ),
       ),
@@ -467,7 +628,8 @@ class _CellBreakdownBar extends StatelessWidget {
   }
 
   Widget _bar(double fraction, Color color) => fraction > 0
-      ? Expanded(flex: (fraction * 1000).toInt().clamp(1, 1000),
+      ? Expanded(
+          flex: (fraction * 1000).toInt().clamp(1, 1000),
           child: Container(color: color))
       : const SizedBox.shrink();
 }

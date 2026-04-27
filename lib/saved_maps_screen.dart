@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'accessibility_service.dart';
 import 'performance_dashboard.dart';
+import 'wcag_theme.dart';
 
 class SavedMapInfo {
   final String name;
@@ -62,7 +63,8 @@ class SavedMapsScreen extends StatefulWidget {
   State<SavedMapsScreen> createState() => _SavedMapsScreenState();
 }
 
-class _SavedMapsScreenState extends State<SavedMapsScreen> with VolumeButtonNavigationMixin {
+class _SavedMapsScreenState extends State<SavedMapsScreen>
+    with VolumeButtonNavigationMixin {
   static const _ch = MethodChannel('com.ketan.slam/map_store');
   final _accessibility = AccessibilityService();
 
@@ -114,19 +116,23 @@ class _SavedMapsScreenState extends State<SavedMapsScreen> with VolumeButtonNavi
       final map = _maps![i];
       focusables.add(FocusableElement(
         id: 'map_$i',
-        label: '${map.name.replaceAll('_', ' ')}. ${map.formattedTimestamp}',
-        hint: 'Area ${map.areaM2.toStringAsFixed(0)} square meters, ${map.objectCount} objects. Double tap to open, long press to select.',
+        label:
+            '${map.name.replaceAll('_', ' ')}. ${map.formattedTimestamp}',
+        hint:
+            'Area ${map.areaM2.toStringAsFixed(0)} square meters, ${map.objectCount} objects. Double tap to open, long press to select.',
         onActivate: () => _openMap(map),
       ));
       focusables.add(FocusableElement(
         id: 'perf_$i',
         label: 'Performance for ${map.name.replaceAll('_', ' ')}',
-        hint: 'Double tap to view performance metrics for this scan.',
+        hint:
+            'Double tap to view performance metrics for this scan.',
         onActivate: () => _openPerformance(map),
       ));
     }
 
-    _accessibility.registerFocusables(focusables, onFocusChanged: () => setState(() {}));
+    _accessibility.registerFocusables(focusables,
+        onFocusChanged: () => setState(() {}));
   }
 
   @override
@@ -136,7 +142,10 @@ class _SavedMapsScreenState extends State<SavedMapsScreen> with VolumeButtonNavi
   }
 
   Future<void> _loadMaps() async {
-    setState(() { _loading = true; _error = null; });
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
     try {
       final result = await _ch.invokeMethod('listSavedMaps');
       if (result is List && mounted) {
@@ -145,13 +154,19 @@ class _SavedMapsScreenState extends State<SavedMapsScreen> with VolumeButtonNavi
             .map((m) => SavedMapInfo.fromMap(m))
             .toList();
         maps.sort((a, b) => b.timestamp.compareTo(a.timestamp));
-        setState(() { _maps = maps; _loading = false; });
+        setState(() {
+          _maps = maps;
+          _loading = false;
+        });
         _registerFocusables();
         _accessibility.speak('${maps.length} saved maps found.');
       }
     } catch (e) {
       if (mounted) {
-        setState(() { _error = e.toString(); _loading = false; });
+        setState(() {
+          _error = e.toString();
+          _loading = false;
+        });
         _accessibility.speak('Failed to load maps.');
       }
     }
@@ -159,27 +174,43 @@ class _SavedMapsScreenState extends State<SavedMapsScreen> with VolumeButtonNavi
 
   Future<void> _deleteSelectedMaps() async {
     if (_selectedMaps.isEmpty) return;
-    
+
     final count = _selectedMaps.length;
     final confirmed = await showDialog<bool>(
       context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Delete Maps'),
-        content: Text('Delete $count map${count == 1 ? '' : 's'}? This cannot be undone.'),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx, false),
-              child: const Text('Cancel')),
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, true),
-            style: TextButton.styleFrom(foregroundColor: const Color(0xFFDC2626)),
-            child: const Text('Delete'),
+      builder: (ctx) {
+        final p = WcagPalette.of(ctx);
+        return AlertDialog(
+          title: WcagText('Delete Maps',
+              size: WcagType.headline, weight: WcagType.bold),
+          content: WcagText(
+            'Delete $count map${count == 1 ? '' : 's'}? This cannot be undone.',
+            size: WcagType.body,
           ),
-        ],
-      ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: WcagText('Cancel',
+                  size: WcagType.label,
+                  weight: WcagType.semibold,
+                  color: p.textPrimary),
+            ),
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: WcagText('Delete',
+                  size: WcagType.label,
+                  weight: WcagType.semibold,
+                  color: p.accentDanger),
+            ),
+          ],
+        );
+      },
     );
     if (confirmed != true) return;
 
-    setState(() { _loading = true; });
+    setState(() {
+      _loading = true;
+    });
 
     int deleted = 0;
     for (final mapName in _selectedMaps) {
@@ -196,9 +227,14 @@ class _SavedMapsScreenState extends State<SavedMapsScreen> with VolumeButtonNavi
     _loadMaps();
 
     if (mounted) {
+      final msg = 'Deleted $deleted map${deleted == 1 ? '' : 's'}';
+      _accessibility.speak(msg);
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Deleted $deleted map${deleted == 1 ? '' : 's'}'),
-            duration: const Duration(seconds: 2)),
+        SnackBar(
+          content: WcagText(msg,
+              size: WcagType.body, color: Colors.white),
+          duration: const Duration(seconds: 3),
+        ),
       );
     }
   }
@@ -218,120 +254,143 @@ class _SavedMapsScreenState extends State<SavedMapsScreen> with VolumeButtonNavi
 
   @override
   Widget build(BuildContext context) {
-    final isDark = Theme.of(context).brightness == Brightness.dark;
-    final bg      = isDark ? const Color(0xFF0F0F17) : const Color(0xFFF8F8FC);
-    final surface = isDark ? const Color(0xFF1A1A26) : Colors.white;
-    final textPri = isDark ? const Color(0xFFF3F4F6) : const Color(0xFF111827);
-    final textSec = isDark ? const Color(0xFF9CA3AF) : const Color(0xFF6B7280);
-    final border  = isDark ? const Color(0xFF2A2A38) : const Color(0xFFE5E7EB);
+    final p = WcagPalette.of(context);
 
     return Scaffold(
-      backgroundColor: bg,
+      backgroundColor: p.background,
       appBar: AppBar(
-        backgroundColor: surface,
+        backgroundColor: p.surface,
         elevation: 0,
         leading: _isSelectionMode
             ? IconButton(
-                icon: Icon(Icons.close_rounded, color: textPri),
+                iconSize: 28,
+                icon: Icon(Icons.close_rounded, color: p.textPrimary),
+                tooltip: 'Cancel selection',
                 onPressed: () => setState(() {
                   _isSelectionMode = false;
                   _selectedMaps.clear();
                 }),
               )
             : IconButton(
-                icon: Icon(Icons.arrow_back_rounded, color: textPri),
+                iconSize: 28,
+                icon: Icon(Icons.arrow_back_rounded, color: p.textPrimary),
+                tooltip: 'Go back',
                 onPressed: () => Navigator.pop(context),
               ),
-        title: Text(
-            _isSelectionMode ? '${_selectedMaps.length} Selected' : 'Saved Maps',
-            style: TextStyle(color: textPri, fontSize: 18,
-                fontWeight: FontWeight.w700)),
+        title: WcagText(
+          _isSelectionMode
+              ? '${_selectedMaps.length} Selected'
+              : 'Saved Maps',
+          size: WcagType.headline,
+          weight: WcagType.bold,
+        ),
         centerTitle: false,
         actions: _isSelectionMode
             ? [
                 IconButton(
-                  icon: const Icon(Icons.delete_outline_rounded, color: Color(0xFFDC2626)),
-                  onPressed: _selectedMaps.isEmpty ? null : _deleteSelectedMaps,
-                )
+                  iconSize: 28,
+                  icon: Icon(Icons.delete_outline_rounded,
+                      color: p.accentDanger),
+                  tooltip: 'Delete selected maps',
+                  onPressed:
+                      _selectedMaps.isEmpty ? null : _deleteSelectedMaps,
+                ),
               ]
             : null,
       ),
-      body: _loading
-          ? const Center(child: CircularProgressIndicator())
-          : _error != null
-              ? _errorState(textPri, textSec)
-              : (_maps == null || _maps!.isEmpty)
-                  ? _emptyState(textPri, textSec)
-                  : _mapList(surface, textPri, textSec, border),
+      body: WcagScaffoldFrame(
+        child: _loading
+            ? const Center(child: CircularProgressIndicator())
+            : _error != null
+                ? _errorState(p)
+                : (_maps == null || _maps!.isEmpty)
+                    ? _emptyState(p)
+                    : _mapList(p),
+      ),
     );
   }
 
-  Widget _emptyState(Color textPri, Color textSec) {
+  Widget _emptyState(WcagPalette p) {
     return Center(
       child: Padding(
         padding: const EdgeInsets.all(40),
         child: Column(mainAxisSize: MainAxisSize.min, children: [
-          Icon(Icons.map_outlined, size: 64,
-              color: textSec.withOpacity(0.4)),
+          Icon(Icons.map_outlined, size: 64, color: p.textTertiary),
           const SizedBox(height: 20),
-          Text('No saved maps yet',
-              style: TextStyle(color: textPri, fontSize: 18,
-                  fontWeight: FontWeight.w600)),
+          WcagText('No saved maps yet',
+              size: WcagType.headline, weight: WcagType.semibold),
           const SizedBox(height: 8),
-          Text('Start an AR scan to create your first map',
-              textAlign: TextAlign.center,
-              style: TextStyle(color: textSec, fontSize: 14, height: 1.4)),
+          WcagText('Start an AR scan to create your first map',
+              align: TextAlign.center,
+              size: WcagType.body,
+              emphasis: 'secondary',
+              height: 1.4),
         ]),
       ),
     );
   }
 
-  Widget _errorState(Color textPri, Color textSec) {
+  Widget _errorState(WcagPalette p) {
     return Center(
       child: Padding(
         padding: const EdgeInsets.all(40),
         child: Column(mainAxisSize: MainAxisSize.min, children: [
-          Icon(Icons.error_outline_rounded, size: 48,
-              color: const Color(0xFFDC2626).withOpacity(0.6)),
+          Icon(Icons.error_outline_rounded,
+              size: 56, color: p.accentDanger),
           const SizedBox(height: 16),
-          Text('Failed to load maps',
-              style: TextStyle(color: textPri, fontSize: 16,
-                  fontWeight: FontWeight.w600)),
+          WcagText('Failed to load maps',
+              size: WcagType.headline, weight: WcagType.semibold),
           const SizedBox(height: 8),
-          Text(_error ?? '', textAlign: TextAlign.center,
-              style: TextStyle(color: textSec, fontSize: 13)),
+          WcagText(_error ?? '',
+              align: TextAlign.center,
+              size: WcagType.body,
+              emphasis: 'secondary'),
           const SizedBox(height: 20),
-          ElevatedButton(onPressed: _loadMaps, child: const Text('Retry')),
+          SizedBox(
+            height: WcagSize.minTouch,
+            child: ElevatedButton(
+              onPressed: _loadMaps,
+              style: ElevatedButton.styleFrom(
+                backgroundColor: p.accentPrimary,
+                foregroundColor: p.textOnAccent,
+                padding: const EdgeInsets.symmetric(horizontal: 24),
+              ),
+              child: WcagText('Retry',
+                  size: WcagType.label,
+                  weight: WcagType.semibold,
+                  color: p.textOnAccent),
+            ),
+          ),
         ]),
       ),
     );
   }
 
-  Widget _mapList(Color surface, Color textPri, Color textSec, Color border) {
+  Widget _mapList(WcagPalette p) {
     return RefreshIndicator(
       onRefresh: _loadMaps,
       child: ListView.separated(
         padding: const EdgeInsets.fromLTRB(16, 16, 16, 32),
         itemCount: _maps!.length,
-        separatorBuilder: (_, __) => const SizedBox(height: 10),
-        itemBuilder: (ctx, i) => _mapCard(_maps![i], surface, textPri, textSec, border),
+        separatorBuilder: (_, __) => const SizedBox(height: 12),
+        itemBuilder: (ctx, i) => _mapCard(_maps![i], p),
       ),
     );
   }
 
-  Widget _mapCard(SavedMapInfo map, Color surface, Color textPri,
-      Color textSec, Color border) {
-    
+  Widget _mapCard(SavedMapInfo map, WcagPalette p) {
     final isSelected = _selectedMaps.contains(map.name);
-    
+
     return Semantics(
       button: true,
-      label: '${map.name}. ${map.formattedTimestamp}. '
+      label:
+          '${map.name.replaceAll('_', ' ')}. ${map.formattedTimestamp}. '
           'Area ${map.areaM2.toStringAsFixed(0)} square meters, '
           '${map.objectCount} objects, duration ${map.formattedDuration}. '
           'Tap to view, long press to select.',
+      excludeSemantics: true,
       child: Material(
-        color: surface,
+        color: isSelected ? p.accentPrimary.withOpacity(0.10) : p.surface,
         borderRadius: BorderRadius.circular(14),
         child: InkWell(
           borderRadius: BorderRadius.circular(14),
@@ -359,13 +418,15 @@ class _SavedMapsScreenState extends State<SavedMapsScreen> with VolumeButtonNavi
             }
           },
           child: Container(
+            constraints:
+                const BoxConstraints(minHeight: WcagSize.minTouch + 32),
             padding: const EdgeInsets.all(16),
             decoration: BoxDecoration(
-              color: isSelected ? const Color(0xFF2563EB).withOpacity(0.08) : null,
               borderRadius: BorderRadius.circular(14),
               border: Border.all(
-                  color: isSelected ? const Color(0xFF2563EB) : border,
-                  width: isSelected ? 2 : 1),
+                color: isSelected ? p.accentPrimary : p.border,
+                width: isSelected ? 2.5 : 1.5,
+              ),
             ),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -374,70 +435,93 @@ class _SavedMapsScreenState extends State<SavedMapsScreen> with VolumeButtonNavi
                   if (_isSelectionMode)
                     Container(
                       margin: const EdgeInsets.only(right: 12),
-                      width: 24, height: 24,
+                      width: 28,
+                      height: 28,
                       decoration: BoxDecoration(
                         shape: BoxShape.circle,
-                        color: isSelected ? const Color(0xFF2563EB) : Colors.transparent,
-                        border: isSelected ? null : Border.all(color: textSec.withOpacity(0.5), width: 2),
+                        color: isSelected ? p.accentPrimary : p.surface,
+                        border: Border.all(
+                          color:
+                              isSelected ? p.accentPrimary : p.borderStrong,
+                          width: 2,
+                        ),
                       ),
-                      child: isSelected ? const Icon(Icons.check, size: 16, color: Colors.white) : null,
+                      child: isSelected
+                          ? Icon(Icons.check,
+                              size: 18, color: p.textOnAccent)
+                          : null,
                     )
                   else
                     Container(
-                      padding: const EdgeInsets.all(8),
+                      padding: const EdgeInsets.all(10),
                       margin: const EdgeInsets.only(right: 12),
                       decoration: BoxDecoration(
-                        color: const Color(0xFF059669).withOpacity(0.1),
+                        color: p.accentSuccess,
                         borderRadius: BorderRadius.circular(10),
                       ),
-                      child: const Icon(Icons.map_rounded, size: 20,
-                          color: Color(0xFF059669)),
+                      child: Icon(Icons.map_rounded,
+                          size: 22, color: p.textOnAccent),
                     ),
                   Expanded(
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        Text(
+                        WcagText(
                           map.name.replaceAll('_', ' '),
-                          style: TextStyle(color: textPri, fontSize: 15,
-                              fontWeight: FontWeight.w600),
+                          size: WcagType.label,
+                          weight: WcagType.semibold,
+                          maxLines: 1,
                           overflow: TextOverflow.ellipsis,
                         ),
-                        const SizedBox(height: 2),
-                        Text(map.formattedTimestamp,
-                            style: TextStyle(color: textSec, fontSize: 12)),
+                        const SizedBox(height: 4),
+                        WcagText(
+                          map.formattedTimestamp,
+                          size: WcagType.caption,
+                          emphasis: 'secondary',
+                        ),
                       ],
                     ),
                   ),
                   if (!_isSelectionMode) ...[
-                    Semantics(
-                      button: true,
-                      label: 'View performance metrics for ${map.name.replaceAll('_', ' ')}',
-                      child: InkWell(
-                        borderRadius: BorderRadius.circular(20),
-                        onTap: () => _openPerformance(map),
-                        child: Padding(
-                          padding: const EdgeInsets.all(6),
-                          child: Icon(Icons.analytics_rounded,
-                              size: 20, color: const Color(0xFFD97706)),
+                    SizedBox(
+                      width: WcagSize.minTouch,
+                      height: WcagSize.minTouch,
+                      child: Semantics(
+                        button: true,
+                        label:
+                            'View performance metrics for ${map.name.replaceAll('_', ' ')}',
+                        excludeSemantics: true,
+                        child: Material(
+                          color: Colors.transparent,
+                          shape: const CircleBorder(),
+                          child: InkWell(
+                            customBorder: const CircleBorder(),
+                            onTap: () => _openPerformance(map),
+                            child: Center(
+                              child: Icon(Icons.analytics_rounded,
+                                  size: 24, color: p.accentWarning),
+                            ),
+                          ),
                         ),
                       ),
                     ),
-                    const SizedBox(width: 2),
-                    Icon(Icons.chevron_right_rounded, size: 20, color: textSec),
+                    Icon(Icons.chevron_right_rounded,
+                        size: 22, color: p.textSecondary),
                   ],
                 ]),
-                const SizedBox(height: 12),
-                Row(children: [
-                  _statChip(Icons.square_foot_rounded,
-                      '${map.areaM2.toStringAsFixed(0)} m\u00B2', textSec),
-                  const SizedBox(width: 12),
-                  _statChip(Icons.category_rounded,
-                      '${map.objectCount} objects', textSec),
-                  const SizedBox(width: 12),
-                  _statChip(Icons.timer_outlined,
-                      map.formattedDuration, textSec),
-                ]),
+                const SizedBox(height: 14),
+                Wrap(
+                  spacing: 12,
+                  runSpacing: 8,
+                  children: [
+                    _statChip(Icons.square_foot_rounded,
+                        '${map.areaM2.toStringAsFixed(0)} m²', p),
+                    _statChip(Icons.category_rounded,
+                        '${map.objectCount} objects', p),
+                    _statChip(Icons.timer_outlined,
+                        map.formattedDuration, p),
+                  ],
+                ),
               ],
             ),
           ),
@@ -446,12 +530,14 @@ class _SavedMapsScreenState extends State<SavedMapsScreen> with VolumeButtonNavi
     );
   }
 
-  Widget _statChip(IconData icon, String text, Color color) {
+  Widget _statChip(IconData icon, String text, WcagPalette p) {
     return Row(mainAxisSize: MainAxisSize.min, children: [
-      Icon(icon, size: 13, color: color),
-      const SizedBox(width: 4),
-      Text(text, style: TextStyle(color: color, fontSize: 12,
-          fontWeight: FontWeight.w500)),
+      Icon(icon, size: 16, color: p.textSecondary),
+      const SizedBox(width: 6),
+      WcagText(text,
+          size: WcagType.caption,
+          emphasis: 'secondary',
+          weight: WcagType.medium),
     ]);
   }
 }

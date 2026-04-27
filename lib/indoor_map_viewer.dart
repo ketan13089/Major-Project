@@ -3,6 +3,7 @@ import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'accessibility_service.dart';
+import 'wcag_theme.dart';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Cell constants — must match MapBuilder.kt
@@ -14,65 +15,22 @@ const int cellWall     = 3;
 const int cellVisited  = 4;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Architectural floor-plan colour theme
-// Matches the reference image: white floor, dark thick walls, clear rooms
+// Map painter palette — decorative cell colors only. NOT subject to WCAG
+// text-contrast rules. UI chrome (top bar, chips, banners, etc.) pulls from
+// [WcagPalette.of(context)] instead.
 // ─────────────────────────────────────────────────────────────────────────────
 class _T {
-  // App chrome
-  static const bg        = Color(0xFFF5F7FA);
-  static const surface   = Color(0xFFFFFFFF);
-  static const surfaceLo = Color(0xFFF0F2F5);
-  static const border    = Color(0xFFE2E6ED);
-  static const divider   = Color(0xFFEBEEF2);
-
-  // Accent
-  static const blue      = Color(0xFF2563EB);
-  static const blueSoft  = Color(0xFFEFF4FF);
-  static const blueLight = Color(0xFFBFD4FE);
-  static const green     = Color(0xFF16A34A);
-  static const greenSoft = Color(0xFFDCFCE7);
-  static const amber     = Color(0xFFD97706);
-  static const amberSoft = Color(0xFFFEF3C7);
-  static const red       = Color(0xFFDC2626);
-  static const redSoft   = Color(0xFFFEE2E2);
-
-  // Text
-  static const textPri  = Color(0xFF111827);
-  static const textSec  = Color(0xFF6B7280);
-  static const textDim  = Color(0xFFD1D5DB);
-
-  // ── Architectural map colours ──────────────────────────────────────────────
-  // Background: light warm off-white (like paper/blueprint bg)
-  static const mapBg      = Color(0xFFF8F6F0);
-
-  // Grid lines: very subtle, doesn't compete with walls
-  static const mapGrid    = Color(0xFFECEAE4);
-
-  // Floor — clean white, clearly passable
-  static const mapFloor   = Color(0xFFFFFFFF);
-
-  // Visited path (camera trajectory) — stronger blue so it remains visible
-  // even when zoomed out.
-  static const mapVisited = Color(0xFF60A5FA);
-
-  // WALL — the most important colour. Dark gray like architectural drawings.
-  // Must be very distinct from floor. Using a near-black warm gray.
-  static const mapWall    = Color(0xFF2C2C2C);
-
-  // Obstacle — object footprint. Muted orange-brown, like furniture in plans.
+  // Architectural map colours (used only inside _MapPainter)
+  static const mapBg       = Color(0xFFF8F6F0);
+  static const mapGrid     = Color(0xFFD9D6CE);
+  static const mapFloor    = Color(0xFFFFFFFF);
+  static const mapVisited  = Color(0xFF60A5FA);
+  static const mapWall     = Color(0xFF1F1F1F);
   static const mapObstacle = Color(0xFFB45309);
-
-  // Path highlight (BFS route to selected object)
-  static const mapPath    = Color(0xFF3B82F6);
-
-  // Nav path (voice navigation route) — green
-  static const mapNavPath = Color(0xFF10B981);
-
-  // Camera trail polyline — a distinct teal stroke drawn over visited cells
-  static const mapTrail   = Color(0xFF0EA5E9);
-
-  // Robot position
-  static const mapRobot   = Color(0xFF2563EB);
+  static const mapPath     = Color(0xFF1D4ED8);
+  static const mapNavPath  = Color(0xFF15803D);
+  static const mapTrail    = Color(0xFF0E7490);
+  static const mapRobot    = Color(0xFF1D4ED8);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -551,14 +509,14 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
     } catch (_) {}
   }
 
-  Color _navStateColor() {
+  Color _navStateColor(WcagPalette p) {
     switch (_navState) {
-      case 'LISTENING':  return const Color(0xFF7C3AED);
-      case 'PLANNING':   return _T.blue;
-      case 'NAVIGATING': return const Color(0xFF1D4ED8);
-      case 'ARRIVED':    return _T.green;
-      case 'ERROR':      return _T.red;
-      default:           return _T.textSec;
+      case 'LISTENING':  return const Color(0xFF6D28D9); // 4.85:1 on white
+      case 'PLANNING':   return p.accentPrimary;
+      case 'NAVIGATING': return p.accentPrimary;
+      case 'ARRIVED':    return p.accentSuccess;
+      case 'ERROR':      return p.accentDanger;
+      default:           return p.textSecondary;
     }
   }
 
@@ -581,69 +539,88 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
   // ─────────────────────────────────────────────────────────────────────────
   @override
   Widget build(BuildContext context) {
+    final p = WcagPalette.of(context);
     return Scaffold(
-      backgroundColor: _T.bg,
-      body: SafeArea(
-        child: Stack(children: [
-          Column(children: [
-            _topBar(),
-            Expanded(child: _mapArea()),
-            if (objects.isNotEmpty) _objectRail(),
-            if (!_isReadOnly) _bottomBar(),
+      backgroundColor: p.background,
+      body: WcagScaffoldFrame(
+        child: SafeArea(
+          child: Stack(children: [
+            Column(children: [
+              _topBar(p),
+              Expanded(child: _mapArea(p)),
+              if (objects.isNotEmpty) _objectRail(p),
+              if (!_isReadOnly) _bottomBar(p),
+            ]),
+            if (_showLegend) _legendSheet(p),
           ]),
-          if (_showLegend) _legendSheet(),
-        ]),
+        ),
       ),
     );
   }
 
   // ── Top bar ───────────────────────────────────────────────────────────────
-  Widget _topBar() {
+  Widget _topBar(WcagPalette p) {
     return Container(
-      color: _T.surface,
-      padding: const EdgeInsets.fromLTRB(16, 0, 12, 0),
+      color: p.surface,
+      padding: const EdgeInsets.fromLTRB(8, 0, 4, 0),
       child: Column(children: [
         if (_isReadOnly)
           SizedBox(
-            height: 52,
+            height: WcagSize.minTouch + 8,
             child: Row(children: [
-              GestureDetector(
-                onTap: () => Navigator.pop(context),
-                child: const Icon(Icons.arrow_back_rounded, size: 22, color: _T.textPri),
+              IconButton(
+                iconSize: 28,
+                tooltip: 'Go back',
+                icon: Icon(Icons.arrow_back_rounded, color: p.textPrimary),
+                onPressed: () => Navigator.pop(context),
               ),
-              const SizedBox(width: 10),
-              Expanded(child: Text(
-                widget.savedMapName!.replaceAll('_', ' '),
-                style: const TextStyle(color: _T.textPri, fontSize: 14,
-                    fontWeight: FontWeight.w600),
-                overflow: TextOverflow.ellipsis,
-              )),
+              const SizedBox(width: 4),
+              Expanded(
+                child: WcagText(
+                  widget.savedMapName!.replaceAll('_', ' '),
+                  size: WcagType.label,
+                  weight: WcagType.semibold,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
               Container(
-                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                padding: const EdgeInsets.symmetric(
+                    horizontal: 10, vertical: 6),
                 decoration: BoxDecoration(
-                  color: _T.amberSoft,
+                  color: p.accentWarning,
                   borderRadius: BorderRadius.circular(8),
                 ),
-                child: const Text('Saved', style: TextStyle(
-                    color: _T.amber, fontSize: 11, fontWeight: FontWeight.w600)),
+                child: WcagText('Saved',
+                    size: WcagType.caption,
+                    weight: WcagType.bold,
+                    color: p.textOnAccent),
               ),
-              const SizedBox(width: 8),
-              _tinyBtn(Icons.info_outline_rounded,
+              const SizedBox(width: 4),
+              _tinyBtn(p, Icons.info_outline_rounded,
                   () => setState(() => _showLegend = !_showLegend),
-                  active: _showLegend),
-              _tinyBtn(Icons.crop_free_rounded,
-                  () => setState(() { pan = Offset.zero; scale = 28; })),
+                  active: _showLegend, tooltip: 'Toggle legend'),
+              _tinyBtn(p, Icons.crop_free_rounded,
+                  () => setState(() { pan = Offset.zero; scale = 28; }),
+                  tooltip: 'Reset zoom'),
             ]),
           ),
         if (!_isReadOnly)
         SizedBox(
-          height: 52,
+          height: WcagSize.minTouch + 8,
           child: Row(children: [
             Container(
-              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+              padding: const EdgeInsets.symmetric(
+                  horizontal: 12, vertical: 8),
               decoration: BoxDecoration(
-                color: scanning ? _T.greenSoft : _T.surfaceLo,
+                color: scanning
+                    ? p.accentSuccess.withOpacity(0.15)
+                    : p.surfaceRecessed,
                 borderRadius: BorderRadius.circular(20),
+                border: Border.all(
+                  color: scanning ? p.accentSuccess : p.border,
+                  width: scanning ? 1.5 : 1,
+                ),
               ),
               child: Row(mainAxisSize: MainAxisSize.min, children: [
                 AnimatedBuilder(
@@ -652,97 +629,116 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
                     final t = _pulseCtrl.value;
                     final pulse = t < 0.5 ? t * 2 : 2 - t * 2;
                     return Container(
-                      width: 7, height: 7,
+                      width: 10, height: 10,
                       decoration: BoxDecoration(
                         shape: BoxShape.circle,
-                        color: (scanning ? _T.green : _T.textDim)
-                            .withOpacity(scanning ? 0.4 + 0.6 * pulse : 1.0),
+                        color: scanning
+                            ? p.accentSuccess.withOpacity(0.4 + 0.6 * pulse)
+                            : p.textTertiary,
                       ),
                     );
                   },
                 ),
-                const SizedBox(width: 6),
-                Text(
+                const SizedBox(width: 8),
+                WcagText(
                   scanning ? 'Scanning' : 'Idle',
-                  style: TextStyle(
-                    color: scanning ? _T.green : _T.textSec,
-                    fontSize: 12, fontWeight: FontWeight.w600,
+                  size: WcagType.caption,
+                  weight: WcagType.bold,
+                  color: scanning ? p.accentSuccess : p.textSecondary,
+                ),
+              ]),
+            ),
+            const SizedBox(width: 8),
+            _inlineStatChip(p,
+              '${posX.toStringAsFixed(1)}, ${posZ.toStringAsFixed(1)} m',
+              Icons.navigation_rounded, p.accentPrimary,
+            ),
+            const SizedBox(width: 6),
+            _inlineStatChip(p,
+              '${_areaSqM.toStringAsFixed(1)} m²',
+              Icons.square_foot_rounded, p.accentWarning,
+            ),
+            const Spacer(),
+            _tinyBtn(p, Icons.info_outline_rounded,
+                () => setState(() => _showLegend = !_showLegend),
+                active: _showLegend, tooltip: 'Toggle legend'),
+            _tinyBtn(p, Icons.crop_free_rounded,
+                () => setState(() { pan = Offset.zero; scale = 28; }),
+                tooltip: 'Reset zoom'),
+          ]),
+        ),
+        Divider(height: 1, color: p.border),
+        if (!_isReadOnly && _navState != 'IDLE')
+          Semantics(
+            liveRegion: true,
+            child: Container(
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(
+                  horizontal: 16, vertical: 10),
+              color: _navStateColor(p).withOpacity(0.12),
+              child: Row(children: [
+                Icon(Icons.assistant_navigation,
+                    size: 18, color: _navStateColor(p)),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: WcagText(
+                    _navMessage,
+                    size: WcagType.caption,
+                    weight: WcagType.semibold,
+                    color: _navStateColor(p),
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
                   ),
                 ),
               ]),
             ),
-            const SizedBox(width: 10),
-            _inlineStatChip(
-              '${posX.toStringAsFixed(1)}, ${posZ.toStringAsFixed(1)} m',
-              Icons.navigation_rounded, _T.blue,
-            ),
-            const SizedBox(width: 6),
-            _inlineStatChip(
-              '${_areaSqM.toStringAsFixed(1)} m²',
-              Icons.square_foot_rounded, _T.amber,
-            ),
-            const Spacer(),
-            _tinyBtn(Icons.info_outline_rounded,
-                    () => setState(() => _showLegend = !_showLegend),
-                active: _showLegend),
-            _tinyBtn(Icons.crop_free_rounded,
-                    () => setState(() { pan = Offset.zero; scale = 28; })),
-          ]),
-        ),
-        Divider(height: 1, color: _T.border),
-        if (!_isReadOnly && _navState != 'IDLE')
-          Container(
-            width: double.infinity,
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
-            color: _navStateColor().withOpacity(0.08),
-            child: Row(children: [
-              Icon(Icons.assistant_navigation, size: 13, color: _navStateColor()),
-              const SizedBox(width: 6),
-              Expanded(child: Text(
-                _navMessage,
-                style: TextStyle(color: _navStateColor(), fontSize: 12,
-                    fontWeight: FontWeight.w500),
-                overflow: TextOverflow.ellipsis,
-              )),
-            ]),
           ),
       ]),
     );
   }
 
-  Widget _inlineStatChip(String value, IconData icon, Color color) {
+  Widget _inlineStatChip(WcagPalette p, String value, IconData icon, Color iconColor) {
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
       decoration: BoxDecoration(
-        color: _T.surfaceLo, borderRadius: BorderRadius.circular(8),
+        color: p.surfaceRecessed,
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: p.border),
       ),
       child: Row(mainAxisSize: MainAxisSize.min, children: [
-        Icon(icon, size: 13, color: color),
-        const SizedBox(width: 5),
-        Text(value, style: const TextStyle(
-            color: _T.textPri, fontSize: 12, fontWeight: FontWeight.w500)),
+        Icon(icon, size: 16, color: iconColor),
+        const SizedBox(width: 6),
+        WcagText(value,
+            size: WcagType.caption, weight: WcagType.semibold),
       ]),
     );
   }
 
-  Widget _tinyBtn(IconData icon, VoidCallback cb, {bool active = false}) {
-    return GestureDetector(
-      onTap: cb,
-      child: Container(
-        width: 36, height: 36,
-        margin: const EdgeInsets.only(left: 4),
-        decoration: BoxDecoration(
-          color: active ? _T.blueSoft : Colors.transparent,
-          borderRadius: BorderRadius.circular(8),
+  Widget _tinyBtn(WcagPalette p, IconData icon, VoidCallback cb,
+      {bool active = false, String? tooltip}) {
+    return Tooltip(
+      message: tooltip ?? '',
+      child: Material(
+        color: active ? p.accentPrimary.withOpacity(0.12) : Colors.transparent,
+        borderRadius: BorderRadius.circular(10),
+        child: InkWell(
+          onTap: cb,
+          borderRadius: BorderRadius.circular(10),
+          child: Container(
+            width: WcagSize.minTouch,
+            height: WcagSize.minTouch,
+            margin: const EdgeInsets.only(left: 2),
+            child: Icon(icon,
+                size: 24,
+                color: active ? p.accentPrimary : p.textSecondary),
+          ),
         ),
-        child: Icon(icon, size: 18, color: active ? _T.blue : _T.textSec),
       ),
     );
   }
 
   // ── Map canvas ────────────────────────────────────────────────────────────
-  Widget _mapArea() {
-    // Use cached path — BFS is never run inside build()
+  Widget _mapArea(WcagPalette p) {
     final pathCells = _cachedPathCells;
 
     return Container(
@@ -779,20 +775,21 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
           if (grid == null || gridW == 0)
             Center(
               child: Container(
-                padding: const EdgeInsets.all(20),
+                padding: const EdgeInsets.all(24),
                 decoration: BoxDecoration(
-                  color: _T.surface, borderRadius: BorderRadius.circular(20),
-                  border: Border.all(color: _T.border),
+                  color: p.surface,
+                  borderRadius: BorderRadius.circular(20),
+                  border: Border.all(color: p.border, width: 1.5),
                 ),
                 child: Column(mainAxisSize: MainAxisSize.min, children: [
-                  Icon(Icons.map_outlined, size: 48, color: _T.textDim),
-                  const SizedBox(height: 12),
-                  const Text('No map yet',
-                      style: TextStyle(color: _T.textPri, fontSize: 15,
-                          fontWeight: FontWeight.w600)),
-                  const SizedBox(height: 4),
-                  const Text('Start a scan to build the floor map',
-                      style: TextStyle(color: _T.textSec, fontSize: 13)),
+                  Icon(Icons.map_outlined, size: 56, color: p.textTertiary),
+                  const SizedBox(height: 14),
+                  WcagText('No map yet',
+                      size: WcagType.headline,
+                      weight: WcagType.semibold),
+                  const SizedBox(height: 6),
+                  WcagText('Start a scan to build the floor map',
+                      size: WcagType.body, emphasis: 'secondary'),
                 ]),
               ),
             ),
@@ -800,26 +797,35 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
           Positioned(
             right: 12, top: 12,
             child: Column(children: [
-              _mapBtn(Icons.add_rounded, () => setState(() => scale = (scale + 6).clamp(6.0, 300.0))),
-              const SizedBox(height: 4),
-              _mapBtn(Icons.remove_rounded, () => setState(() => scale = (scale - 6).clamp(6.0, 300.0))),
-              const SizedBox(height: 8),
-              _mapBtn(Icons.my_location_rounded, () => setState(() => pan = Offset.zero)),
+              _mapBtn(p, Icons.add_rounded,
+                  () => setState(() => scale = (scale + 6).clamp(6.0, 300.0)),
+                  tooltip: 'Zoom in'),
+              const SizedBox(height: 6),
+              _mapBtn(p, Icons.remove_rounded,
+                  () => setState(() => scale = (scale - 6).clamp(6.0, 300.0)),
+                  tooltip: 'Zoom out'),
+              const SizedBox(height: 10),
+              _mapBtn(p, Icons.my_location_rounded,
+                  () => setState(() => pan = Offset.zero),
+                  tooltip: 'Center on me'),
             ]),
           ),
           // Scale bar bottom-left
           Positioned(
             left: 12, bottom: 12,
             child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+              padding: const EdgeInsets.symmetric(
+                  horizontal: 10, vertical: 6),
               decoration: BoxDecoration(
-                color: _T.surface.withOpacity(0.9),
-                borderRadius: BorderRadius.circular(6),
-                border: Border.all(color: _T.border),
+                color: p.surface,
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: p.borderStrong),
               ),
-              child: Text(
+              child: WcagText(
                 '${(5 * gridRes).toStringAsFixed(1)} m / 5 cells',
-                style: const TextStyle(color: _T.textSec, fontSize: 10),
+                size: WcagType.caption,
+                emphasis: 'secondary',
+                weight: WcagType.medium,
               ),
             ),
           ),
@@ -828,49 +834,58 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
             Positioned(
               left: 12, top: 12,
               child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                padding: const EdgeInsets.symmetric(
+                    horizontal: 10, vertical: 8),
                 decoration: BoxDecoration(
-                  color: _T.surface.withOpacity(0.9),
-                  borderRadius: BorderRadius.circular(6),
-                  border: Border.all(color: _T.border),
+                  color: p.surface,
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(color: p.borderStrong),
                 ),
                 child: Row(mainAxisSize: MainAxisSize.min, children: [
-                  Icon(Icons.category_rounded, size: 12, color: _T.blue),
-                  const SizedBox(width: 4),
-                  Text('$totalObjects object${totalObjects > 1 ? 's' : ''} found',
-                      style: const TextStyle(color: _T.textPri, fontSize: 10,
-                          fontWeight: FontWeight.w500)),
+                  Icon(Icons.category_rounded,
+                      size: 16, color: p.accentPrimary),
+                  const SizedBox(width: 6),
+                  WcagText(
+                    '$totalObjects object${totalObjects > 1 ? 's' : ''} found',
+                    size: WcagType.caption,
+                    weight: WcagType.semibold,
+                  ),
                 ]),
               ),
             ),
-          // Nav instruction banner
+          // Nav instruction banner — high-contrast & live region for TTS
           if (!_isReadOnly && _navInstruction.isNotEmpty)
             Positioned(
-              bottom: 110, left: 12, right: 64,
-              child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-                decoration: BoxDecoration(
-                  color: const Color(0xFF1D4ED8),
-                  borderRadius: BorderRadius.circular(10),
-                  boxShadow: [BoxShadow(
-                      color: Colors.black.withOpacity(0.18),
-                      blurRadius: 10, offset: const Offset(0, 3))],
+              bottom: 110, left: 12, right: 76,
+              child: Semantics(
+                liveRegion: true,
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                      horizontal: 14, vertical: 12),
+                  decoration: BoxDecoration(
+                    color: p.accentPrimary,
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(
+                        color: p.textOnAccent, width: 1.5),
+                  ),
+                  child: Row(children: [
+                    Icon(Icons.assistant_navigation_rounded,
+                        size: 22, color: p.textOnAccent),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: WcagText(_navInstruction,
+                          size: WcagType.body,
+                          weight: WcagType.bold,
+                          color: p.textOnAccent),
+                    ),
+                  ]),
                 ),
-                child: Row(children: [
-                  const Text('🧭', style: TextStyle(fontSize: 15)),
-                  const SizedBox(width: 8),
-                  Expanded(child: Text(
-                    _navInstruction,
-                    style: const TextStyle(color: Colors.white, fontSize: 13,
-                        fontWeight: FontWeight.w600),
-                  )),
-                ]),
               ),
             ),
-          // Voice nav button — above the compass rose (hidden in read-only mode)
+          // Voice nav button — large 64dp circle, well above the FAB minimum
           if (!_isReadOnly) Positioned(
             right: 12,
-            bottom: _navInstruction.isNotEmpty ? 110 : 80,
+            bottom: _navInstruction.isNotEmpty ? 130 : 80,
             child: Semantics(
               button: true,
               label: _navState == 'NAVIGATING'
@@ -878,21 +893,33 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
                   : _navState == 'LISTENING'
                       ? 'Listening for voice command'
                       : 'Start voice command. Say things like: take me to the nearest door.',
-              child: GestureDetector(
-                onTap: _onNavButtonTap,
-                child: Container(
-                  width: 48, height: 48,
-                  decoration: BoxDecoration(
-                    color: _navState == 'NAVIGATING' ? _T.red : _T.blue,
-                    shape: BoxShape.circle,
-                    boxShadow: [BoxShadow(
-                        color: Colors.black.withOpacity(0.18),
-                        blurRadius: 8, offset: const Offset(0, 2))],
-                  ),
-                  child: Icon(
-                    _navState == 'LISTENING'  ? Icons.mic_none_rounded :
-                    _navState == 'NAVIGATING' ? Icons.stop_rounded     : Icons.mic_rounded,
-                    color: Colors.white, size: 22,
+              excludeSemantics: true,
+              child: Material(
+                color: _navState == 'NAVIGATING'
+                    ? p.accentDanger
+                    : p.accentPrimary,
+                shape: const CircleBorder(),
+                elevation: 4,
+                child: InkWell(
+                  customBorder: const CircleBorder(),
+                  onTap: _onNavButtonTap,
+                  child: Container(
+                    width: 64,
+                    height: 64,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      border: Border.all(
+                          color: p.textOnAccent, width: 2),
+                    ),
+                    child: Icon(
+                      _navState == 'LISTENING'
+                          ? Icons.mic_none_rounded
+                          : _navState == 'NAVIGATING'
+                              ? Icons.stop_rounded
+                              : Icons.mic_rounded,
+                      color: p.textOnAccent,
+                      size: 30,
+                    ),
                   ),
                 ),
               ),
@@ -903,83 +930,110 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
     );
   }
 
-  Widget _mapBtn(IconData icon, VoidCallback cb) => GestureDetector(
-    onTap: cb,
-    child: Container(
-      width: 36, height: 36,
-      decoration: BoxDecoration(
-        color: _T.surface,
-        borderRadius: BorderRadius.circular(8),
-        border: Border.all(color: _T.border),
-        boxShadow: [BoxShadow(
-            color: Colors.black.withOpacity(0.06),
-            blurRadius: 6, offset: const Offset(0, 2))],
+  Widget _mapBtn(WcagPalette p, IconData icon, VoidCallback cb,
+      {String? tooltip}) {
+    return Tooltip(
+      message: tooltip ?? '',
+      child: Material(
+        color: p.surface,
+        borderRadius: BorderRadius.circular(10),
+        elevation: 1,
+        child: InkWell(
+          onTap: cb,
+          borderRadius: BorderRadius.circular(10),
+          child: Container(
+            width: WcagSize.minTouch,
+            height: WcagSize.minTouch,
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(color: p.borderStrong),
+            ),
+            child: Icon(icon, size: 24, color: p.textSecondary),
+          ),
+        ),
       ),
-      child: Icon(icon, size: 18, color: _T.textSec),
-    ),
-  );
+    );
+  }
 
   // ── Object rail ───────────────────────────────────────────────────────────
-  Widget _objectRail() {
+  Widget _objectRail(WcagPalette p) {
     return Container(
       decoration: BoxDecoration(
-        color: _T.surface,
+        color: p.surface,
         border: Border(
-            top: BorderSide(color: _T.border),
-            bottom: BorderSide(color: _T.border)),
+          top: BorderSide(color: p.border),
+          bottom: BorderSide(color: p.border),
+        ),
       ),
-      padding: const EdgeInsets.fromLTRB(16, 10, 16, 10),
+      padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
         Row(children: [
-          const Text('Objects', style: TextStyle(color: _T.textPri,
-              fontSize: 12, fontWeight: FontWeight.w600)),
-          const SizedBox(width: 6),
-          Text('· tap to show path',
-              style: TextStyle(color: _T.textSec, fontSize: 11)),
+          WcagText('Objects',
+              size: WcagType.caption,
+              weight: WcagType.bold),
+          const SizedBox(width: 8),
+          WcagText('· tap to show path',
+              size: WcagType.caption, emphasis: 'secondary'),
         ]),
-        const SizedBox(height: 8),
+        const SizedBox(height: 10),
         SizedBox(
-          height: 40,
+          height: WcagSize.minTouch,
           child: ListView.separated(
             scrollDirection: Axis.horizontal,
             itemCount: objects.length,
-            separatorBuilder: (_, __) => const SizedBox(width: 6),
+            separatorBuilder: (_, __) => const SizedBox(width: 8),
             itemBuilder: (ctx, i) {
               final o = objects[i];
               final col = _typeColor(o.type);
               final selected = _selObj == i;
               return Semantics(
                 button: true,
-                label: '${_displayLabel(o)}, ${(o.confidence * 100).toStringAsFixed(0)} percent confidence. Tap to show path.',
-                child: GestureDetector(
-                onTap: () => setState(() {
-                  _selObj = selected ? null : i;
-                  _cachedPathCells = _recomputePath(
-                      grid, gridW, gridH, robotGX, robotGZ, _selObj, objects);
-                }),
-                child: AnimatedContainer(
-                  duration: const Duration(milliseconds: 150),
-                  padding: const EdgeInsets.symmetric(horizontal: 12),
-                  decoration: BoxDecoration(
-                    color: selected ? col.withOpacity(0.1) : _T.surfaceLo,
-                    borderRadius: BorderRadius.circular(8),
-                    border: Border.all(
-                        color: selected ? col : _T.border,
-                        width: selected ? 1.5 : 1),
+                label:
+                    '${_displayLabel(o)}, ${(o.confidence * 100).toStringAsFixed(0)} percent confidence. Tap to show path.',
+                excludeSemantics: true,
+                child: Material(
+                  color: selected
+                      ? col.withOpacity(0.15)
+                      : p.surfaceRecessed,
+                  borderRadius: BorderRadius.circular(10),
+                  child: InkWell(
+                    onTap: () => setState(() {
+                      _selObj = selected ? null : i;
+                      _cachedPathCells = _recomputePath(grid, gridW, gridH,
+                          robotGX, robotGZ, _selObj, objects);
+                    }),
+                    borderRadius: BorderRadius.circular(10),
+                    child: AnimatedContainer(
+                      duration: const Duration(milliseconds: 150),
+                      padding: const EdgeInsets.symmetric(horizontal: 14),
+                      decoration: BoxDecoration(
+                        borderRadius: BorderRadius.circular(10),
+                        border: Border.all(
+                          color: selected ? col : p.border,
+                          width: selected ? 2 : 1.2,
+                        ),
+                      ),
+                      child: Row(children: [
+                        Text(_emoji(o.type),
+                            style: const TextStyle(fontSize: 18)),
+                        const SizedBox(width: 8),
+                        WcagText(
+                          _displayLabel(o),
+                          size: WcagType.caption,
+                          weight: WcagType.semibold,
+                          color: selected ? col : p.textPrimary,
+                        ),
+                        const SizedBox(width: 6),
+                        WcagText(
+                          '${(o.confidence * 100).toStringAsFixed(0)}%',
+                          size: WcagType.caption,
+                          emphasis: 'secondary',
+                        ),
+                      ]),
+                    ),
                   ),
-                  child: Row(children: [
-                    Text(_emoji(o.type), style: const TextStyle(fontSize: 14)),
-                    const SizedBox(width: 6),
-                    Text(_displayLabel(o),
-                        style: TextStyle(
-                            color: selected ? col : _T.textPri,
-                            fontSize: 12, fontWeight: FontWeight.w500)),
-                    const SizedBox(width: 5),
-                    Text('${(o.confidence * 100).toStringAsFixed(0)}%',
-                        style: TextStyle(color: _T.textSec, fontSize: 11)),
-                  ]),
                 ),
-              ));
+              );
             },
           ),
         ),
@@ -988,116 +1042,170 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
   }
 
   // ── Bottom bar ────────────────────────────────────────────────────────────
-  Widget _bottomBar() {
+  Widget _bottomBar(WcagPalette p) {
     return Container(
-      color: _T.surface,
-      padding: const EdgeInsets.fromLTRB(16, 10, 16, 12),
+      color: p.surface,
+      padding: const EdgeInsets.fromLTRB(16, 12, 16, 14),
       child: Semantics(
         button: true,
-        label: 'Open AR Camera for indoor navigation and scanning',
-        child: GestureDetector(
-        onTap: _openAR,
-        child: AnimatedContainer(
-          duration: const Duration(milliseconds: 300),
-          height: 50,
-          decoration: BoxDecoration(
-            gradient: LinearGradient(
-              colors: scanning
-                  ? [_T.green, const Color(0xFF15803D)]
-                  : [_T.blue, const Color(0xFF1D4ED8)],
-            ),
+        label: scanning
+            ? 'Scanning in progress. Tap to open AR camera.'
+            : 'Start AR scan. Opens the AR camera for indoor navigation and scanning.',
+        excludeSemantics: true,
+        child: Material(
+          color: scanning ? p.accentSuccess : p.accentPrimary,
+          borderRadius: BorderRadius.circular(12),
+          child: InkWell(
+            onTap: _openAR,
             borderRadius: BorderRadius.circular(12),
-          ),
-          child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [
-            Icon(
-              scanning ? Icons.stop_circle_outlined : Icons.videocam_rounded,
-              color: Colors.white, size: 20,
-            ),
-            const SizedBox(width: 10),
-            Text(
-              scanning ? 'Scanning in progress' : 'Start AR Scan',
-              style: const TextStyle(
-                color: Colors.white, fontSize: 14,
-                fontWeight: FontWeight.w600, letterSpacing: 0.2,
+            child: Container(
+              height: WcagSize.minTouch + 8,
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(12),
+                border:
+                    Border.all(color: p.textOnAccent.withOpacity(0.4)),
               ),
+              child: Row(mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                Icon(
+                  scanning
+                      ? Icons.stop_circle_outlined
+                      : Icons.videocam_rounded,
+                  color: p.textOnAccent,
+                  size: 24,
+                ),
+                const SizedBox(width: 12),
+                WcagText(
+                  scanning ? 'Scanning in progress' : 'Start AR Scan',
+                  size: WcagType.label,
+                  weight: WcagType.bold,
+                  color: p.textOnAccent,
+                  letterSpacing: 0.2,
+                ),
+              ]),
             ),
-          ]),
+          ),
         ),
-      ),
       ),
     );
   }
 
   // ── Legend ────────────────────────────────────────────────────────────────
-  Widget _legendSheet() {
+  Widget _legendSheet(WcagPalette p) {
     return Positioned(
-      top: 60, right: 12,
+      top: 60,
+      right: 12,
       child: Container(
-        width: 230,
-        padding: const EdgeInsets.all(14),
+        width: 280,
+        padding: const EdgeInsets.all(16),
         decoration: BoxDecoration(
-          color: _T.surface,
+          color: p.surface,
           borderRadius: BorderRadius.circular(12),
-          border: Border.all(color: _T.border),
-          boxShadow: [BoxShadow(
-              color: Colors.black.withOpacity(0.10),
-              blurRadius: 20, offset: const Offset(0, 4))],
-        ),
-        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Row(children: [
-            const Text('Legend', style: TextStyle(color: _T.textPri,
-                fontSize: 13, fontWeight: FontWeight.w700)),
-            const Spacer(),
-            GestureDetector(
-              onTap: () => setState(() => _showLegend = false),
-              child: Icon(Icons.close_rounded, size: 16, color: _T.textSec),
+          border: Border.all(color: p.borderStrong, width: 1.5),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withOpacity(0.18),
+              blurRadius: 24,
+              offset: const Offset(0, 6),
             ),
-          ]),
-          const SizedBox(height: 12),
-          _legendRow(_T.mapFloor,    'Floor (passable)',    'White — open walkable area'),
-          _legendRow(_T.mapVisited,  'Visited cells',        'Light blue — scanned floor area'),
-          _legendRow(_T.mapTrail,   'Camera trail',         'Teal line — exact path taken'),
-          _legendRow(_T.mapWall,     'Wall',                'Dark — detected vertical surface'),
-          _legendRow(_T.mapObstacle, 'Obstacle',            'Brown — object footprint'),
-          _legendRow(_T.mapPath,     'Route to object',     'Blue — selected object path'),
-          _legendRow(_T.mapNavPath,  'Navigation route',    'Green — voice nav path'),
-          Divider(height: 16, color: _T.divider),
-          Row(children: [
-            Container(width: 12, height: 12,
-                decoration: const BoxDecoration(
-                    color: _T.mapRobot, shape: BoxShape.circle)),
-            const SizedBox(width: 10),
-            Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              const Text('You', style: TextStyle(color: _T.textPri,
-                  fontSize: 11, fontWeight: FontWeight.w600)),
-              Text('Arrow shows heading',
-                  style: TextStyle(color: _T.textSec, fontSize: 10)),
-            ])),
-          ]),
-        ]),
+          ],
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(children: [
+              WcagText('Legend',
+                  size: WcagType.label, weight: WcagType.bold),
+              const Spacer(),
+              SizedBox(
+                width: WcagSize.minTouch,
+                height: WcagSize.minTouch,
+                child: IconButton(
+                  iconSize: 24,
+                  tooltip: 'Close legend',
+                  icon: Icon(Icons.close_rounded, color: p.textSecondary),
+                  onPressed: () => setState(() => _showLegend = false),
+                ),
+              ),
+            ]),
+            const SizedBox(height: 8),
+            _legendRow(p, _T.mapFloor, 'Floor (passable)',
+                'Open walkable area'),
+            _legendRow(p, _T.mapVisited, 'Visited cells',
+                'Scanned floor area'),
+            _legendRow(p, _T.mapTrail, 'Camera trail',
+                'Exact path taken'),
+            _legendRow(p, _T.mapWall, 'Wall',
+                'Detected vertical surface'),
+            _legendRow(p, _T.mapObstacle, 'Obstacle',
+                'Object footprint'),
+            _legendRow(p, _T.mapPath, 'Route to object',
+                'Selected object path'),
+            _legendRow(p, _T.mapNavPath, 'Navigation route',
+                'Voice nav path'),
+            Divider(height: 20, color: p.border),
+            Row(children: [
+              Container(
+                width: 16,
+                height: 16,
+                decoration: BoxDecoration(
+                  color: _T.mapRobot,
+                  shape: BoxShape.circle,
+                  border: Border.all(color: p.textOnAccent, width: 1.5),
+                ),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: const [
+                    WcagText('You',
+                        size: WcagType.caption,
+                        weight: WcagType.bold),
+                    WcagText('Arrow shows heading',
+                        size: WcagType.caption,
+                        emphasis: 'secondary'),
+                  ],
+                ),
+              ),
+            ]),
+          ],
+        ),
       ),
     );
   }
 
-  Widget _legendRow(Color color, String title, String desc) {
+  Widget _legendRow(WcagPalette p, Color swatch, String title, String desc) {
     return Padding(
-      padding: const EdgeInsets.only(bottom: 9),
-      child: Row(children: [
-        Container(
-          width: 14, height: 14,
-          decoration: BoxDecoration(
-            color: color,
-            borderRadius: BorderRadius.circular(3),
-            border: Border.all(color: Colors.black.withOpacity(0.12), width: 0.5),
+      padding: const EdgeInsets.only(bottom: 12),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Container(
+            width: 18,
+            height: 18,
+            decoration: BoxDecoration(
+              color: swatch,
+              borderRadius: BorderRadius.circular(4),
+              border: Border.all(color: p.borderStrong, width: 1),
+            ),
           ),
-        ),
-        const SizedBox(width: 10),
-        Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Text(title, style: const TextStyle(color: _T.textPri,
-              fontSize: 11, fontWeight: FontWeight.w600)),
-          Text(desc, style: TextStyle(color: _T.textSec, fontSize: 10)),
-        ])),
-      ]),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                WcagText(title,
+                    size: WcagType.caption,
+                    weight: WcagType.semibold),
+                WcagText(desc,
+                    size: WcagType.caption,
+                    emphasis: 'secondary'),
+              ],
+            ),
+          ),
+        ],
+      ),
     );
   }
 }

@@ -1,8 +1,8 @@
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 import 'indoor_map_viewer.dart';
 import 'saved_maps_screen.dart';
 import 'accessibility_service.dart';
+import 'wcag_theme.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -18,12 +18,14 @@ class MyApp extends StatelessWidget {
       title: 'Indoor Navigator',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFF7C3AED)),
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: WcagPalette.light.accentPrimary,
+        ),
         useMaterial3: true,
       ),
       darkTheme: ThemeData(
         colorScheme: ColorScheme.fromSeed(
-          seedColor: const Color(0xFF7C3AED),
+          seedColor: WcagPalette.dark.accentPrimary,
           brightness: Brightness.dark,
         ),
         useMaterial3: true,
@@ -62,7 +64,6 @@ class _HomePageState extends State<HomePage> with VolumeButtonNavigationMixin {
   @override
   void initState() {
     super.initState();
-    // Register focusable elements for this screen
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _registerFocusables();
       _accessibility.announceScreen('Home');
@@ -85,12 +86,14 @@ class _HomePageState extends State<HomePage> with VolumeButtonNavigationMixin {
       ),
       FocusableElement(
         id: 'accessibility_toggle',
-        label: _accessibility.enabled ? 'Disable Accessibility Mode' : 'Enable Accessibility Mode',
+        label: _accessibility.enabled
+            ? 'Disable Accessibility Mode'
+            : 'Enable Accessibility Mode',
         hint: 'Toggle voice announcements and volume button navigation',
         onActivate: () {
           _accessibility.toggle();
           setState(() {});
-          _registerFocusables(); // Re-register to update label
+          _registerFocusables();
         },
         type: FocusableElementType.toggle,
       ),
@@ -110,182 +113,112 @@ class _HomePageState extends State<HomePage> with VolumeButtonNavigationMixin {
 
   @override
   Widget build(BuildContext context) {
-    final isDark = Theme.of(context).brightness == Brightness.dark;
-    final bg      = isDark ? const Color(0xFF0F0F17) : const Color(0xFFF8F8FC);
-    final surface = isDark ? const Color(0xFF1A1A26) : Colors.white;
-    final textPri = isDark ? const Color(0xFFF3F4F6) : const Color(0xFF111827);
-    final textSec = isDark ? const Color(0xFF9CA3AF) : const Color(0xFF6B7280);
-    final border  = isDark ? const Color(0xFF2A2A38) : const Color(0xFFE5E7EB);
-    final chipBg  = isDark ? const Color(0xFF1E1E2C) : const Color(0xFFF3F4F6);
+    final p = WcagPalette.of(context);
 
     return Scaffold(
-      backgroundColor: bg,
-      body: SafeArea(
-        child: SingleChildScrollView(
-          padding: const EdgeInsets.fromLTRB(20, 20, 20, 36),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              // ── Header ──
-              Row(children: [
-                Container(
-                  padding: const EdgeInsets.all(10),
-                  decoration: BoxDecoration(
-                    gradient: const LinearGradient(
-                      colors: [Color(0xFF7C3AED), Color(0xFF6D28D9)],
+      backgroundColor: p.background,
+      body: WcagScaffoldFrame(
+        child: SafeArea(
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.fromLTRB(20, 20, 20, 36),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                _Header(p: p),
+                const SizedBox(height: 28),
+                _HeroBanner(p: p),
+                const SizedBox(height: 24),
+                AccessibleFocusable(
+                  index: 0,
+                  borderRadius: BorderRadius.circular(16),
+                  child: Semantics(
+                    button: true,
+                    label:
+                        'View Indoor Map. Explore the map built from your scan.',
+                    excludeSemantics: true,
+                    child: _ActionCard(
+                      title: 'View Indoor Map',
+                      subtitle: 'Explore your scanned floor plan',
+                      icon: Icons.map_rounded,
+                      iconColor: p.accentPrimary,
+                      p: p,
+                      onTap: () => _openMapViewer(context),
                     ),
-                    borderRadius: BorderRadius.circular(14),
                   ),
-                  child: const Icon(Icons.explore_rounded, size: 24,
-                      color: Colors.white),
                 ),
-                const SizedBox(width: 12),
-                Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                  Text('Indoor Navigator',
-                      style: TextStyle(fontSize: 20, fontWeight: FontWeight.w700,
-                          color: textPri, letterSpacing: -0.3)),
-                  Text('AR-powered wayfinding',
-                      style: TextStyle(fontSize: 12, color: textSec)),
-                ]),
-              ]),
-
-              const SizedBox(height: 28),
-
-              // ── Hero Banner ──
-              Container(
-                width: double.infinity,
-                padding: const EdgeInsets.fromLTRB(24, 32, 24, 28),
-                decoration: BoxDecoration(
-                  gradient: const LinearGradient(
-                    begin: Alignment.topLeft,
-                    end: Alignment.bottomRight,
-                    colors: [Color(0xFF7C3AED), Color(0xFF4F46E5), Color(0xFF2563EB)],
-                  ),
-                  borderRadius: BorderRadius.circular(24),
-                  boxShadow: [
-                    BoxShadow(
-                      color: const Color(0xFF7C3AED).withOpacity(isDark ? 0.15 : 0.25),
-                      blurRadius: 24, offset: const Offset(0, 8),
+                const SizedBox(height: 12),
+                AccessibleFocusable(
+                  index: 1,
+                  borderRadius: BorderRadius.circular(16),
+                  child: Semantics(
+                    button: true,
+                    label: 'Saved Maps. View and manage your scanned maps.',
+                    excludeSemantics: true,
+                    child: _ActionCard(
+                      title: 'Saved Maps',
+                      subtitle: 'View and manage your scanned maps',
+                      icon: Icons.folder_rounded,
+                      iconColor: p.accentSuccess,
+                      p: p,
+                      onTap: () =>
+                          Navigator.pushNamed(context, '/saved-maps'),
                     ),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                AccessibleFocusable(
+                  index: 2,
+                  borderRadius: BorderRadius.circular(16),
+                  child: Semantics(
+                    button: true,
+                    toggled: _accessibility.enabled,
+                    label: _accessibility.enabled
+                        ? 'Accessibility mode is on. Tap to disable.'
+                        : 'Accessibility mode is off. Tap to enable.',
+                    excludeSemantics: true,
+                    child: _ActionCard(
+                      title: _accessibility.enabled
+                          ? 'Accessibility: ON'
+                          : 'Accessibility: OFF',
+                      subtitle:
+                          'Volume buttons navigate, long-press to toggle',
+                      icon: Icons.accessibility_new_rounded,
+                      iconColor: _accessibility.enabled
+                          ? p.accentPrimary
+                          : p.textSecondary,
+                      p: p,
+                      onTap: () {
+                        _accessibility.toggle();
+                        setState(() {});
+                        _registerFocusables();
+                      },
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 28),
+                WcagText(
+                  'Capabilities',
+                  size: WcagType.label,
+                  weight: WcagType.semibold,
+                  letterSpacing: -0.2,
+                ),
+                const SizedBox(height: 12),
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: const [
+                    _CapChip(Icons.radar, 'Obstacle alerts'),
+                    _CapChip(Icons.hearing, 'Spatial audio'),
+                    _CapChip(Icons.mic, 'Voice commands'),
+                    _CapChip(Icons.stairs, 'Stair warnings'),
+                    _CapChip(Icons.sos, 'Emergency SOS'),
+                    _CapChip(Icons.undo, 'Guide me back'),
+                    _CapChip(Icons.save_alt, 'Save maps'),
+                    _CapChip(Icons.accessibility_new, 'TalkBack'),
                   ],
                 ),
-                child: Column(children: [
-                  Container(
-                    padding: const EdgeInsets.all(14),
-                    decoration: BoxDecoration(
-                      color: Colors.white.withOpacity(0.15),
-                      borderRadius: BorderRadius.circular(16),
-                    ),
-                    child: const Icon(Icons.accessibility_new_rounded,
-                        size: 36, color: Colors.white),
-                  ),
-                  const SizedBox(height: 16),
-                  const Text('Navigate indoors\nwith confidence',
-                      textAlign: TextAlign.center,
-                      style: TextStyle(fontSize: 22, fontWeight: FontWeight.w700,
-                          color: Colors.white, height: 1.3)),
-                  const SizedBox(height: 8),
-                  Text(
-                      'Real-time obstacle alerts, voice navigation,\n'
-                      'and spatial audio feedback',
-                      textAlign: TextAlign.center,
-                      style: TextStyle(fontSize: 13,
-                          color: Colors.white.withOpacity(0.8), height: 1.4)),
-                ]),
-              ),
-
-              const SizedBox(height: 24),
-
-              // ── Action Cards ──
-              AccessibleFocusable(
-                index: 0,
-                borderRadius: BorderRadius.circular(16),
-                child: Semantics(
-                  button: true,
-                  label: 'View Indoor Map. Explore the map built from your scan.',
-                  child: _ActionCard(
-                    title: 'View Indoor Map',
-                    subtitle: 'Explore your scanned floor plan',
-                    icon: Icons.map_rounded,
-                    gradientColors: const [Color(0xFF2563EB), Color(0xFF1D4ED8)],
-                    surface: surface, textPri: textPri,
-                    textSec: textSec, border: border,
-                    onTap: () => _openMapViewer(context),
-                  ),
-                ),
-              ),
-
-              const SizedBox(height: 12),
-
-              AccessibleFocusable(
-                index: 1,
-                borderRadius: BorderRadius.circular(16),
-                child: Semantics(
-                  button: true,
-                  label: 'Saved Maps. View and manage your scanned maps.',
-                  child: _ActionCard(
-                    title: 'Saved Maps',
-                    subtitle: 'View and manage your scanned maps',
-                    icon: Icons.folder_rounded,
-                    gradientColors: const [Color(0xFF059669), Color(0xFF047857)],
-                    surface: surface, textPri: textPri,
-                    textSec: textSec, border: border,
-                    onTap: () => Navigator.pushNamed(context, '/saved-maps'),
-                  ),
-                ),
-              ),
-
-              const SizedBox(height: 12),
-
-              // ── Accessibility Toggle ──
-              AccessibleFocusable(
-                index: 2,
-                borderRadius: BorderRadius.circular(16),
-                child: Semantics(
-                  button: true,
-                  toggled: _accessibility.enabled,
-                  label: _accessibility.enabled 
-                      ? 'Accessibility mode is on. Tap to disable.'
-                      : 'Accessibility mode is off. Tap to enable.',
-                  child: _ActionCard(
-                    title: _accessibility.enabled ? 'Accessibility: ON' : 'Accessibility: OFF',
-                    subtitle: 'Volume buttons navigate, long-press to toggle',
-                    icon: Icons.accessibility_new_rounded,
-                    gradientColors: _accessibility.enabled
-                        ? const [Color(0xFF7C3AED), Color(0xFF6D28D9)]
-                        : [Colors.grey.shade600, Colors.grey.shade700],
-                    surface: surface, textPri: textPri,
-                    textSec: textSec, border: border,
-                    onTap: () {
-                      _accessibility.toggle();
-                      setState(() {});
-                      _registerFocusables();
-                    },
-                  ),
-                ),
-              ),
-
-              const SizedBox(height: 28),
-
-              // ── Capabilities ──
-              Padding(
-                padding: const EdgeInsets.only(left: 2),
-                child: Text('Capabilities',
-                    style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600,
-                        color: textPri, letterSpacing: -0.2)),
-              ),
-              const SizedBox(height: 12),
-              Wrap(spacing: 8, runSpacing: 8, children: [
-                _CapChip(Icons.radar, 'Obstacle alerts', chipBg, textSec),
-                _CapChip(Icons.hearing, 'Spatial audio', chipBg, textSec),
-                _CapChip(Icons.mic, 'Voice commands', chipBg, textSec),
-                _CapChip(Icons.stairs, 'Stair warnings', chipBg, textSec),
-                _CapChip(Icons.sos, 'Emergency SOS', chipBg, textSec),
-                _CapChip(Icons.undo, 'Guide me back', chipBg, textSec),
-                _CapChip(Icons.save_alt, 'Save maps', chipBg, textSec),
-                _CapChip(Icons.accessibility_new, 'TalkBack', chipBg, textSec),
-              ]),
-            ],
+              ],
+            ),
           ),
         ),
       ),
@@ -293,58 +226,137 @@ class _HomePageState extends State<HomePage> with VolumeButtonNavigationMixin {
   }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Action Card — main navigation buttons
-// ─────────────────────────────────────────────────────────────────────────────
+class _Header extends StatelessWidget {
+  final WcagPalette p;
+  const _Header({required this.p});
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(children: [
+      Container(
+        padding: const EdgeInsets.all(10),
+        decoration: BoxDecoration(
+          color: p.accentPrimary,
+          borderRadius: BorderRadius.circular(14),
+        ),
+        child: Icon(Icons.explore_rounded,
+            size: 24, color: p.textOnAccent),
+      ),
+      const SizedBox(width: 12),
+      Column(crossAxisAlignment: CrossAxisAlignment.start, children: const [
+        WcagText('Indoor Navigator',
+            size: WcagType.title, weight: WcagType.bold, letterSpacing: -0.3),
+        SizedBox(height: 2),
+        WcagText('AR-powered wayfinding',
+            size: WcagType.caption, emphasis: 'secondary'),
+      ]),
+    ]);
+  }
+}
+
+class _HeroBanner extends StatelessWidget {
+  final WcagPalette p;
+  const _HeroBanner({required this.p});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.fromLTRB(24, 32, 24, 28),
+      decoration: BoxDecoration(
+        color: p.accentPrimary,
+        borderRadius: BorderRadius.circular(24),
+      ),
+      child: Column(children: [
+        Container(
+          padding: const EdgeInsets.all(14),
+          decoration: BoxDecoration(
+            color: Colors.white.withOpacity(0.18),
+            borderRadius: BorderRadius.circular(16),
+          ),
+          child: Icon(Icons.accessibility_new_rounded,
+              size: 36, color: p.textOnAccent),
+        ),
+        const SizedBox(height: 16),
+        WcagText(
+          'Navigate indoors\nwith confidence',
+          align: TextAlign.center,
+          size: WcagType.headline,
+          weight: WcagType.bold,
+          color: p.textOnAccent,
+          height: 1.3,
+        ),
+        const SizedBox(height: 8),
+        WcagText(
+          'Real-time obstacle alerts, voice navigation,\n'
+          'and spatial audio feedback',
+          align: TextAlign.center,
+          size: WcagType.caption,
+          color: p.textOnAccent.withOpacity(0.9),
+          height: 1.4,
+        ),
+      ]),
+    );
+  }
+}
+
 class _ActionCard extends StatelessWidget {
   final String title, subtitle;
   final IconData icon;
-  final List<Color> gradientColors;
-  final Color surface, textPri, textSec, border;
+  final Color iconColor;
+  final WcagPalette p;
   final VoidCallback onTap;
 
   const _ActionCard({
-    required this.title, required this.subtitle, required this.icon,
-    required this.gradientColors, required this.surface,
-    required this.textPri, required this.textSec, required this.border,
+    required this.title,
+    required this.subtitle,
+    required this.icon,
+    required this.iconColor,
+    required this.p,
     required this.onTap,
   });
 
   @override
   Widget build(BuildContext context) {
     return Material(
-      color: surface,
+      color: p.surface,
       borderRadius: BorderRadius.circular(16),
       child: InkWell(
         onTap: onTap,
         borderRadius: BorderRadius.circular(16),
         child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 20),
+          constraints: const BoxConstraints(minHeight: WcagSize.minTouch + 24),
+          padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 18),
           decoration: BoxDecoration(
             borderRadius: BorderRadius.circular(16),
-            border: Border.all(color: border),
+            border: Border.all(color: p.border, width: 1.5),
           ),
           child: Row(children: [
             Container(
               padding: const EdgeInsets.all(13),
               decoration: BoxDecoration(
-                gradient: LinearGradient(colors: gradientColors),
+                color: iconColor,
                 borderRadius: BorderRadius.circular(14),
               ),
-              child: Icon(icon, size: 26, color: Colors.white),
+              child: Icon(icon, size: 26, color: p.textOnAccent),
             ),
             const SizedBox(width: 16),
-            Expanded(child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(title, style: TextStyle(fontSize: 15,
-                    fontWeight: FontWeight.w600, color: textPri)),
-                const SizedBox(height: 3),
-                Text(subtitle, style: TextStyle(fontSize: 12,
-                    color: textSec, height: 1.3)),
-              ],
-            )),
-            Icon(Icons.arrow_forward_ios_rounded, size: 15, color: textSec),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  WcagText(title,
+                      size: WcagType.label, weight: WcagType.semibold),
+                  const SizedBox(height: 4),
+                  WcagText(subtitle,
+                      size: WcagType.caption,
+                      emphasis: 'secondary',
+                      height: 1.3),
+                ],
+              ),
+            ),
+            Icon(Icons.arrow_forward_ios_rounded,
+                size: 16, color: p.textSecondary),
           ]),
         ),
       ),
@@ -352,29 +364,28 @@ class _ActionCard extends StatelessWidget {
   }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Capability Chip
-// ─────────────────────────────────────────────────────────────────────────────
 class _CapChip extends StatelessWidget {
   final IconData icon;
   final String text;
-  final Color bg, textColor;
-
-  const _CapChip(this.icon, this.text, this.bg, this.textColor);
+  const _CapChip(this.icon, this.text);
 
   @override
   Widget build(BuildContext context) {
+    final p = WcagPalette.of(context);
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
       decoration: BoxDecoration(
-        color: bg,
+        color: p.surfaceRecessed,
         borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: p.border),
       ),
       child: Row(mainAxisSize: MainAxisSize.min, children: [
-        Icon(icon, size: 14, color: textColor),
+        Icon(icon, size: 16, color: p.textSecondary),
         const SizedBox(width: 6),
-        Text(text, style: TextStyle(fontSize: 12, color: textColor,
-            fontWeight: FontWeight.w500)),
+        WcagText(text,
+            size: WcagType.caption,
+            emphasis: 'secondary',
+            weight: WcagType.medium),
       ]),
     );
   }
