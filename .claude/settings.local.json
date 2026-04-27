@@ -32,7 +32,8 @@
       "Bash(./gradlew :app:compileDebugKotlin)",
       "Bash(git commit *)",
       "Bash(git push *)",
-      "WebSearch"
+      "WebSearch",
+      "Bash(./gradlew :app:compileDebugKotlin -q)"
     ]
   }
 }

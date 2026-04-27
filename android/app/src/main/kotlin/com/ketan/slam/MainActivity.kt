@@ -225,10 +225,26 @@ class MainActivity : FlutterActivity() {
                 objects.add(m)
             }
 
-            // Robot position from last breadcrumb or (0,0)
+            // Robot position from last breadcrumb or (0,0); also build the
+            // camera trail in local grid coords so the map viewer can render
+            // the path the user walked while scanning.
             val bcArr = json.optJSONArray("breadcrumbs")
             var robotX = 0f; var robotZ = 0f
+            val trailPoints = mutableListOf<Map<String, Int>>()
             if (bcArr != null && bcArr.length() > 0) {
+                var lastTGX = Int.MIN_VALUE; var lastTGZ = Int.MIN_VALUE
+                for (i in 0 until bcArr.length()) {
+                    val entry = bcArr.getJSONArray(i)
+                    val px = entry.getDouble(0).toFloat()
+                    val pz = entry.getDouble(2).toFloat()
+                    val tgx = (px / res).roundToInt()
+                    val tgz = (pz / res).roundToInt()
+                    val lx = tgx - minGX; val lz = tgz - minGZ
+                    if (lx !in 0 until w || lz !in 0 until h) continue
+                    if (tgx == lastTGX && tgz == lastTGZ) continue
+                    trailPoints.add(mapOf("x" to lx, "z" to lz))
+                    lastTGX = tgx; lastTGZ = tgz
+                }
                 val last = bcArr.getJSONArray(bcArr.length() - 1)
                 robotX = last.getDouble(0).toFloat()
                 robotZ = last.getDouble(2).toFloat()
@@ -242,7 +258,8 @@ class MainActivity : FlutterActivity() {
                 "robotGridX" to ((robotX / res).roundToInt() - minGX),
                 "robotGridZ" to ((robotZ / res).roundToInt() - minGZ),
                 "objects" to objects,
-                "navPath" to emptyList<Any>()
+                "navPath" to emptyList<Any>(),
+                "cameraTrail" to trailPoints
             )
         } catch (e: Exception) {
             println("MainActivity: loadMapPayload: ${e.message}")
