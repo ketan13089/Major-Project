@@ -621,11 +621,15 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
     return Scaffold(
       backgroundColor: p.background,
       body: WcagScaffoldFrame(
-        child: SafeArea(
-          child: Stack(children: [
-            // Reserve room at the bottom so the full-width voice command
-            // bar doesn't cover the AR Scan button or object rail.
-            Padding(
+        // Stack lives OUTSIDE the SafeArea so the voice command bar can
+        // extend all the way to the device bottom edge. The bar handles
+        // its own gesture-inset padding internally.
+        child: Stack(children: [
+          SafeArea(
+            bottom: false,
+            child: Padding(
+              // Reserve room at the bottom so the full-width voice command
+              // bar doesn't cover the AR Scan button or object rail.
               padding: const EdgeInsets.only(bottom: 88),
               child: Column(children: [
                 _topBar(p),
@@ -634,10 +638,10 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
                 if (!_isReadOnly) _bottomBar(p),
               ]),
             ),
-            if (_showLegend) _legendSheet(p),
-            const GlobalVoiceFab(),
-          ]),
-        ),
+          ),
+          if (_showLegend) _legendSheet(p),
+          const GlobalVoiceFab(),
+        ]),
       ),
     );
   }

@@ -223,6 +223,9 @@ class _HomePageState extends State<HomePage>
     return Scaffold(
       backgroundColor: p.background,
       body: WcagScaffoldFrame(
+        // Stack lives OUTSIDE the SafeArea so the voice command bar can
+        // extend all the way to the device bottom edge. The bar handles
+        // its own gesture-inset padding internally.
         child: Stack(children: [
           SafeArea(
             child: SingleChildScrollView(
