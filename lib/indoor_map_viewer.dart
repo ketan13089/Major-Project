@@ -869,7 +869,7 @@ class _IndoorMapViewerState extends State<IndoorMapViewer>
                         color: p.textOnAccent, width: 1.5),
                   ),
                   child: Row(children: [
-                    Icon(Icons.assistant_navigation_rounded,
+                    Icon(Icons.assistant_navigation,
                         size: 22, color: p.textOnAccent),
                     const SizedBox(width: 10),
                     Expanded(
